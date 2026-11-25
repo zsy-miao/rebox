@@ -37,6 +37,7 @@
 #include "pacing.h"
 #include "present.h"
 #include "proxy.h"
+#include "quarantine.h"
 #include "title_textures.h"
 #include "dxgi_device.h"
 #include "debug_view.h"
@@ -5077,6 +5078,7 @@ static BOOL device_lost(void)
         InterlockedExchange(&lost, 1);
         rebox_log("d3d12_xs: the device is lost: GPU memory waits still pending are signalled from the CPU, "
                   "not logged");
+        quarantine_device_lost();
     }
     return lost;
 }

@@ -147,6 +147,7 @@ void console_trace_op(const char *op, UINT a, UINT b, UINT c, UINT width, UINT h
 void console_bindings_changed(BOOL textures);
 
 UINT64 console_stage_id(const void *shader, SIZE_T size);
+UINT64 console_program_hash(const void *shader, SIZE_T size);
 BOOL console_stage_watched(UINT64 id);
 UINT64 console_last_draw_vs(void);
 

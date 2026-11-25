@@ -186,3 +186,14 @@ out=$(REBOX_DEBUG_VIEW=32x16 REBOX_DUMP_FRAMES_AT=1,2,3,4,5,6 "$WINE" "$here/bui
 grep -q "ok   REBOX_DEBUG_VIEW shows its copy from when its pass ended" <<<"$out" \
     || { echo "FAIL REBOX_DEBUG_VIEW did not show the copy"; grep -E "DEBUG_VIEW" <<<"$out" | head; exit 1; }
 echo "ok   REBOX_DEBUG_VIEW copies the target when its pass ends and shows the copy"
+
+# REBOX_QUARANTINE skips the dispatches of compute programs a file names by the id their compile
+# logs (the dispatch test's program here; that test's checks then fail, which is not this one's business).
+echo "== fake.bin, REBOX_QUARANTINE"
+printf '%s\n' '# programs earlier runs lost the device after' 'a7830803eec28b79  # the dispatch test' > "$work/quarantine.txt"
+out=$(REBOX_QUARANTINE="$work/quarantine.txt" "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || true
+grep -q "quarantine: 1 console program(s) quarantined by Z:.*quarantine.txt, skipped: a7830803eec28b79" <<<"$out" \
+    && grep -q "quarantine: console compute shader a7830803eec28b79 is quarantined" <<<"$out" \
+    && ! grep -q "console shader a7830803eec28b79: compiled a variant" <<<"$out" \
+    || { echo "FAIL REBOX_QUARANTINE did not skip the program it names"; grep -E "quarantine|a7830803eec28b79" <<<"$out" | head; exit 1; }
+echo "ok   REBOX_QUARANTINE skips the dispatches of the programs its file names"

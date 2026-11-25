@@ -33,6 +33,7 @@
 #include "console_desc.h"
 #include "gpu_memory.h"
 #include "proxy.h"
+#include "quarantine.h"
 #include "shadow.h"
 #include "title_textures.h"
 
@@ -2136,6 +2137,24 @@ UINT64 console_stage_id(const void *shader, SIZE_T size)
                       h->code_dwords * 4u);
 }
 
+/* A deferred program's id as "console shader <id>: compiled a variant" logs it: its code's hash once
+ * its FLAT_SCRATCH setup is NOPed (quarantine.c). 0 if it isn't one. */
+UINT64 console_program_hash(const void *shader, SIZE_T size)
+{
+    const struct rebox_deferred_shader *h = shader;
+    UINT32 *code;
+    UINT64 hash;
+    if (!h || size < sizeof(*h) || (h->version != 1 && h->version != 2) || h->code_offset > size
+            || h->code_dwords * 4ull > size - h->code_offset
+            || !(code = malloc(h->code_dwords * 4u + 4)))
+        return 0;
+    memcpy(code, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+    nop_flat_scratch_setup(code, h->code_dwords);
+    hash = hash_bytes(0xcbf29ce484222325ull, code, h->code_dwords * 4u);
+    free(code);
+    return hash;
+}
+
 /* Whether a stage is REBOX_WATCH_STAGE's. */
 BOOL console_stage_watched(UINT64 id)
 {
@@ -2763,9 +2782,18 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 {
     HRESULT hr;
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
+    void *quarantined;
 
     call_outcome = OUTCOME_FAILED;
-    hr = console_compile(in, out);
+    /* REBOX_QUARANTINE (quarantine.c): programs earlier runs lost the device after. A quarantined
+     * pixel stage can still get the stand-in below. */
+    if (quarantine_skips(in, &quarantined))
+    {
+        set_last(E_FAIL, "quarantined by REBOX_QUARANTINE", NULL);
+        hr = E_FAIL;
+    }
+    else if (SUCCEEDED(hr = console_compile(in, out)))
+        quarantine_ran(quarantined);
     /* vkd3d-proton compiles a draw's first stage, then its pixel stage, on the same thread. */
     if (h && in->shader_size >= sizeof(*h) && h->version == 2)
     {
