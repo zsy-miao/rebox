@@ -1158,6 +1158,16 @@ static struct compile_stats
 } compile_stats[2][2]; /* [compute][background] */
 static __thread struct compile_stats *stats;
 static __thread LONG64 relock_ticks; /* a background compile's wait to take the lock back */
+/* This thread's last compile's phases (the long background compiles' log). */
+static __thread LONG64 call_phase[PHASES];
+/* What the title's own threads spent in ReboxConsoleCompile, by kind ([compute]): the time draws
+ * and dispatches waited. "Compiles at title threads" above are the compiles done for those calls,
+ * most of them on the bounded pool's threads, past whatever the call waited. */
+static struct title_wait
+{
+    volatile LONG calls, overruns;
+    volatile LONG64 ticks;
+} title_waits[2];
 
 static LONG64 ticks_now(void)
 {
@@ -1172,6 +1182,8 @@ static void phase_end(LARGE_INTEGER *mark, UINT phase)
     QueryPerformanceCounter(&now);
     if (mark->QuadPart && stats)
         InterlockedAdd64(&stats->phase[phase], now.QuadPart - mark->QuadPart);
+    if (mark->QuadPart)
+        call_phase[phase] += now.QuadPart - mark->QuadPart;
     *mark = now;
 }
 
@@ -2114,11 +2126,15 @@ static DWORD WINAPI compile_worker(void *arg)
         {
             const struct rebox_deferred_shader *h = job->in.shader;
             BOOL header = job->in.shader_size >= sizeof(*h);
+            double f = qpc_frequency();
             rebox_log("d3d12_xs: console shaders: background compile of %s program %016llx (%u code dwords, %u calls "
-                      "waiting) took %.1f s: %s", !header ? "a" : h->version != 2 ? "compute" : h->stage == 0x10
-                      ? "pixel" : h->stage == 0x80 ? "mesh" : "vertex", (unsigned long long)job->key,
+                      "waiting) took %.1f s (memory regions %.1f, AnyPS5 %.1f, bindings %.1f, module %.1f): %s%s%.160s",
+                      !header ? "a" : h->version != 2 ? "compute" : h->stage == 0x10 ? "pixel"
+                      : h->stage == 0x80 ? "mesh" : "vertex", (unsigned long long)job->key,
                       header ? h->code_dwords : 0, job->slot != ~0u ? programs[job->slot].uses : 0, seconds,
-                      SUCCEEDED(hr) ? "compiled" : "failed");
+                      call_phase[PHASE_REGIONS] / f, call_phase[PHASE_ANYPS5] / f, call_phase[PHASE_BINDINGS] / f,
+                      call_phase[PHASE_MODULE] / f, SUCCEEDED(hr) ? "compiled" : "failed",
+                      SUCCEEDED(hr) ? "" : ", ", SUCCEEDED(hr) ? "" : last_message);
         }
         if (job->retry)
         {
@@ -2253,9 +2269,11 @@ void console_display_draw_end(void)
  * dispatch whose stage isn't "ok" is skipped (vkd3d-proton draws nothing, or logs "Failed to update
  * compute state"). The census only names DrawInstanced and DrawIndexedInstanced; these count every
  * draw, mesh draw, ExecuteIndirect and dispatch. */
-enum { OUTCOME_OK, OUTCOME_BUDGET, OUTCOME_QUEUED, OUTCOME_WAIT, OUTCOME_PROGRAM_FAILED, OUTCOME_FAILED, OUTCOMES };
+enum { OUTCOME_OK, OUTCOME_BUDGET, OUTCOME_QUEUED, OUTCOME_WAIT, OUTCOME_PROGRAM_FAILED, OUTCOME_FAILED,
+       OUTCOME_OVERRUN, OUTCOMES };
 static const char *const outcome_names[OUTCOMES] = { "ok", "past the frame's budget", "compiling in the background",
-                                                     "past their wait", "program failed before", "failed" };
+                                                     "past their wait", "program failed before", "failed",
+                                                     "skipped behind a compile past its wait" };
 static volatile LONG outcomes[4][OUTCOMES]; /* [compute, vertex, pixel, mesh] */
 static volatile LONG standins; /* pixel stand-ins given (REBOX_STANDIN_PIXEL) */
 static __thread UINT call_outcome;
@@ -2520,11 +2538,19 @@ static LONG64 frame_budget_ticks(void)
  * a new variant of a large program can take tens of seconds, and the title's render thread, waiting
  * for that recording job, stopped presenting until its GPU watchdog fired. Past the wait the draw or
  * dispatch is skipped and the compile goes on; the next call finds it in AnyPS5's memo.
- * REBOX_INLINE_COMPILE_WAIT_MS (default 50; compute 250; 0: compile in the caller as before). */
+ * REBOX_INLINE_COMPILE_WAIT_MS (default 50; compute 250; 0: compile in the caller as before).
+ *
+ * Once a call's compile runs past its wait, its program's later calls don't wait or queue another
+ * compile until it ends (overrun_running): they're skipped at once. A world's new variants of large
+ * programs (a specialization or a variant of a million-word module: seconds of spirv-opt) were
+ * drawn a few times a frame, and each of those calls waited its 50 ms (250 for compute) and queued
+ * a compile that only waited for the first one's lock: in run 0543 about 400 such waits a frame,
+ * about 20 s of the title's recording threads per present. REBOX_OVERRUN_SKIP=0: every call waits,
+ * as before. */
 struct bounded_job
 {
     struct bounded_job *next;
-    volatile LONG refs;
+    volatile LONG refs, finished;
     HANDLE done;
     HRESULT hr;
     UINT64 program; /* a program's first compile (first_call_compile): its state is set when done */
@@ -2561,10 +2587,90 @@ static DWORD WINAPI bounded_worker(void *unused)
         job->hr = compile_now(&job->in, &job->out, FALSE);
         if (job->program)
             program_set(job->program, SUCCEEDED(job->hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        InterlockedExchange(&job->finished, 1);
         SetEvent(job->done);
         bounded_release(job);
     }
     return 0;
+}
+
+/* Programs whose compile on the pool ran past a call's wait, with that compile (a reference held). */
+#define OVERRUNS 256
+static struct overrun
+{
+    UINT64 key;
+    struct bounded_job *job;
+} overruns[OVERRUNS];
+static SRWLOCK overruns_lock = SRWLOCK_INIT;
+
+static BOOL overrun_skip_on(void)
+{
+    static LONG on = -1;
+    if (on < 0)
+    {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("REBOX_OVERRUN_SKIP", v, sizeof(v));
+        on = !(n && n < sizeof(v) && v[0] == '0');
+    }
+    return on;
+}
+
+/* The entry of key, or one free (its finished job released) to take; NULL if neither is near
+ * (overruns_lock held exclusively). */
+static struct overrun *overrun_slot(UINT64 key, BOOL take)
+{
+    struct overrun *free_slot = NULL;
+    for (UINT i = 0; i < 16; i++)
+    {
+        struct overrun *o = &overruns[(key + i) % OVERRUNS];
+        if (o->job && o->job->finished)
+        {
+            bounded_release(o->job);
+            o->job = NULL;
+            o->key = 0;
+        }
+        if (o->job && o->key == key)
+            return o;
+        if (!o->job && !free_slot)
+            free_slot = o;
+    }
+    return take ? free_slot : NULL;
+}
+
+/* A call of program key ran past its wait for job: until job ends, the program's calls skip. */
+static void overrun_note(UINT64 key, struct bounded_job *job)
+{
+    struct overrun *o;
+    if (!key || !overrun_skip_on())
+        return;
+    AcquireSRWLockExclusive(&overruns_lock);
+    if ((o = overrun_slot(key, TRUE)))
+    {
+        InterlockedIncrement(&job->refs);
+        if (o->job)
+            bounded_release(o->job);
+        o->key = key;
+        o->job = job;
+    }
+    ReleaseSRWLockExclusive(&overruns_lock);
+}
+
+/* The compile of program key still running past an earlier call's wait, referenced (bounded_release
+ * it), or NULL. */
+static struct bounded_job *overrun_running(UINT64 key)
+{
+    struct bounded_job *job = NULL;
+    struct overrun *o;
+    if (!key || !overrun_skip_on())
+        return NULL;
+    AcquireSRWLockExclusive(&overruns_lock);
+    if ((o = overrun_slot(key, FALSE)))
+    {
+        job = o->job;
+        InterlockedIncrement(&job->refs);
+    }
+    ReleaseSRWLockExclusive(&overruns_lock);
+    return job;
 }
 
 static DWORD inline_wait_ms(BOOL graphics)
@@ -2580,9 +2686,10 @@ static DWORD inline_wait_ms(BOOL graphics)
 }
 
 /* Compiles in on the pool, waiting at most wait ms (0: in the caller); program, if not 0, is a
- * program claimed as pending whose state the compile sets. */
+ * program claimed as pending whose state the compile sets; owner, if not 0, the program whose later
+ * calls skip while this compile runs past the wait (overrun_note). */
 static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics,
-                                   DWORD wait, UINT64 program)
+                                   DWORD wait, UINT64 program, UINT64 owner)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     static LONG timeouts;
@@ -2645,14 +2752,16 @@ static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct reb
                       "their draw or dispatch", n, graphics ? "graphics" : "compute");
         set_last(E_PENDING, "compiling past its wait", NULL);
         hr = E_PENDING;
+        overrun_note(owner, job);
     }
     bounded_release(job);
     return hr;
 }
 
-static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics)
+static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics,
+                               UINT64 key)
 {
-    return bounded_compile_for(in, out, graphics, inline_wait_ms(graphics), 0);
+    return bounded_compile_for(in, out, graphics, inline_wait_ms(graphics), 0, key);
 }
 
 /* First calls wait. A draw or dispatch skipped because its program is still compiling (its first
@@ -2749,10 +2858,11 @@ static HRESULT first_call_compile(UINT64 key, enum program_state state, const st
                                   struct rebox_compile_out *out, BOOL graphics, DWORD wait)
 {
     LONG64 started = ticks_now(), deadline = started + (LONG64)(wait * qpc_frequency() / 1000);
+    struct bounded_job *running;
     HRESULT hr;
 
     if (state == PROGRAM_COLD)
-        return bounded_compile_for(in, out, graphics, wait, key);
+        return bounded_compile_for(in, out, graphics, wait, key, key);
     while (state == PROGRAM_PENDING && ticks_now() < deadline)
     {
         Sleep(2);
@@ -2768,16 +2878,30 @@ static HRESULT first_call_compile(UINT64 key, enum program_state state, const st
         set_last(E_FAIL, "its background compile failed", NULL);
         return E_FAIL;
     }
-    hr = bounded_compile_for(in, out, graphics, (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 50.0), 0);
+    /* An earlier call's compile of this program past its wait: waited for here, not queued again
+     * behind it. */
+    if ((running = overrun_running(key)))
+    {
+        WaitForSingleObject(running->done, (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 0.0));
+        bounded_release(running);
+        if (ticks_now() >= deadline)
+        {
+            set_last(E_PENDING, "an earlier call's compile is past its first-call wait", NULL);
+            return E_PENDING;
+        }
+    }
+    hr = bounded_compile_for(in, out, graphics, (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 50.0), 0,
+                             key);
     return hr;
 }
 
-static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct rebox_compile_out *out)
+static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct rebox_compile_out *out, UINT64 key)
 {
     const struct rebox_deferred_shader *h = in->shader;
     BOOL graphics = in->shader_size >= sizeof(*h) && h->version == 2;
     LONG64 budget = frame_budget_ticks(), started, elapsed;
     LONG frame = compile_frame;
+    struct bounded_job *running;
     HRESULT hr;
 
     if (InterlockedExchange(&budget_frame, frame) != frame)
@@ -2800,8 +2924,15 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
      * layers went black for a frame whenever they needed a new variant. */
     if (in_display_draw && current_draw.target >= 0)
         hr = compile_now(in, out, FALSE);
+    else if ((running = overrun_running(key)))
+    {
+        bounded_release(running);
+        set_last(E_PENDING, "an earlier call's compile of its program is past its wait", NULL);
+        call_outcome = OUTCOME_OVERRUN;
+        return E_PENDING;
+    }
     else
-        hr = bounded_compile(in, out, graphics);
+        hr = bounded_compile(in, out, graphics, key);
     call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr == E_PENDING ? OUTCOME_WAIT : OUTCOME_FAILED;
     elapsed = ticks_now() - started;
     if (elapsed >= slow_compile_ticks())
@@ -2884,7 +3015,7 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
         return E_FAIL;
     }
     default:
-        return compile_within_budget(in, out);
+        return compile_within_budget(in, out, key);
     }
 }
 
@@ -2980,6 +3111,7 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     HRESULT hr;
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
     void *quarantined;
+    LONG64 entered = ticks_now();
 
     call_outcome = OUTCOME_FAILED;
     /* REBOX_QUARANTINE (quarantine.c): programs earlier runs lost the device after. A quarantined
@@ -2991,6 +3123,13 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     }
     else if (SUCCEEDED(hr = console_compile(in, out)))
         quarantine_ran(quarantined);
+    {
+        struct title_wait *w = &title_waits[!(h && in->shader_size >= sizeof(*h) && h->version == 2)];
+        InterlockedIncrement(&w->calls);
+        InterlockedAdd64(&w->ticks, ticks_now() - entered);
+        if (call_outcome == OUTCOME_OVERRUN)
+            InterlockedIncrement(&w->overruns);
+    }
     /* vkd3d-proton compiles a draw's first stage, then its pixel stage, on the same thread. */
     if (h && in->shader_size >= sizeof(*h) && h->version == 2)
     {
@@ -3184,6 +3323,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         LONG n;
         stats = &kind[background != 0];
         relock_ticks = 0;
+        memset(call_phase, 0, sizeof(call_phase));
         n = InterlockedIncrement(&stats->calls);
         if (!(n & (n - 1)))
         {
@@ -3204,12 +3344,16 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                          st->memo_skips);
             }
             char refused[64] = "";
+            const struct title_wait *w = &title_waits[!graphics];
+            LONG waits = w->calls;
             if (graphics)
                 snprintf(refused, sizeof(refused), "; %ld distinct stages refused so far",
                          min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
             rebox_log("d3d12_xs: console %s: compiles at title threads %s; at background workers %s%s; descriptor "
-                      "bindings kept from earlier draws %ld, resolved %ld", graphics ? "graphics" : "compute", rows[0],
-                      rows[1], refused, bind_hits, bind_misses);
+                      "bindings kept from earlier draws %ld, resolved %ld; title threads waited %.2f ms a call (%ld "
+                      "calls, %ld skipped behind a compile past its wait)", graphics ? "graphics" : "compute", rows[0],
+                      rows[1], refused, bind_hits, bind_misses,
+                      w->ticks * 1000.0 / qpc_frequency() / max(waits, 1), waits, w->overruns);
         }
         QueryPerformanceCounter(&started);
         mark = started;

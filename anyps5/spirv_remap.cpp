@@ -35,6 +35,8 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -234,10 +236,11 @@ struct Module {
 
     std::uint32_t Pointer(std::uint32_t storageClass, std::uint32_t pointee) { return Type(OpTypePointer, {storageClass, pointee}); }
 
-    // Every variable at a set and binding. AnyPS5 declares several at one binding: a view of the
-    // guest buffers per element type (buffers, buffers_coherent, buffers_u64, buffers_u8) and an
-    // image table per image type (table_images_N). Each one must move, not just the first.
-    std::vector<std::uint32_t> VariablesAt(std::uint32_t set, std::uint32_t binding) const
+    // Every variable at each set and binding, in id order, in one walk of the decorations. AnyPS5
+    // declares several at one binding: a view of the guest buffers per element type (buffers,
+    // buffers_coherent, buffers_u64, buffers_u8) and an image table per image type
+    // (table_images_N). Each one must move, not just the first.
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::uint32_t>> VariablesByBinding() const
     {
         std::map<std::uint32_t, std::uint32_t> sets, bindings;
         for (const auto& inst : insts) {
@@ -245,10 +248,9 @@ struct Module {
             if (inst[2] == DecorationDescriptorSet) sets[inst[1]] = inst[3];
             if (inst[2] == DecorationBinding) bindings[inst[1]] = inst[3];
         }
-        std::vector<std::uint32_t> found;
+        std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::uint32_t>> found;
         for (const auto& [id, b] : bindings)
-            if (b == binding && sets.count(id) && sets.at(id) == set) found.push_back(id);
-        if (found.empty()) Fail("no variable at set " + std::to_string(set) + " binding " + std::to_string(binding));
+            if (const auto s = sets.find(id); s != sets.end()) found[{s->second, b}].push_back(id);
         return found;
     }
 
@@ -341,6 +343,67 @@ std::vector<std::uint32_t> Freeze(const std::vector<std::uint32_t>& words,
     options.set_run_validator(false);
     if (!optimizer.Run(words.data(), words.size(), &out, options)) Fail("freezing specialization constants failed: " + log);
     return out;
+}
+
+// A result's frozen words, kept for its next module: a stage gets a new module whenever its
+// bindings or host buffers differ (other heap slots, another draw block layout), and each one froze
+// the same words again, a spirv-opt run over the whole module (seconds for a world's
+// million-word pixel and compute stages, on the threads draws wait for). Keyed by the words'
+// 128-bit content hash and length and the specialization values; Freeze is a function of those, so
+// the module is the same either way. REBOX_FREEZE_CACHE_MB (default 512; 0: off) bounds the words
+// kept, the least recently used going first.
+std::uint64_t FreezeCacheBytes()
+{
+    static const std::uint64_t bytes = [] {
+        const char* v = std::getenv("REBOX_FREEZE_CACHE_MB");
+        return (v && *v ? std::strtoull(v, nullptr, 10) : 512u) << 20u;
+    }();
+    return bytes;
+}
+
+struct FrozenEntry {
+    std::mutex once;  // held while the first caller freezes; later ones wait for its words
+    std::shared_ptr<const std::vector<std::uint32_t>> words;
+    std::uint64_t used = 0;
+};
+
+std::shared_ptr<const std::vector<std::uint32_t>> Frozen(sa5_result& result)
+{
+    const auto& constants = result.result.specialization;
+    const std::uint64_t budget = FreezeCacheBytes();
+    if (!budget) return std::make_shared<const std::vector<std::uint32_t>>(Freeze(result.Spirv(), constants));
+    const auto hash = result.result.spirv.ContentHash();
+    std::vector<std::uint64_t> key{hash.low, hash.high, result.result.spirv.size()};
+    for (const auto& c : constants) key.push_back(static_cast<std::uint64_t>(c.id) << 32u | c.value);
+
+    static std::mutex lock;
+    static std::map<std::vector<std::uint64_t>, std::shared_ptr<FrozenEntry>> entries;
+    static std::uint64_t held = 0, clock = 0;
+    std::shared_ptr<FrozenEntry> entry;
+    {
+        std::lock_guard guard(lock);
+        auto& slot = entries[key];
+        if (!slot) slot = std::make_shared<FrozenEntry>();
+        entry = slot;
+        entry->used = ++clock;
+    }
+    std::lock_guard first(entry->once);
+    if (entry->words) return entry->words;
+    auto words = std::make_shared<const std::vector<std::uint32_t>>(Freeze(result.Spirv(), constants));
+    std::lock_guard guard(lock);
+    entry->words = words;
+    held += words->size() * sizeof(std::uint32_t);
+    // Over the budget: the least recently used entries with words go (not this one).
+    while (held > budget) {
+        auto victim = entries.end();
+        for (auto it = entries.begin(); it != entries.end(); ++it)
+            if (it->second->words && it->second != entry && (victim == entries.end() || it->second->used < victim->second->used))
+                victim = it;
+        if (victim == entries.end()) break;
+        held -= victim->second->words->size() * sizeof(std::uint32_t);
+        entries.erase(victim);
+    }
+    return words;
 }
 
 // ---------------------------------------------------------------- 2. guest descriptor arrays
@@ -483,10 +546,25 @@ void RebindVariable(Module& m, const sa5_remap& remap, const DrawBlock* draw, st
     }
 }
 
-void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw, std::set<std::uint32_t>& rebound)
+// The variables a remap or host buffer moves: those at its AnyPS5 set and binding before any move.
+// Looked up again after earlier moves, a binding that is also where an earlier remap put its
+// variables (vkd3d-proton's samplers at set 0 binding 0, where AnyPS5 keeps its guest buffer views)
+// picked those up as well: a compute stage's host buffer then failed as "not a storage buffer".
+using VariableMap = std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::uint32_t>>;
+
+const std::vector<std::uint32_t>& VariablesAt(const VariableMap& bound, std::uint32_t set, std::uint32_t binding)
+{
+    const auto found = bound.find({set, binding});
+    if (found == bound.end() || found->second.empty())
+        Fail("no variable at set " + std::to_string(set) + " binding " + std::to_string(binding));
+    return found->second;
+}
+
+void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw, const VariableMap& bound,
+            std::set<std::uint32_t>& rebound)
 {
     std::uint32_t table = 0, privateUintPtr = 0;
-    for (const std::uint32_t var : m.VariablesAt(remap.set, remap.binding)) {
+    for (const std::uint32_t var : VariablesAt(bound, remap.set, remap.binding)) {
         RebindVariable(m, remap, draw, var, table, privateUintPtr);
         rebound.insert(var);
     }
@@ -714,7 +792,8 @@ void AlignPhysicalAccesses(Module& m)
     }
 }
 
-void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count, const DrawBlock* draw)
+void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count, const DrawBlock* draw,
+                 const VariableMap& bound)
 {
     if (!count) return;
     if (count > MaxHostBuffers) Fail("too many host buffers");
@@ -760,7 +839,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
             m.AddGlobal(Make(OpConstantComposite, {uvec2, address, m.Constant(static_cast<std::uint32_t>(buffers[i].address)),
                                                    m.Constant(static_cast<std::uint32_t>(buffers[i].address >> 32u))}));
         }
-        for (const std::uint32_t var : m.VariablesAt(buffers[i].set, buffers[i].binding)) {
+        for (const std::uint32_t var : VariablesAt(bound, buffers[i].set, buffers[i].binding)) {
             const Inst varDef = m.Def(var);
             if (varDef[3] != StorageClassStorageBuffer) Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is not a storage buffer");
             std::uint32_t block = m.Def(varDef[1])[3];
@@ -1020,13 +1099,14 @@ void Finish(Module& m, const sa5_remap* remaps, std::uint32_t remap_count, const
         Fail("the draw block's address must be 8-byte aligned in the push block");
     FreezeMeshDraw(m);
     std::set<std::uint32_t> rebound;
+    const VariableMap bound = m.VariablesByBinding();
     if (draw_block_base == SA5_NO_DRAW_BLOCK) {
-        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr, rebound);
-        HostBuffers(m, buffers, buffer_count, nullptr);
+        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr, bound, rebound);
+        HostBuffers(m, buffers, buffer_count, nullptr, bound);
     } else {
         const DrawBlock draw(m, draw_block_base);
-        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw, rebound);
-        HostBuffers(m, buffers, buffer_count, &draw);
+        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw, bound, rebound);
+        HostBuffers(m, buffers, buffer_count, &draw, bound);
     }
     CheckBindings(m, rebound);
     const auto words = m.Words();
@@ -1052,7 +1132,7 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
 {
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
-        Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
+        Module m(*Frozen(*const_cast<sa5_result*>(result)));
         Finish(m, remaps, remap_count, buffers, buffer_count, SA5_NO_DRAW_BLOCK, out, out_count);
         return 0;
     } catch (const std::exception& e) {
@@ -1066,7 +1146,7 @@ SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_
 {
     try {
         if (!result || !out || !out_count || draw_block_base == SA5_NO_DRAW_BLOCK) Fail("bad arguments");
-        Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
+        Module m(*Frozen(*const_cast<sa5_result*>(result)));
         Finish(m, remaps, remap_count, buffers, buffer_count, draw_block_base, out, out_count);
         return 0;
     } catch (const std::exception& e) {

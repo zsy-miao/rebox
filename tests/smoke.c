@@ -2610,6 +2610,27 @@ static void test_remap_aliases(void)
         out = NULL;
     }
 
+    /* The image tables moved onto the binding where AnyPS5 keeps the guest buffers (vkd3d-proton's
+     * samplers at set 0 binding 0, AnyPS5's buffer views there too): the host buffer is still only
+     * the buffer views, not the tables just moved there ("not a storage buffer" before). */
+    for (int draw = 0; draw < 2; draw++)
+    {
+        struct sa5_remap onto = remap;
+        int failed;
+        BOOL valid;
+        onto.new_set = 0;
+        onto.new_binding = 7;
+        error[0] = 0;
+        failed = finalize_words(s.w, s.n, &onto, 1, &host, 1, draw ? 128 : SA5_NO_DRAW_BLOCK, &out, &count, error,
+                                sizeof(error));
+        valid = !failed && validate && !validate(out, count, error, sizeof(error));
+        CHECK(valid, "sa5_finalize_words (%s) moves image tables onto the guest buffers' binding and still binds "
+              "only the buffers as the host buffer %s", draw ? "draw block" : "baked", error);
+        if (!failed)
+            free_words(out);
+        out = NULL;
+    }
+
     /* The guest buffers not given as a host buffer: both their variables stay at set 0 binding 7. */
     error[0] = 0;
     CHECK(finalize_words(s.w, s.n, &remap, 1, NULL, 0, 128, &out, &count, error, sizeof(error))
