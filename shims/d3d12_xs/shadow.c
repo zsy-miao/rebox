@@ -879,27 +879,39 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
     ReleaseSRWLockExclusive(&lock);
 }
 
-/* Whether [va, va + size) can go in the BDA page table as identity-mapped memory: a title address
- * (4 GiB to 2^46, outside the GPU window, as proxy.c's ia_adopt) only if it is GPU memory or can be
- * made so; anything else is vkd3d-proton's own. A constant buffer in title memory that isn't GPU
- * memory (pages of a render-target pool) was mapped anyway, and shaders reading through the table
- * faulted the GPU. */
-static BOOL buffer_range_mappable(UINT64 va, UINT64 size)
+/* How many bytes from va of [va, va + size) the GPU can read, 0 if it can't read va: what a
+ * constant buffer view may cover and what may go in the BDA page table as identity-mapped memory.
+ * A title address (4 GiB to 2^46, outside the GPU window, as proxy.c's ia_adopt) only if it is GPU
+ * memory or can be made so: a constant buffer in title memory that isn't GPU memory (pages of a
+ * render-target pool) was mapped anyway, and shaders reading through the table faulted the GPU.
+ * Below 4 GiB (RADV's low window) and in the GPU memory window, only Rebox's GPU memory chunks and
+ * buffers the title knows (resources it made views of or asked the address of), up to their end,
+ * as for root views (proxy.c's gpu_buffer_known): these addresses were all taken as vkd3d-proton's
+ * own, so a view at one in no allocation went in the page table and the known ranges, and the
+ * root view, vertex buffer and guest buffer checks then let reads there through. */
+UINT64 shadow_buffer_range_usable(UINT64 va, UINT64 size)
 {
     UINT64 end;
-    if (va < 0x100000000ull || va + size > 0x400000000000ull
-            || (va + size > 0x200000000000ull && va < 0x210000000000ull))
-        return TRUE;
+    if (!va || !size || va + size < va)
+        return 0;
+    if (va < 0x100000000ull || (va + size > 0x200000000000ull && va < 0x210000000000ull))
+    {
+        if (!shadow_buffer_range_at(va, NULL, &end) && !gpu_memory_gpu_extent(va, &end))
+            return 0;
+        return min(size, end - va);
+    }
+    if (va + size > 0x400000000000ull)
+        return size;
     if (gpu_memory_identity_extent(va, &end) && end >= va + size)
-        return TRUE;
-    return gpu_memory_adopt(va, size);
+        return size;
+    return gpu_memory_adopt(va, size) ? size : 0;
 }
 
-void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, UINT64 usable)
 {
     UINT32 w[8];
-    if (desc && desc->BufferLocation && buffer_range_mappable(desc->BufferLocation, desc->SizeInBytes))
-        note_buffer_range(desc->BufferLocation, desc->SizeInBytes);
+    if (desc && desc->BufferLocation && usable)
+        note_buffer_range(desc->BufferLocation, usable);
     console_encode_cbv(desc, w);
     write_slot(cpu, w, sizeof(w), desc && desc->BufferLocation ? SHADOW_VIEW_CBV : SHADOW_VIEW_NONE, NULL);
 }

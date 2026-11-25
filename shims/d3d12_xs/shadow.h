@@ -38,7 +38,12 @@ SIZE_T shadow_title_cpu_start(SIZE_T cpu_start);
 /* A title CPU handle in a placed heap as vkd3d-proton's; any other handle unchanged. */
 SIZE_T shadow_cpu_to_inner(SIZE_T cpu);
 BOOL shadow_title_heaps_placed(void);
-void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc);
+/* usable: shadow_buffer_range_usable of the view's range (only that much is noted as a buffer). */
+void shadow_write_cbv(SIZE_T cpu, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, UINT64 usable);
+/* How many bytes from va of [va, va + size) the GPU can read (title memory made GPU memory in place
+ * if it can be; below 4 GiB and in the GPU memory window, only known buffers and Rebox's chunks, up
+ * to their end); 0 if it can't read va. */
+UINT64 shadow_buffer_range_usable(UINT64 va, UINT64 size);
 void shadow_write_srv(SIZE_T cpu, ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc);
 void shadow_write_uav(SIZE_T cpu, ID3D12Resource *res, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc);
 void shadow_write_sampler(SIZE_T cpu, const D3D12_SAMPLER_DESC *desc);

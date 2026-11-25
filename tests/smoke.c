@@ -1658,6 +1658,20 @@ static void test_present(void *dev, void *queue)
             CHECK(words && (words[1] >> 16 & 0x3fff) == 16 && words[2] == 256 / 16 && (words[3] >> 28 & 3) == 1,
                   "the CBV's V# has stride 16 and its size in rows (%08x %08x %08x)", words ? words[1] : 0,
                   words ? words[2] : 0, words ? words[3] : 0);
+            /* A CBV at a low address in no buffer (a TCP read faulted the GPU at 0x31016000, below 4
+             * GiB and in no allocation): its words still reach the shadow heap, but it doesn't make
+             * that memory a known buffer, which would let V#s and root views there through. */
+            {
+                UINT64 (WINAPI *length)(UINT64, UINT64) =
+                        (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGuestBufferLength");
+                D3D12_CONSTANT_BUFFER_VIEW_DESC wild = { 0x31016200, 0x30 };
+                XSLOT(dev, 17, void, const D3D12_CONSTANT_BUFFER_VIEW_DESC *, SIZE_T)(dev, &wild, start + 4 * inc);
+                words = pdata ? (const UINT32 *)((BYTE *)pdata + 4 * pstride) : NULL;
+                CHECK(words && words[0], "a CBV at an address in no buffer still reaches the shadow heap (%08x)",
+                      words ? words[0] : 0);
+                CHECK(length && !length(wild.BufferLocation, 0x30), "a CBV at a low address in no buffer doesn't make "
+                      "it a buffer V#s may read (%#llx)", length ? (unsigned long long)length(wild.BufferLocation, 0x30) : 0);
+            }
             if (cbuf) ID3D12Resource_Release(cbuf);
         }
         if (pheap) XSLOT(pheap, 2, ULONG)(pheap);
