@@ -56,12 +56,13 @@ struct proxy_class
     BOOL custom[MAX_SLOTS], forwarded[MAX_SLOTS];
 };
 
-/* Command-list data from slot 148, freed a few Resets after use. */
+/* Command-list data from slot 148, freed a few Resets after use, once the GPU is past it. */
 struct embedded
 {
     BYTE *cpu;
     SIZE_T size, used;
     unsigned generation;
+    LONG64 retired_at; /* QueryPerformanceCounter time of the reset that retired it */
     struct embedded *next;
 };
 
@@ -5072,6 +5073,16 @@ static struct gpu_latency_entry gpu_latency[4096];
 static UINT gpu_latency_head, gpu_latency_tail;
 static SRWLOCK gpu_latency_lock = SRWLOCK_INIT;
 
+/* The QueryPerformanceCounter time before which every submission has finished on the GPU, as the
+ * latency thread last saw (every 20 ms); 0 until the first submission. Entries of several queues
+ * interleave, so it is a lower bound. */
+static volatile LONG64 gpu_finished_before;
+
+LONG64 proxy_gpu_finished_before(void)
+{
+    return gpu_finished_before;
+}
+
 /* Memory, every 10 s: a run killed for using too much (a host OOM watcher) left no other trace.
  * Then the resources Rebox gives memory of their own: alive (MiB), +made -destroyed in the last
  * 10 s; alias heaps (place_aliased_texture); memory views kept, and retired ones waiting for the
@@ -5193,6 +5204,12 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
             ID3D12Fence_Release(e->fence);
             gpu_latency_tail++;
         }
+        {
+            LARGE_INTEGER inside;
+            QueryPerformanceCounter(&inside);
+            InterlockedExchange64(&gpu_finished_before, gpu_latency_tail != gpu_latency_head
+                                  ? gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].at : inside.QuadPart);
+        }
         /* Retired view resources go once the GPU is past everything submitted before them. */
         reap_before = now.QuadPart - f.QuadPart * VIEW_RETIRE_MS / 1000;
         if (gpu_latency_tail != gpu_latency_head)
@@ -5238,8 +5255,10 @@ static void gpu_latency_note(struct proxy *queue)
     if (!InterlockedExchange(&started, 1))
         CloseHandle(CreateThread(NULL, 0, gpu_latency_thread, NULL, 0, NULL));
     ID3D12CommandQueue_Signal(INNER(queue, ID3D12CommandQueue), queue->timing_fence, ++queue->timing_value);
-    QueryPerformanceCounter(&now);
     AcquireSRWLockExclusive(&gpu_latency_lock);
+    /* Taken under the lock, so the thread's proxy_gpu_finished_before never passes an entry not
+     * yet listed. */
+    QueryPerformanceCounter(&now);
     if (gpu_latency_head - gpu_latency_tail < ARRAYSIZE(gpu_latency))
     {
         ID3D12Fence_AddRef(queue->timing_fence);
@@ -5854,8 +5873,11 @@ static void STDMETHODCALLTYPE list_CopyTextureRegionX(struct proxy *p, const D3D
     ID3D12GraphicsCommandList_CopyTextureRegion(INNER(p, ID3D12GraphicsCommandList), dst, x, y, z, src, box);
 }
 
-/* Embedded data lives until the list has been reset this many more times;
- * by then the GPU work that read it has normally finished. */
+/* Embedded data lives until the list has been reset this many more times, and until the GPU has
+ * finished every submission made before the reset that retired it (proxy_gpu_finished_before): a
+ * pooled list is reset many times a frame, and with the GPU seconds behind (it was 2 s behind just
+ * before a fault) the reset count alone could free data queued submissions still read, the next
+ * list's data landing where a draw's tables and constant buffers had been. */
 #define EMBEDDED_KEEP_RESETS 3
 
 /* Console methods with nothing to do on the host (cache flushes, depth bounds). */
@@ -6659,7 +6681,10 @@ static void STDMETHODCALLTYPE list_CopyRaytracingAccelerationStructure(struct pr
 static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
     struct embedded **e, *keep = NULL, *drop = NULL;
+    LONG64 finished_before = proxy_gpu_finished_before();
+    LARGE_INTEGER now;
 
+    QueryPerformanceCounter(&now);
     p->cpu_write_count = 0;
     p->gpu_write_count = 0;
     p->wait_count = 0;
@@ -6673,6 +6698,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
         struct embedded *a = p->active;
         p->active = a->next;
         a->generation = p->resets;
+        a->retired_at = now.QuadPart;
         a->next = p->retired;
         p->retired = a;
     }
@@ -6680,7 +6706,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     {
         struct embedded *a = *e;
         *e = a->next;
-        if (a->generation + EMBEDDED_KEEP_RESETS <= p->resets)
+        if (a->generation + EMBEDDED_KEEP_RESETS <= p->resets && a->retired_at < finished_before)
             a->next = drop, drop = a;
         else
             a->next = keep, keep = a;

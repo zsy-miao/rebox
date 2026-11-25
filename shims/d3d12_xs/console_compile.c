@@ -30,6 +30,7 @@
 #include "console_fssm.h"
 #include "console_desc.h"
 #include "gpu_memory.h"
+#include "proxy.h"
 #include "shadow.h"
 #include "title_textures.h"
 
@@ -379,14 +380,66 @@ static struct host_buffer { UINT64 hash, gpu; SIZE_T size; const void *cpu; stru
 /* GPU memory for contents that change with every draw or dispatch (guest buffer tables, the
  * flattened SRT, shader data, image table maps: they hold the title's per-draw constant buffer
  * addresses and table pointers): a ring, bump-allocated and wrapped. Sharing by content never hit
- * for those, so each draw allocated GPU memory it never freed, about 10 ms each. The ring is large
- * enough that a slot is reused long after the GPU read it (frames are far fewer draws than its
- * DRAW_RING / 256 slots). */
+ * for those, so each draw allocated GPU memory it never freed, about 10 ms each.
+ *
+ * A wrap reuses the ring only once the GPU has finished every submission made before
+ * DRAW_RING_SUBMIT_MS after the lap began (proxy_gpu_finished_before; a block is written when its
+ * draw is recorded and read when the list runs, normally well within that). Otherwise a fresh ring
+ * takes over and the old one is freed once the GPU is past that much after its last block: a draw
+ * block overwritten under a queued draw gave its stage another draw's guest buffer table, SRT and
+ * heap slots, wild scalar reads. */
 #define DRAW_RING (128u << 20)
+#define DRAW_RING_SUBMIT_MS 2000
+#define DRAW_RINGS_RETIRED 8
 
 static SRWLOCK ring_lock = SRWLOCK_INIT;
 static BYTE *ring_cpu;
 static UINT64 ring_gpu, ring_head;
+static LONG64 ring_lap_start; /* QueryPerformanceCounter time of the current lap's first block */
+static struct { BYTE *cpu; LONG64 last; } rings_retired[DRAW_RINGS_RETIRED];
+static UINT rings_retired_count;
+static LONG64 (*ring_gpu_finished_before)(void) = proxy_gpu_finished_before;
+
+/* For tests: the GPU progress the ring asks for, instead of the proxies' (NULL restores it). */
+void WINAPI ReboxConsoleRingProgress(LONG64 (*finished_before)(void))
+{
+    AcquireSRWLockExclusive(&ring_lock);
+    ring_gpu_finished_before = finished_before ? finished_before : proxy_gpu_finished_before;
+    ReleaseSRWLockExclusive(&ring_lock);
+}
+
+static LONG64 qpc_now(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+
+static LONG64 qpc_ms(LONG64 ms)
+{
+    static LONG64 frequency;
+    if (!frequency)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        frequency = f.QuadPart;
+    }
+    return frequency * ms / 1000;
+}
+
+/* Under ring_lock: retired rings the GPU is past go. */
+static void rings_reap(LONG64 finished_before)
+{
+    UINT kept = 0;
+    for (UINT i = 0; i < rings_retired_count; i++)
+    {
+        if (rings_retired[i].last + qpc_ms(DRAW_RING_SUBMIT_MS) < finished_before)
+            ReboxGpuFree(rings_retired[i].cpu);
+        else
+            rings_retired[kept++] = rings_retired[i];
+    }
+    rings_retired_count = kept;
+}
 
 static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 {
@@ -403,17 +456,47 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
         ReleaseSRWLockExclusive(&ring_lock);
         return 0;
     }
+    if (!ring_lap_start)
+        ring_lap_start = qpc_now();
     if (ring_head + aligned > DRAW_RING)
     {
-        /* How long a lap takes: under a frame or two, slots are reused while the GPU may still
-         * read them (there is no fence here). */
-        static ULONGLONG lap_start;
-        static LONG laps;
-        ULONGLONG now = GetTickCount64();
-        if (lap_start && (now - lap_start < 2000 || InterlockedIncrement(&laps) <= 4))
-            rebox_log("d3d12_xs: the per-draw ring wrapped after %llu ms", now - lap_start);
-        lap_start = now;
+        static LONG laps, fresh;
+        LONG64 now = qpc_now(), finished_before = ring_gpu_finished_before();
+        BYTE *new_cpu;
+        UINT64 new_gpu;
+        if (rings_retired_count)
+            rings_reap(finished_before);
+        if (finished_before <= ring_lap_start + qpc_ms(DRAW_RING_SUBMIT_MS)
+                && rings_retired_count < DRAW_RINGS_RETIRED
+                && SUCCEEDED(ReboxGpuAlloc(DRAW_RING, 256, (void **)&new_cpu, &new_gpu)))
+        {
+            /* The GPU may still read this lap's blocks: a fresh ring. */
+            if (InterlockedIncrement(&fresh) <= 8)
+                rebox_log("d3d12_xs: the per-draw ring filled in %lld ms with the GPU not yet past its first "
+                          "blocks: a fresh ring (%u waiting to be freed)", (now - ring_lap_start) / qpc_ms(1),
+                          rings_retired_count + 1);
+            rings_retired[rings_retired_count].cpu = ring_cpu;
+            rings_retired[rings_retired_count++].last = now;
+            ring_cpu = new_cpu;
+            ring_gpu = new_gpu;
+        }
+        else if (finished_before <= ring_lap_start + qpc_ms(DRAW_RING_SUBMIT_MS))
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: the per-draw ring wrapped after %lld ms with the GPU not yet past its first "
+                          "blocks, and no fresh ring could be had: reused", (now - ring_lap_start) / qpc_ms(1));
+        }
+        else if (InterlockedIncrement(&laps) <= 4)
+            rebox_log("d3d12_xs: the per-draw ring wrapped after %lld ms", (now - ring_lap_start) / qpc_ms(1));
+        ring_lap_start = now;
         ring_head = 0;
+    }
+    else if (rings_retired_count)
+    {
+        static UINT blocks;
+        if (!(++blocks & 4095))
+            rings_reap(ring_gpu_finished_before());
     }
     at = ring_head;
     ring_head += aligned;
@@ -427,6 +510,12 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 UINT64 console_draw_buffer(const void *data, SIZE_T size)
 {
     return draw_buffer(data, size, NULL);
+}
+
+/* For tests: a block of the per-draw ring holding size bytes of data; its CPU address in *cpu. */
+UINT64 WINAPI ReboxConsoleRingBlock(const void *data, SIZE_T size, void **cpu)
+{
+    return draw_buffer(data, size, (BYTE **)cpu);
 }
 
 /* For tests: size bytes of the per-draw ring at a GPU address draw_buffer gave (a draw block). */

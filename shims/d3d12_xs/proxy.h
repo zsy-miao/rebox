@@ -22,6 +22,11 @@ ID3D12GraphicsCommandList *proxy_list(void *list, ID3D12DescriptorHeap **heaps, 
 void proxy_frame_presented(void);
 void proxy_log_slot_stats(void);
 
+/* The QueryPerformanceCounter time before which every submission (ExecuteCommandLists through the
+ * proxies) has finished on the GPU, as last seen (every 20 ms); 0 before the first. Memory the GPU
+ * may read is reused or freed only once this passes the time it was last handed to the GPU. */
+LONG64 proxy_gpu_finished_before(void);
+
 /* Proxy -> vkd3d-proton object; anything else is returned unchanged. */
 void *proxy_unwrap(void *object);
 

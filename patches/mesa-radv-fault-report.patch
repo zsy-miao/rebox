@@ -1,0 +1,625 @@
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 6abb751..7eab659 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -4399,7 +4399,7 @@ radv_emit_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer)
+       radv_cs_add_buffer(device->ws, cs->b, pipeline->sqtt_shaders_reloc->bo);
+    }
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_pipeline_trace_enabled(device))
+       radv_save_pipeline(cmd_buffer, &pipeline->base);
+ }
+ 
+@@ -9049,7 +9049,7 @@ radv_emit_ray_tracing_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_r
+       radeon_end();
+    }
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_pipeline_trace_enabled(device))
+       radv_save_pipeline(cmd_buffer, &pipeline->base.base);
+ }
+ 
+@@ -9064,7 +9064,7 @@ radv_emit_compute_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_compu
+ 
+    radv_emit_compute_shader(pdev, cs, cmd_buffer->state.shaders[MESA_SHADER_COMPUTE], true);
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_pipeline_trace_enabled(device))
+       radv_save_pipeline(cmd_buffer, &pipeline->base);
+ }
+ 
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index da2a20c..f6e0219 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -40,6 +40,8 @@
+ #include "util/mesa-blake3.h"
+ #include "util/u_atomic.h"
+ #include "util/u_process.h"
++#include "util/os_misc.h"
++#include "util/set.h"
+ #include "git_sha1.h"
+ #include "vk_sync.h"
+ 
+@@ -631,6 +633,17 @@ radv_device_init_device_fault_detection(struct radv_device *device)
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
++   if (radv_device_fault_report_enabled(device)) {
++      /* rebox: the trace buffer (for the bound pipeline) and address binding reports, no waits. */
++      if (!radv_init_trace(device))
++         return VK_ERROR_INITIALIZATION_FAILED;
++      simple_mtx_init(&device->fault_report_mtx, mtx_plain);
++      device->fault_report_pipelines = _mesa_pointer_set_create(NULL);
++      fprintf(stderr, "radv: RADV_DEBUG=faultreport: a GPUVM fault's report goes to %s.\n",
++              os_get_option("RADV_DUMP_DIR") ? os_get_option("RADV_DUMP_DIR") : "$HOME");
++      return VK_SUCCESS;
++   }
++
+    if (!radv_device_fault_detection_enabled(device))
+       return VK_SUCCESS;
+ 
+@@ -656,6 +669,11 @@ radv_device_finish_device_fault_detection(struct radv_device *device)
+ {
+    radv_finish_trace(device);
+    ralloc_free(device->gpu_hang_report);
++   if (device->fault_report_pipelines) {
++      _mesa_set_destroy(device->fault_report_pipelines, NULL);
++      device->fault_report_pipelines = NULL;
++      simple_mtx_destroy(&device->fault_report_mtx);
++   }
+ }
+ 
+ static VkResult
+diff --git a/src/amd/vulkan/radv_device.h b/src/amd/vulkan/radv_device.h
+index d7c6416..ba7a112 100644
+--- a/src/amd/vulkan/radv_device.h
++++ b/src/amd/vulkan/radv_device.h
+@@ -321,6 +321,12 @@ struct radv_device {
+ 
+    struct radv_address_binding_tracker *addr_binding_tracker;
+ 
++   /* rebox: RADV_DEBUG=faultreport: the live pipelines (the trace buffer's pipeline is only
++    * dereferenced when it is one), and whether the report was written. */
++   struct set *fault_report_pipelines;
++   simple_mtx_t fault_report_mtx;
++   bool fault_report_written;
++
+    struct radv_compiler_info compiler_info;
+ 
+    struct radv_shader_abort_data shader_abort;
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index ea450f1..ddffc16 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -101,6 +101,7 @@ static const struct debug_control_bitset radv_debug_options[] = {
+    OPT1("fullsync", RADV_DEBUG_FULL_SYNC),
+    OPT1("notmz", RADV_DEBUG_NO_TMZ),
+    OPT1("noheap", RADV_DEBUG_NO_HEAP),
++   OPT1("faultreport", RADV_DEBUG_FAULT_REPORT),
+    {
+       NULL,
+    }
+diff --git a/src/amd/vulkan/radv_instance.h b/src/amd/vulkan/radv_instance.h
+index b15113a..b1a17d9 100644
+--- a/src/amd/vulkan/radv_instance.h
++++ b/src/amd/vulkan/radv_instance.h
+@@ -93,6 +93,7 @@ enum radv_debug_flag {
+    RADV_DEBUG_FULL_SYNC,
+    RADV_DEBUG_NO_TMZ,
+    RADV_DEBUG_NO_HEAP,
++   RADV_DEBUG_FAULT_REPORT,
+ 
+    RADV_DEBUG_COUNT,
+ };
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index 7bc63a5..037b562 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -12,6 +12,7 @@
+ #include "meta/radv_meta.h"
+ #include "nir/nir.h"
+ #include "nir/radv_nir.h"
++#include "tools/radv_debug_hang.h"
+ #include "tools/radv_rmv.h"
+ #include "util/u_atomic.h"
+ #include "radv_pipeline_rt.h"
+@@ -45,12 +46,15 @@ radv_pipeline_init(struct radv_device *device, struct radv_pipeline *pipeline, e
+    vk_object_base_init(&device->vk, &pipeline->base, VK_OBJECT_TYPE_PIPELINE);
+ 
+    pipeline->type = type;
++   radv_fault_report_pipeline_created(device, pipeline);
+ }
+ 
+ void
+ radv_pipeline_destroy(struct radv_device *device, struct radv_pipeline *pipeline,
+                       const VkAllocationCallbacks *allocator)
+ {
++   radv_fault_report_pipeline_destroyed(device, pipeline);
++
+    if (pipeline->cache_object)
+       vk_pipeline_cache_object_unref(&device->vk, pipeline->cache_object);
+ 
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 80cfc66..5a37e9c 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -1858,6 +1858,10 @@ radv_queue_handle_fault_state(struct radv_queue *queue)
+    struct radv_device *device = radv_queue_device(queue);
+ 
+    radv_report_gpuvm_fault(device);
++
++   /* rebox: RADV_DEBUG=faultreport */
++   if (radv_device_fault_report_enabled(device))
++      radv_write_fault_report(queue);
+ }
+ 
+ static VkResult
+diff --git a/src/amd/vulkan/radv_radeon_winsys.h b/src/amd/vulkan/radv_radeon_winsys.h
+index e200bcb..a51afaf 100644
+--- a/src/amd/vulkan/radv_radeon_winsys.h
++++ b/src/amd/vulkan/radv_radeon_winsys.h
+@@ -311,6 +311,9 @@ struct radeon_winsys {
+ 
+    void (*dump_bo_log)(struct radeon_winsys *ws, FILE *file);
+ 
++   /* rebox: the BO history entries around one address, and the live BOs nearest it. */
++   void (*dump_bo_log_va)(struct radeon_winsys *ws, uint64_t va, FILE *file);
++
+    bool (*bo_wait_for_idle)(struct radeon_winsys *ws, struct radeon_winsys_bo *bo);
+ 
+    int (*get_fd)(struct radeon_winsys *ws);
+diff --git a/src/amd/vulkan/tools/radv_debug_hang.c b/src/amd/vulkan/tools/radv_debug_hang.c
+index 2be9c5d..5f1b27c 100644
+--- a/src/amd/vulkan/tools/radv_debug_hang.c
++++ b/src/amd/vulkan/tools/radv_debug_hang.c
+@@ -18,6 +18,14 @@
+ #include "spirv/nir_spirv.h"
+ #include "util/mesa-blake3.h"
+ #include "util/os_time.h"
++#include "util/os_misc.h"
++#include "util/set.h"
++#include <inttypes.h>
++#include <time.h>
++#include "util/os_misc.h"
++#include "util/set.h"
++#include <inttypes.h>
++#include <time.h>
+ #include "ac_debug.h"
+ #include "ac_descriptors.h"
+ #include "git_sha1.h"
+@@ -970,8 +978,24 @@ radv_create_dump_dir()
+    timep = os_localtime(&raw_time, &result);
+    strftime(buf_time, sizeof(buf_time), "%Y.%m.%d_%H.%M.%S", timep);
+ 
+-   snprintf(dump_dir, sizeof(dump_dir), "%s/" RADV_DUMP_DIR "_%d_%s", debug_get_option("HOME", "."), getpid(),
+-            buf_time);
++   /* rebox: $RADV_DUMP_DIR (made if missing, with its parents) instead of $HOME when it is set. */
++   const char *parent = os_get_option("RADV_DUMP_DIR");
++   if (parent && *parent) {
++      char path[256];
++      snprintf(path, sizeof(path), "%s", parent);
++      for (char *p = path + 1; *p; p++) {
++         if (*p != '/')
++            continue;
++         *p = '\0';
++         mkdir(path, 0775);
++         *p = '/';
++      }
++      mkdir(path, 0775);
++   } else {
++      parent = debug_get_option("HOME", ".");
++   }
++
++   snprintf(dump_dir, sizeof(dump_dir), "%s/" RADV_DUMP_DIR "_%d_%s", parent, getpid(), buf_time);
+    if (mkdir(dump_dir, 0774) && errno != EEXIST) {
+       fprintf(stderr, "radv: can't create directory '%s' (%i).\n", dump_dir, errno);
+       abort();
+@@ -1125,6 +1149,189 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
+    return VK_ERROR_DEVICE_LOST;
+ }
+ 
++/* rebox: RADV_DEBUG=faultreport (radv_debug_hang.h). */
++void
++radv_fault_report_pipeline_created(struct radv_device *device, struct radv_pipeline *pipeline)
++{
++   if (!device->fault_report_pipelines)
++      return;
++   simple_mtx_lock(&device->fault_report_mtx);
++   _mesa_set_add(device->fault_report_pipelines, pipeline);
++   simple_mtx_unlock(&device->fault_report_mtx);
++}
++
++void
++radv_fault_report_pipeline_destroyed(struct radv_device *device, struct radv_pipeline *pipeline)
++{
++   if (!device->fault_report_pipelines)
++      return;
++   simple_mtx_lock(&device->fault_report_mtx);
++   _mesa_set_remove_key(device->fault_report_pipelines, pipeline);
++   simple_mtx_unlock(&device->fault_report_mtx);
++}
++
++static void
++radv_fault_report_shader(const struct radv_shader *shader, mesa_shader_stage stage, const struct radv_pipeline *pipeline,
++                         const char *dump_dir, FILE *f)
++{
++   char hash[BLAKE3_HEX_LEN];
++
++   if (!shader)
++      return;
++
++   _mesa_blake3_format(hash, shader->hash);
++   fprintf(f, "  %s: code at 0x%" PRIx64 "-0x%" PRIx64 " (%u bytes, %u executable), wave%u, %u SGPRs, %u VGPRs,"
++              " scratch %u bytes/lane, blake3 %s\n",
++           radv_get_shader_name(&shader->info, stage), shader->va, shader->va + shader->code_size, shader->code_size,
++           shader->exec_size, shader->info.wave_size, shader->config.num_sgprs, shader->config.num_vgprs,
++           shader->config.scratch_bytes_per_wave / MAX2(shader->info.wave_size, 1), hash);
++
++   const struct radv_userdata_locations *locs = &shader->info.user_sgprs_locs;
++   fprintf(f, "    user SGPRs:");
++   for (unsigned i = 0; i < MAX_SETS; i++)
++      if (locs->descriptor_sets[i].sgpr_idx != -1)
++         fprintf(f, " set%u=s%d", i, locs->descriptor_sets[i].sgpr_idx);
++   for (unsigned i = 0; i < RADV_MAX_HEAPS; i++)
++      if (locs->descriptor_heaps[i].sgpr_idx != -1)
++         fprintf(f, " heap%u=s%d", i, locs->descriptor_heaps[i].sgpr_idx);
++   for (unsigned i = 0; i < AC_UD_MAX_UD; i++)
++      if (locs->shader_data[i].sgpr_idx != -1)
++         fprintf(f, " ud%u=s%d(%u)", i, locs->shader_data[i].sgpr_idx, locs->shader_data[i].num_sgprs);
++   fprintf(f, "\n");
++
++   if (shader->code && dump_dir) {
++      char path[512];
++      snprintf(path, sizeof(path), "%s/pipeline_%" PRIx64 "_%s.bin", dump_dir, (uint64_t)(uintptr_t)pipeline,
++               mesa_shader_stage_name(stage));
++      FILE *code = fopen(path, "wb");
++      if (code) {
++         fwrite(shader->code, shader->code_size, 1, code);
++         fclose(code);
++         fprintf(f, "    code: %s\n", path);
++      }
++   }
++
++   if (shader->dbg.disasm_string)
++      fprintf(f, "    DISASM:\n%s\n", shader->dbg.disasm_string);
++}
++
++static void
++radv_fault_report_pipeline(struct radv_device *device, const char *ring_name, uint64_t saved, const char *dump_dir,
++                           FILE *f)
++{
++   struct radv_pipeline *pipeline = (struct radv_pipeline *)(uintptr_t)saved;
++
++   fprintf(f, "Last pipeline the %s ring's command processor bound: ", ring_name);
++   if (!pipeline) {
++      fprintf(f, "none\n\n");
++      return;
++   }
++   /* The trace buffer is written as the command processor runs ahead of the shaders, without
++    * waits: this is the pipeline of the last bind it reached, at or after the faulting one. */
++   fprintf(f, "VkPipeline 0x%" PRIx64 "\n", (uint64_t)(uintptr_t)pipeline);
++
++   simple_mtx_lock(&device->fault_report_mtx);
++   if (!_mesa_set_search(device->fault_report_pipelines, pipeline)) {
++      simple_mtx_unlock(&device->fault_report_mtx);
++      fprintf(f, "  (destroyed since)\n\n");
++      return;
++   }
++
++   fprintf(f, "  hash %016" PRIx64 ", type %d, name %s\n", pipeline->pipeline_hash, pipeline->type,
++           pipeline->base.object_name ? pipeline->base.object_name : "<unnamed>");
++
++   for (unsigned s = 0; s < MESA_VULKAN_SHADER_STAGES; s++)
++      radv_fault_report_shader(pipeline->shaders[s], s, pipeline, dump_dir, f);
++   if (pipeline->type == RADV_PIPELINE_RAY_TRACING) {
++      struct radv_ray_tracing_pipeline *rt_pipeline = radv_pipeline_to_ray_tracing(pipeline);
++      radv_fault_report_shader(rt_pipeline->prolog, MESA_SHADER_COMPUTE, pipeline, dump_dir, f);
++   }
++   simple_mtx_unlock(&device->fault_report_mtx);
++   fprintf(f, "\n");
++}
++
++/* Called once a submission found the device lost (radv_queue_set_lost): writes what is known
++ * without hang mode's waits to $RADV_DUMP_DIR/radv_dumps_<pid>_<time>/ (else $HOME), once per
++ * device. fault.log first: the GPUVM fault, what the BO history and address binding reports say
++ * of its address, and the pipelines last bound. */
++void
++radv_write_fault_report(struct radv_queue *queue)
++{
++#ifndef _WIN32
++   struct radv_device *device = radv_queue_device(queue);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++   struct radv_winsys_gpuvm_fault_info fault_info = {0};
++   char path[512];
++   FILE *f;
++
++   if (!device->fault_report_pipelines)
++      return;
++
++   simple_mtx_lock(&device->fault_report_mtx);
++   bool written = device->fault_report_written;
++   device->fault_report_written = true;
++   simple_mtx_unlock(&device->fault_report_mtx);
++   if (written)
++      return;
++
++   bool vm_fault_occurred = radv_vm_fault_occurred(device, &fault_info);
++   char *dump_dir = radv_create_dump_dir();
++   fprintf(stderr, "radv: device lost; fault report in '%s'.\n", dump_dir);
++
++   snprintf(path, sizeof(path), "%s/fault.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      struct timespec real;
++      clock_gettime(CLOCK_REALTIME, &real);
++      fprintf(f, "Device lost on the %s ring. Now: monotonic %" PRIu64 " ns (the timestamps below), wall %lld.%09ld\n\n",
++              ac_get_ip_type_string(&pdev->info, radv_queue_ring(queue)), (uint64_t)os_time_get_nano(),
++              (long long)real.tv_sec, real.tv_nsec);
++      if (vm_fault_occurred) {
++         radv_dump_vm_fault(device, &fault_info, f);
++         fprintf(f, "\n");
++         if (device->ws->dump_bo_log_va)
++            device->ws->dump_bo_log_va(device->ws, fault_info.addr, f);
++      } else {
++         fprintf(f, "No GPUVM fault reported.\n");
++      }
++      fprintf(f, "\n");
++      radv_fault_report_pipeline(device, "GFX", device->trace_data->gfx_ring_pipeline, dump_dir, f);
++      radv_fault_report_pipeline(device, "COMPUTE", device->trace_data->comp_ring_pipeline, dump_dir, f);
++      fclose(f);
++   }
++
++   snprintf(path, sizeof(path), "%s/bo_history.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      device->ws->dump_bo_log(device->ws, f);
++      fclose(f);
++   }
++   snprintf(path, sizeof(path), "%s/addr_binding_report.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      if (device->addr_binding_tracker)
++         radv_dump_address_binding_reports(device, f);
++      fclose(f);
++   }
++   snprintf(path, sizeof(path), "%s/app_info.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      radv_dump_app_info(device, f);
++      fclose(f);
++   }
++   snprintf(path, sizeof(path), "%s/gpu_info.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      radv_dump_device_name(device, f);
++      ac_print_gpu_info(f, &pdev->info, device->ws->get_fd(device->ws));
++      fclose(f);
++   }
++   snprintf(path, sizeof(path), "%s/dmesg.log", dump_dir);
++   if ((f = fopen(path, "w"))) {
++      radv_dump_dmesg(f);
++      fclose(f);
++   }
++
++   free(dump_dir);
++   fprintf(stderr, "radv: fault report written.\n");
++#endif
++}
++
+ bool
+ radv_trap_handler_init(struct radv_device *device)
+ {
+diff --git a/src/amd/vulkan/tools/radv_debug_hang.h b/src/amd/vulkan/tools/radv_debug_hang.h
+index 720166b..a58c2a3 100644
+--- a/src/amd/vulkan/tools/radv_debug_hang.h
++++ b/src/amd/vulkan/tools/radv_debug_hang.h
+@@ -34,6 +34,33 @@ radv_device_fault_detection_enabled(const struct radv_device *device)
+    return RADV_DEBUG(instance, HANG);
+ }
+ 
++/* rebox: RADV_DEBUG=faultreport. Without hang mode's waits (idle after every draw and submission,
++ * one command buffer per submission), it keeps the BO history and address binding reports, records
++ * the pipeline each queue type last bound (one WRITE_DATA per pipeline bind), and when a submission
++ * finds the device lost after a GPUVM fault, writes a report to $RADV_DUMP_DIR (else $HOME). */
++ALWAYS_INLINE static bool
++radv_device_fault_report_enabled(const struct radv_device *device)
++{
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++   const struct radv_instance *instance = radv_physical_device_instance(pdev);
++
++   return RADV_DEBUG(instance, FAULT_REPORT) && !RADV_DEBUG(instance, HANG);
++}
++
++/* The bound pipeline is recorded in the trace buffer (hang mode or faultreport). */
++ALWAYS_INLINE static bool
++radv_device_pipeline_trace_enabled(const struct radv_device *device)
++{
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++   const struct radv_instance *instance = radv_physical_device_instance(pdev);
++
++   return RADV_DEBUG(instance, HANG) || RADV_DEBUG(instance, FAULT_REPORT);
++}
++
++void radv_fault_report_pipeline_created(struct radv_device *device, struct radv_pipeline *pipeline);
++void radv_fault_report_pipeline_destroyed(struct radv_device *device, struct radv_pipeline *pipeline);
++void radv_write_fault_report(struct radv_queue *queue);
++
+ struct radv_trace_data {
+    uint32_t primary_id;
+    uint32_t secondary_id;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index ea78270..431087c 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -1264,6 +1264,123 @@ radv_amdgpu_dump_bo_log(struct radeon_winsys *_ws, FILE *file)
+    u_rwlock_rdunlock(&ws->log_bo_list_lock);
+ }
+ 
++/* rebox: entries of a BO log sorted by VA, then in log order. */
++struct radv_amdgpu_bo_log_ref {
++   const struct radv_amdgpu_winsys_bo_log *log;
++   uint64_t order;
++};
++
++static int
++radv_amdgpu_bo_log_ref_compare(const void *a, const void *b)
++{
++   const struct radv_amdgpu_bo_log_ref *x = a, *y = b;
++   if (x->log->va != y->log->va)
++      return x->log->va < y->log->va ? -1 : 1;
++   return x->order < y->order ? -1 : x->order > y->order ? 1 : 0;
++}
++
++static void
++radv_amdgpu_print_bo_log_entry(const struct radv_amdgpu_winsys_bo_log *bo_log, FILE *file)
++{
++   if (bo_log->virtual_mapping) {
++      fprintf(file, "  timestamp=%llu, VA=%.16llx-%.16llx, mapped_to=%.16llx\n", (long long)bo_log->timestamp,
++              (long long)radv_amdgpu_canonicalize_va(bo_log->va),
++              (long long)radv_amdgpu_canonicalize_va(bo_log->va + bo_log->size),
++              (long long)radv_amdgpu_canonicalize_va(bo_log->mapped_va));
++   } else {
++      fprintf(file, "  timestamp=%llu, VA=%.16llx-%.16llx, destroyed=%d, is_virtual=%d\n", (long long)bo_log->timestamp,
++              (long long)radv_amdgpu_canonicalize_va(bo_log->va),
++              (long long)radv_amdgpu_canonicalize_va(bo_log->va + bo_log->size), bo_log->destroyed,
++              bo_log->is_virtual);
++   }
++}
++
++/* rebox: what the BO history says about one address (a VM fault's): every creation, destruction
++ * and sparse binding that covered it, and the live BOs ending at or below it and starting above it,
++ * so a read past a BO's end or into a freed one shows as such. */
++static void
++radv_amdgpu_dump_bo_log_va(struct radeon_winsys *_ws, uint64_t va, FILE *file)
++{
++   struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++   struct radv_amdgpu_winsys_bo_log *bo_log;
++   struct radv_amdgpu_bo_log_ref *refs = NULL;
++   uint64_t count = 0, n = 0, covering = 0;
++   const struct radv_amdgpu_winsys_bo_log *below = NULL, *above = NULL;
++
++   if (!ws->debug_log_bos) {
++      fprintf(file, "No BO history (RADV_DEBUG=faultreport or hang keeps it).\n");
++      return;
++   }
++
++   va &= (1ull << 48) - 1;
++
++   u_rwlock_rdlock(&ws->log_bo_list_lock);
++   fprintf(file, "BO history entries covering 0x%.16llx:\n", (long long)va);
++   LIST_FOR_EACH_ENTRY (bo_log, &ws->log_bo_list, list) {
++      count++;
++      if (va >= bo_log->va && va - bo_log->va < bo_log->size) {
++         radv_amdgpu_print_bo_log_entry(bo_log, file);
++         covering++;
++      }
++   }
++   if (!covering)
++      fprintf(file, "  none: no BO this device made ever held that address.\n");
++
++   refs = count ? malloc(count * sizeof(*refs)) : NULL;
++   if (refs) {
++      LIST_FOR_EACH_ENTRY (bo_log, &ws->log_bo_list, list) {
++         if (bo_log->virtual_mapping)
++            continue;
++         refs[n].log = bo_log;
++         refs[n].order = n;
++         n++;
++      }
++   }
++   u_rwlock_rdunlock(&ws->log_bo_list_lock);
++
++   if (!refs) {
++      fprintf(file, "%s\n", count ? "Out of memory sorting the BO history." : "The BO history is empty.");
++      return;
++   }
++
++   /* A VA's last entry says whether a BO lives there now. Entries are never freed while the
++    * device lives, so the pointers stay valid outside the lock. */
++   qsort(refs, n, sizeof(*refs), radv_amdgpu_bo_log_ref_compare);
++   uint64_t live = 0;
++   for (uint64_t i = 0; i < n; i++) {
++      if (i + 1 < n && refs[i + 1].log->va == refs[i].log->va)
++         continue;
++      const struct radv_amdgpu_winsys_bo_log *last = refs[i].log;
++      if (last->destroyed)
++         continue;
++      live++;
++      if (last->va + last->size <= va) {
++         if (!below || last->va + last->size > below->va + below->size)
++            below = last;
++      } else if (last->va > va) {
++         if (!above || last->va < above->va)
++            above = last;
++      }
++   }
++   free(refs);
++
++   fprintf(file, "Live BOs: %llu (of %llu entries). Nearest below 0x%.16llx:\n", (long long)live, (long long)count,
++           (long long)va);
++   if (below) {
++      radv_amdgpu_print_bo_log_entry(below, file);
++      fprintf(file, "  (ends 0x%llx bytes before it)\n", (long long)(va - (below->va + below->size)));
++   } else {
++      fprintf(file, "  none\n");
++   }
++   fprintf(file, "Nearest above:\n");
++   if (above) {
++      radv_amdgpu_print_bo_log_entry(above, file);
++      fprintf(file, "  (starts 0x%llx bytes after it)\n", (long long)(above->va - va));
++   } else {
++      fprintf(file, "  none\n");
++   }
++}
++
+ static void
+ radv_amdgpu_dump_bo_ranges(struct radeon_winsys *_ws, FILE *file)
+ {
+@@ -1326,5 +1443,6 @@ radv_amdgpu_bo_init_functions(struct radv_amdgpu_winsys *ws)
+    ws->base.buffer_make_resident = radv_amdgpu_winsys_bo_make_resident;
+    ws->base.dump_bo_ranges = radv_amdgpu_dump_bo_ranges;
+    ws->base.dump_bo_log = radv_amdgpu_dump_bo_log;
++   ws->base.dump_bo_log_va = radv_amdgpu_dump_bo_log_va;
+    ws->base.bo_wait_for_idle = radv_amdgpu_bo_wait_for_idle;
+ }
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index 8d06821..9252bf7 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -11,9 +11,12 @@
+ #include <assert.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "tools/radv_debug.h"
+ #include "util/hash_table.h"
++#include "util/os_misc.h"
+ #include "util/u_memory.h"
+ #include "ac_linux_drm.h"
+ #include "ac_surface.h"
+@@ -253,13 +256,23 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, const BITSET_W
+ 
+    ws->chain_ib = !BITSET_TEST(debug_flags, RADV_DEBUG_NO_IB_CHAINING);
+    ws->debug_all_bos = BITSET_TEST(debug_flags, RADV_DEBUG_ALL_BOS);
+-   ws->debug_log_bos = BITSET_TEST(debug_flags, RADV_DEBUG_HANG);
++   /* rebox: RADV_DEBUG=faultreport keeps the BO history in memory too, for its report. */
++   ws->debug_log_bos = BITSET_TEST(debug_flags, RADV_DEBUG_HANG) || BITSET_TEST(debug_flags, RADV_DEBUG_FAULT_REPORT);
+    ws->dump_ibs = BITSET_TEST(debug_flags, RADV_DEBUG_DUMP_IBS);
+ 
+    if (BITSET_TEST(debug_flags, RADV_DEBUG_DUMP_BO_HISTORY)) {
+-      ws->bo_history_logfile = fopen("/tmp/radv_bo_history.log", "w+");
++      /* rebox: in $RADV_DUMP_DIR, one per process, when that is set. */
++      char path[512];
++      const char *dir = os_get_option("RADV_DUMP_DIR");
++      if (dir && *dir) {
++         mkdir(dir, 0775);
++         snprintf(path, sizeof(path), "%s/radv_bo_history_%d.log", dir, (int)getpid());
++      } else {
++         snprintf(path, sizeof(path), "/tmp/radv_bo_history.log");
++      }
++      ws->bo_history_logfile = fopen(path, "w+");
+       if (!ws->bo_history_logfile)
+-         fprintf(stderr, "radv/amdgpu: Failed to create /tmp/radv_bo_history.log.\n");
++         fprintf(stderr, "radv/amdgpu: Failed to create %s.\n", path);
+    }
+ 
+    if (ac_drm_cs_create_syncobj2(ws->dev, 0, &ws->vm_timeline_syncobj))
