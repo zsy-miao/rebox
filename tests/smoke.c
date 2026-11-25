@@ -6769,6 +6769,76 @@ static void test_draw_ring_reuse(void)
     progress(NULL);
 }
 
+/* A per-draw ring block written while a list is recorded is read when that list runs: with the
+ * list reset and not yet submitted, and nothing on the GPU, the ring going round (more than two
+ * seconds after the block) must not write over it; once the list has been submitted and has
+ * finished, its ring can go. */
+static void test_draw_ring_open_list(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    UINT64 (WINAPI *block)(const void *, SIZE_T, void **) = (void *)GetProcAddress(m, "ReboxConsoleRingBlock");
+    BOOL (WINAPI *allocated)(const void *) = (void *)GetProcAddress(m, "ReboxGpuAllocated");
+    BOOL (WINAPI *query)(const void *, void **, SIZE_T *) = (void *)GetProcAddress(m, "ReboxGpuQuery");
+    enum { BLOCK = 1 << 20, RING_BLOCKS = 128 };
+    static BYTE data[BLOCK];
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *done = NULL;
+    void *list = NULL, *ring = NULL;
+    BYTE *kept = NULL;
+    BOOL intact = FALSE, freed = FALSE;
+    HRESULT hr;
+    int i;
+
+    CHECK(block && allocated && query, "per-draw ring (open list) test exports");
+    if (!block || !allocated || !query)
+        return;
+    hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&done);
+    CHECK(SUCCEEDED(hr), "per-draw ring (open list): list and fence %#lx", hr);
+    if (FAILED(hr))
+        goto out;
+
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+    memset(data, 0x5a, sizeof(data));
+    if (!block(data, BLOCK, (void **)&kept) || !kept)
+        kept = NULL;
+    if (kept)
+        query(kept, &ring, NULL);
+    /* The list goes on recording: the block is older than the earlier two-second grace. */
+    Sleep(2100);
+    memset(data, 0x3c, sizeof(data));
+    for (i = 0; i < RING_BLOCKS + 2; i++)
+        block(data, BLOCK, NULL);
+    intact = kept && ring && allocated(ring) && kept[0] == 0x5a && kept[BLOCK - 1] == 0x5a;
+    CHECK(intact, "per-draw ring: a block of a list not yet submitted keeps its bytes as the ring goes round (%#x)",
+          kept && ring && allocated(ring) ? kept[0] : 0);
+
+    XSLOT(list, 9, HRESULT)(list);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, done, 1);
+    for (i = 0; i < 500 && ID3D12Fence_GetCompletedValue(done) < 1; i++)
+        Sleep(10);
+    /* The latency thread looks every 20 ms. */
+    Sleep(60);
+    for (i = 0; i < RING_BLOCKS + 2 && ring && allocated(ring); i++)
+        block(data, BLOCK, NULL);
+    freed = ring && !allocated(ring);
+    CHECK(freed, "per-draw ring: once its list has been submitted and has finished, the ring it kept is freed");
+
+out:
+    if (list) IUnknown_Release((IUnknown *)list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (done) ID3D12Fence_Release(done);
+}
+
 /* Command-list embedded data (slot 148) outlives its list's resets until the GPU has finished the
  * submissions made before them: a queue held at a fence wait keeps it through five resets. */
 static void test_embedded_lifetime(void *dev, void *queue)
@@ -7587,6 +7657,7 @@ static void test_xbox(void)
     test_list_queries(dev, queue);
     test_embedded_lifetime(dev, queue);
     test_draw_ring_reuse();
+    test_draw_ring_open_list(dev, queue);
     test_mip_major_layout();
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);
