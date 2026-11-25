@@ -92,6 +92,7 @@ struct proxy
     D3D12_INDEX_BUFFER_VIEW index_buffer;      /* lists: as bound, for REBOX_WATCH_STAGE's vertex log */
     SIZE_T render_target0;     /* lists: the first bound render target view (REBOX_WATCH_STAGE logs it) */
     struct debug_view_list debug_view; /* lists: REBOX_DEBUG_VIEW's view of what is bound */
+    BOOL indirect_barrier;     /* lists: vkd3d-proton has seen a barrier into indirect arguments (indirect_barrier) */
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
     UINT cpu_write_count, cpu_write_capacity;
     struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
@@ -1641,18 +1642,29 @@ static void trace_end(BOOL traced)
 }
 
 /* REBOX_DEBUG_VIEW: around a draw's inner call, what became of it (console_draw_watch_end), counted
- * against the targets bound. */
-static void debug_view_watch_begin(void)
+ * against the targets bound, and in a probed frame what it drew (debug_view.c). args: an
+ * ExecuteIndirect's argument and count buffers, or NULL. */
+static void debug_view_watch_begin_indirect(struct proxy *p, ID3D12Resource *args, UINT64 offset,
+        ID3D12Resource *count, UINT64 count_offset)
 {
-    if (debug_view_on())
-        console_draw_watch_begin();
+    if (!debug_view_on())
+        return;
+    console_draw_watch_begin();
+    debug_view_draw_begin(INNER(p, ID3D12GraphicsCommandList), &p->debug_view, args, offset, count, count_offset);
+}
+
+static void debug_view_watch_begin(struct proxy *p)
+{
+    debug_view_watch_begin_indirect(p, NULL, 0, NULL, 0);
 }
 
 static void debug_view_watch_end(struct proxy *p, BOOL mesh)
 {
     if (debug_view_on())
-        debug_view_draw(&p->debug_view, mesh, console_draw_watch_end());
+        debug_view_draw(INNER(p, ID3D12GraphicsCommandList), &p->debug_view, mesh, console_draw_watch_end());
 }
+
+static void indirect_barrier(struct proxy *p);
 
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
@@ -2226,9 +2238,10 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
             rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
         return;
     }
+    indirect_barrier(p);
     kind = debug_view_on() ? signature_kind(signature) : SIGNATURE_OTHER;
     if (kind != SIGNATURE_OTHER)
-        debug_view_watch_begin();
+        debug_view_watch_begin_indirect(p, args, offset, count_buffer, count_offset);
     traced = trace_begin(p, TRUE, count_buffer ? "indirect-counted" : "indirect", count, 0, 0);
     ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
             p->inner, signature, count, args, offset, count_buffer, count_offset);
@@ -2257,9 +2270,10 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         }
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
+        indirect_barrier(p);
         UINT kind = debug_view_on() ? signature_kind(a) : SIGNATURE_OTHER;
         if (kind != SIGNATURE_OTHER)
-            debug_view_watch_begin();
+            debug_view_watch_begin_indirect(p, c, d, e, f);
         traced = trace_begin(p, TRUE, e ? "indirect-counted" : "indirect", (UINT)b, 0, 0);
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
                 p->inner, a, (UINT)b, c, d, e, f);
@@ -5948,6 +5962,86 @@ static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(struct proxy *p
             values, rect_count, rects);
 }
 
+/* Indirect arguments and the barriers before them, counted for the log (log_indirect_stats). */
+static struct
+{
+    volatile LONG executes;        /* ExecuteIndirects */
+    volatile LONG read_ahead;      /* of them, in a list with no barrier vkd3d-proton takes as into indirect arguments */
+    volatile LONG given;           /* lists given one (indirect_barrier) */
+    volatile LONG title_exact;     /* the title's transitions to exactly INDIRECT_ARGUMENT */
+    volatile LONG title_combined;  /* ... to INDIRECT_ARGUMENT with other states (not taken as one) */
+    volatile LONG title_enhanced;  /* the title's enhanced global or buffer barriers into indirect arguments */
+    volatile LONG syncs;           /* pipeline syncs (list_PipelineSyncX) */
+} indirect_stats;
+
+/* Whether vkd3d-proton takes an enhanced barrier's after-scope as indirect argument reads. */
+static BOOL takes_as_indirect(D3D12_BARRIER_SYNC sync, D3D12_BARRIER_ACCESS access)
+{
+    return (sync & (D3D12_BARRIER_SYNC_ALL | D3D12_BARRIER_SYNC_EXECUTE_INDIRECT))
+            && (access == D3D12_BARRIER_ACCESS_COMMON || (access & D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT));
+}
+
+static void note_indirect_transitions(struct proxy *p, UINT count, const D3D12_RESOURCE_BARRIER *barriers)
+{
+    for (UINT i = 0; i < count; i++)
+    {
+        const D3D12_RESOURCE_BARRIER *b = &barriers[i];
+        if (b->Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || (b->Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
+                || !(b->Transition.StateAfter & D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT))
+            continue;
+        if (b->Transition.StateAfter == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
+        {
+            p->indirect_barrier = TRUE;
+            InterlockedIncrement(&indirect_stats.title_exact);
+        }
+        else
+            InterlockedIncrement(&indirect_stats.title_combined);
+    }
+}
+
+/* REBOX_INDIRECT_BARRIER and REBOX_PIPELINE_SYNC (indirect_barrier, list_PipelineSyncX): on unless 0. */
+static BOOL env_on(const char *name, int *cached)
+{
+    if (*cached < 0)
+    {
+        const char *v = getenv(name);
+        *cached = !(v && *v == '0');
+    }
+    return *cached;
+}
+
+static BOOL indirect_barrier_on(void)
+{
+    static int on = -1;
+    return env_on("REBOX_INDIRECT_BARRIER", &on);
+}
+
+static BOOL pipeline_sync_on(void)
+{
+    static int on = -1;
+    return env_on("REBOX_PIPELINE_SYNC", &on);
+}
+
+/* Every 60 presents while there were any: what the indirect barriers did. */
+static void log_indirect_stats(void)
+{
+    LONG executes = InterlockedExchange(&indirect_stats.executes, 0);
+    LONG read_ahead = InterlockedExchange(&indirect_stats.read_ahead, 0);
+    LONG given = InterlockedExchange(&indirect_stats.given, 0);
+    LONG exact = InterlockedExchange(&indirect_stats.title_exact, 0);
+    LONG combined = InterlockedExchange(&indirect_stats.title_combined, 0);
+    LONG enhanced = InterlockedExchange(&indirect_stats.title_enhanced, 0);
+    LONG syncs = InterlockedExchange(&indirect_stats.syncs, 0);
+    if (!executes && !syncs)
+        return;
+    rebox_log("d3d12_xs: in the last 60 presents: %ld ExecuteIndirects, %ld of them in a list with no barrier "
+              "vkd3d-proton takes as into indirect arguments (%ld lists given one%s); the title's barriers into "
+              "indirect arguments: %ld transitions to exactly INDIRECT_ARGUMENT, %ld with other states too, %ld "
+              "enhanced; %ld pipeline syncs (%s)", executes, read_ahead, given,
+              indirect_barrier_on() ? "" : ": REBOX_INDIRECT_BARRIER=0, their arguments are read ahead of the list",
+              exact, combined, enhanced, syncs, pipeline_sync_on() ? "global barriers" : "ignored: REBOX_PIPELINE_SYNC=0");
+}
+
 /* Barriers are forwarded and also feed PresentX's resource-state tracking:
  * graphics slot 26 / copy slot 15 (PC 26), and enhanced barriers at slot 146
  * (PC 80, ID3D12GraphicsCommandList7::Barrier). */
@@ -5980,6 +6074,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(struct proxy *p, UINT count, 
         count = n;
     }
     present_track_barriers(count, barriers);
+    note_indirect_transitions(p, count, barriers);
     if (count)
         ID3D12GraphicsCommandList_ResourceBarrier(INNER(p, ID3D12GraphicsCommandList), count, barriers);
     if (kept && kept != local)
@@ -5989,8 +6084,57 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(struct proxy *p, UINT count, 
 static void STDMETHODCALLTYPE list_Barrier(struct proxy *p, UINT32 count, const D3D12_BARRIER_GROUP *groups)
 {
     present_track_enhanced(count, groups);
+    for (UINT32 g = 0; groups && g < count; g++)
+    {
+        const D3D12_BARRIER_GROUP *group = &groups[g];
+        for (UINT32 i = 0; i < group->NumBarriers; i++)
+        {
+            if (group->Type == D3D12_BARRIER_TYPE_GLOBAL && group->pGlobalBarriers
+                    && takes_as_indirect(group->pGlobalBarriers[i].SyncAfter, group->pGlobalBarriers[i].AccessAfter))
+                p->indirect_barrier = TRUE;
+            else if (group->Type == D3D12_BARRIER_TYPE_BUFFER && group->pBufferBarriers
+                    && takes_as_indirect(group->pBufferBarriers[i].SyncAfter, group->pBufferBarriers[i].AccessAfter))
+                p->indirect_barrier = TRUE;
+            else
+                continue;
+            InterlockedIncrement(&indirect_stats.title_enhanced);
+        }
+    }
     ((void (STDMETHODCALLTYPE *)(void *, UINT32, const D3D12_BARRIER_GROUP *))PC_SLOT(p->inner, 80))(p->inner,
             count, groups);
+}
+
+/* REBOX_INDIRECT_BARRIER (default 1). vkd3d-proton reads an ExecuteIndirect's arguments in a
+ * compute pass of its own (patch 0017's clamp; a state template's patching), and records that pass
+ * ahead of the whole list, or of the whole submission, unless the list has had a barrier into
+ * indirect arguments: a transition to exactly INDIRECT_ARGUMENT, or an enhanced global or buffer
+ * barrier into EXECUTE_INDIRECT. D3D12 lets it assume so; the console has no such rule, and the
+ * title's meshlet culling writes the mesh dispatches' arguments in the same list or submission,
+ * synchronised by pipeline syncs (list_PipelineSyncX) or barriers vkd3d-proton doesn't take as
+ * indirect ones. Read ahead, the arguments are the memory's contents before the culling ran.
+ * So before a list's first ExecuteIndirect, unless it already had one, the list is given such a
+ * barrier (every earlier write, before indirect reads), and its argument passes go in place.
+ * REBOX_INDIRECT_BARRIER=0: as before. */
+static void indirect_barrier(struct proxy *p)
+{
+    D3D12_GLOBAL_BARRIER g = {
+        .SyncBefore = D3D12_BARRIER_SYNC_ALL,
+        .SyncAfter = D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+        .AccessBefore = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_COPY_DEST,
+        .AccessAfter = D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+    };
+    D3D12_BARRIER_GROUP group = { .Type = D3D12_BARRIER_TYPE_GLOBAL, .NumBarriers = 1, .pGlobalBarriers = &g };
+
+    InterlockedIncrement(&indirect_stats.executes);
+    if (p->indirect_barrier)
+        return;
+    InterlockedIncrement(&indirect_stats.read_ahead);
+    if (!indirect_barrier_on())
+        return;
+    ((void (STDMETHODCALLTYPE *)(void *, UINT32, const D3D12_BARRIER_GROUP *))PC_SLOT(p->inner, 80))(p->inner,
+            1, &group);
+    p->indirect_barrier = TRUE;
+    InterlockedIncrement(&indirect_stats.given);
 }
 
 /* Copies into a title texture (one filled from title memory) make it the GPU's: a UE5 title's font
@@ -6288,7 +6432,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
-    debug_view_watch_begin();
+    debug_view_watch_begin(p);
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
     {
         debug_view_watch_end(p, FALSE);
@@ -6316,7 +6460,7 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
-    debug_view_watch_begin();
+    debug_view_watch_begin(p);
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
     traced = trace_begin(p, TRUE, "indexed", indices, instances, 0);
@@ -6791,7 +6935,7 @@ static void STDMETHODCALLTYPE list_Dispatch(struct proxy *p, UINT x, UINT y, UIN
 static void STDMETHODCALLTYPE list_DispatchMesh(struct proxy *p, UINT x, UINT y, UINT z)
 {
     BOOL traced = trace_begin(p, TRUE, "mesh", x, y, z);
-    debug_view_watch_begin();
+    debug_view_watch_begin(p);
     ((void (STDMETHODCALLTYPE *)(void *, UINT, UINT, UINT))PC_SLOT(p->inner, 79))(p->inner, x, y, z);
     debug_view_watch_end(p, TRUE);
     trace_end(traced);
@@ -6818,11 +6962,33 @@ static void STDMETHODCALLTYPE list_DispatchX(struct proxy *p, UINT x, UINT y, UI
         ID3D12GraphicsCommandList_Dispatch(INNER(p, ID3D12GraphicsCommandList), x, y, z);
 }
 
-/* Pipeline syncs at the top and bottom of the pipe (flags, control, address, size): vkd3d-proton
- * orders a list's work itself (VIctory, GPL-3.0, facts). */
+/* Pipeline syncs at the top and bottom of the pipe (flags, control, address, size; VIctory, GPL-3.0,
+ * facts). vkd3d-proton orders nothing within a list unless told by a barrier, so a sync the
+ * console uses between a compute pass and what reads its results (meshlet culling and the mesh
+ * dispatches it writes the arguments of) is a full global barrier here: every earlier access before
+ * every later one, indirect argument reads included. REBOX_PIPELINE_SYNC=0 ignores them, as before. */
 static void STDMETHODCALLTYPE list_PipelineSyncX(struct proxy *p, UINT flags, UINT control, UINT64 address,
         UINT64 size)
 {
+    D3D12_GLOBAL_BARRIER g = {
+        .SyncBefore = D3D12_BARRIER_SYNC_ALL,
+        .SyncAfter = D3D12_BARRIER_SYNC_ALL,
+        .AccessBefore = D3D12_BARRIER_ACCESS_COMMON,
+        .AccessAfter = D3D12_BARRIER_ACCESS_COMMON,
+    };
+    D3D12_BARRIER_GROUP group = { .Type = D3D12_BARRIER_TYPE_GLOBAL, .NumBarriers = 1, .pGlobalBarriers = &g };
+    static LONG logged;
+
+    InterlockedIncrement(&indirect_stats.syncs);
+    if (InterlockedIncrement(&logged) <= 4)
+        rebox_log("d3d12_xs: pipeline sync (flags %#x, control %#x, address %#llx, size %#llx) in list %p: %s", flags,
+                  control, (unsigned long long)address, (unsigned long long)size, (void *)p,
+                  pipeline_sync_on() ? "a global barrier" : "ignored (REBOX_PIPELINE_SYNC=0)");
+    if (!pipeline_sync_on())
+        return;
+    ((void (STDMETHODCALLTYPE *)(void *, UINT32, const D3D12_BARRIER_GROUP *))PC_SLOT(p->inner, 80))(p->inner,
+            1, &group);
+    p->indirect_barrier = TRUE;
 }
 
 /* DriverHintX(feature, value): the host driver takes no hints (VIctory, GPL-3.0, facts). */
@@ -6908,6 +7074,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
 
     p->resets++;
     p->ray_pipeline = FALSE;
+    p->indirect_barrier = FALSE;
     memset(&p->debug_view, 0, sizeof(p->debug_view));
     while (p->active)
     {
@@ -7261,6 +7428,11 @@ void proxy_frame_presented(void)
     }
     if (interval && !(InterlockedIncrement64(&frames) % interval))
         proxy_log_slot_stats();
+    {
+        static LONG presents;
+        if (!(InterlockedIncrement(&presents) % 60))
+            log_indirect_stats();
+    }
 }
 
 static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)

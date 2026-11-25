@@ -12,6 +12,7 @@ struct debug_view_list
     int rt, depth;               /* 1 + the bound targets' table indices, or 0 */
     void *rt_res, *depth_res;    /* what those entries held when bound */
     void *snapshot_res;          /* the chosen target, bound: copied when the pass ends */
+    int probe;                   /* 1 + the probe slot of the draw being recorded, or 0 */
 };
 
 BOOL debug_view_on(void);
@@ -20,8 +21,12 @@ BOOL debug_view_on(void);
  * the pass that drew the chosen target ends). display: a display-sized target is among rts. */
 void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l, ID3D12Resource *const *rts,
                      UINT count, ID3D12Resource *depth, BOOL display);
-/* After a draw, mesh dispatch or ExecuteIndirect: fate is what became of it (DRAW_FATE_*). */
-void debug_view_draw(struct debug_view_list *l, BOOL mesh, UINT fate);
+/* Before a draw, mesh dispatch or ExecuteIndirect (args and count: an ExecuteIndirect's buffers, or
+ * NULL): in a probed frame, queries begin around it if it draws into the target shown. */
+void debug_view_draw_begin(ID3D12GraphicsCommandList *list, struct debug_view_list *l, ID3D12Resource *args,
+                           UINT64 args_offset, ID3D12Resource *count, UINT64 count_offset);
+/* After it: fate is what became of it (DRAW_FATE_*). */
+void debug_view_draw(ID3D12GraphicsCommandList *list, struct debug_view_list *l, BOOL mesh, UINT fate);
 void debug_view_close(ID3D12GraphicsCommandList *list, struct debug_view_list *l);
 
 /* From PresentX (present.c): the target to show this present, referenced; FALSE for none. *snapshot:
