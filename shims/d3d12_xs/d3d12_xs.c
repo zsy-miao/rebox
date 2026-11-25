@@ -20,6 +20,7 @@
 #include "../common/rebox_log.h"
 #include "console_compile.h"
 #include "console_fssm.h"
+#include "fast.h"
 #include "gpu_memory.h"
 #include "proxy.h"
 #include "shader_cache.h"
@@ -430,6 +431,10 @@ static void attach_console_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *de
             }
         }
     }
+    /* The census and trace name stages by id; REBOX_PROGRAM_NAMES logs which program each is. */
+    fast_name_id(console_stage_id(vs, vs_size), desc->VS.pShaderBytecode, desc->VS.BytecodeLength);
+    if (ps)
+        fast_name_id(console_stage_id(ps, ps_size), desc->PS.pShaderBytecode, desc->PS.BytecodeLength);
     if (console_stage_watched(console_stage_id(vs, vs_size)))
     {
         const D3D12_RENDER_TARGET_BLEND_DESC *b = &desc->BlendState.RenderTarget[0];
@@ -474,7 +479,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC copy;
-    BOOL miss = FALSE;
+    BOOL miss = FALSE, left_out;
 
     HRESULT hr;
 
@@ -509,7 +514,10 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
         hr = orig_create_graphics(device, &copy, riid, pso);
     }
     creating_fallback = FALSE;
-    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso)
+    /* REBOX_FAST (fast.c): a program left out keeps its fallbacks, so its draws do nothing. */
+    left_out = miss && (fast_skip_reason(desc->VS.pShaderBytecode, desc->VS.BytecodeLength, "vs")
+                        || fast_skip_reason(desc->PS.pShaderBytecode, desc->PS.BytecodeLength, "ps"));
+    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !left_out)
         attach_console_graphics(desc, *pso, 0x1);
     /* Bytecode that passed as PC's or came from the cache can still fail to compile: Xbox DXIL
      * calling @xbox.* intrinsics (XboxBvhBuilder), or a bad translation. Fallbacks then, too. */
@@ -530,6 +538,20 @@ static HRESULT STDMETHODCALLTYPE hook_create_graphics(ID3D12Device2 *device,
     return hr;
 }
 
+/* A deferred console compute program (SCRD version 1) is named in the trace by its code's hash. */
+static void name_compute(const D3D12_SHADER_BYTECODE *deferred, const D3D12_SHADER_BYTECODE *container)
+{
+    const struct rebox_deferred_shader *h = deferred->pShaderBytecode;
+    UINT64 hash = 0xcbf29ce484222325ull;
+
+    if (!h || deferred->BytecodeLength < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC || h->version != 1
+            || h->code_offset > deferred->BytecodeLength || h->code_dwords * 4ull > deferred->BytecodeLength - h->code_offset)
+        return;
+    for (UINT i = 0; i < h->code_dwords * 4u; i++)
+        hash = (hash ^ ((const BYTE *)h + h->code_offset)[i]) * 0x100000001b3ull;
+    fast_name_id(hash, container->pShaderBytecode, container->BytecodeLength);
+}
+
 static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pso)
 {
@@ -542,7 +564,12 @@ static HRESULT STDMETHODCALLTYPE hook_create_compute(ID3D12Device2 *device,
         return orig_create_compute(device, desc, riid, pso);
     shader_cache_census("compute", names, &desc->CS, 1, &desc->CachedPSO);
     copy = *desc;
-    if ((miss = shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS) && fallback_enabled())
+    /* REBOX_FAST (fast.c): a program left out gets the fallback, as a missing translation does. */
+    if (fast_skip_reason(desc->CS.pShaderBytecode, desc->CS.BytecodeLength, "cs"))
+        miss = TRUE;
+    else if (!(miss = shader_cache_substitute(&desc->CS, &copy.CS, "cs") == SHADER_MISS))
+        name_compute(&copy.CS, &desc->CS);
+    if (miss && fallback_enabled())
     {
         copy.CS = fallback_cs_bc;
         note_fallback("compute");
@@ -606,7 +633,7 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
      * shader would. */
     D3D12_GRAPHICS_PIPELINE_STATE_DESC console = { 0 };
     D3D12_SHADER_BYTECODE mesh = { 0 };
-    BOOL other_stages = FALSE;
+    BOOL other_stages = FALSE, left_out = FALSE;
     const D3D12_BLEND_DESC *blend = NULL;
     const struct D3D12_RT_FORMAT_ARRAY *rt_formats = NULL;
     BYTE *stream;
@@ -657,6 +684,9 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
                 census_names[stage_count] = subobj_layouts[type].stage;
                 census_bc[stage_count] = *bc;
             }
+            /* REBOX_FAST (fast.c): a program left out keeps its fallbacks. */
+            if (fast_skip_reason(bc->pShaderBytecode, bc->BytecodeLength, subobj_layouts[type].stage))
+                left_out = TRUE;
             miss |= shader_cache_substitute(bc, bc, subobj_layouts[type].stage) == SHADER_MISS;
             if (stage_count < ARRAYSIZE(stages))
                 stages[stage_count++] = offset;
@@ -703,7 +733,9 @@ static HRESULT STDMETHODCALLTYPE hook_create_pipeline(ID3D12Device2 *device,
     creating_fallback = FALSE;
     /* A mesh pipeline: its mesh and pixel shaders, compiled at each mesh dispatch (patch 0013). One
      * with an amplification shader (other_stages) keeps its fallbacks: AnyPS5 has no task stage. */
-    if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages && mesh.BytecodeLength
+    if (left_out && miss)
+        ; /* fallbacks only: its draws do nothing */
+    else if (SUCCEEDED(hr) && miss && fallback_enabled() && pso && !other_stages && mesh.BytecodeLength
             && !console.VS.BytecodeLength)
     {
         console.VS = mesh;

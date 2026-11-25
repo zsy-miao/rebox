@@ -1468,6 +1468,95 @@ done:
     free(ps);
 }
 
+/* REBOX_DEBUG_VIEW=32x16 (run-smoke.sh): a 32x16 target cleared green and presented shows green;
+ * then, picked, it is cleared blue in a pass of its own, copied when that pass ends, and cleared red
+ * after; the next present shows the copy, blue. Presented as frames 5 and 6, after
+ * test_present_format's. */
+static void test_debug_view_snapshot(void *dev, void *queue)
+{
+    const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
+                                 { 1, 0 }, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET };
+    static const FLOAT green[4] = { 0.0f, 1.0f, 0.0f, 1.0f }, blue[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    static const FLOAT red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    D3D12_CLEAR_VALUE clear = { DXGI_FORMAT_R8G8B8A8_UNORM, { { 0.0f, 1.0f, 0.0f, 1.0f } } };
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Resource *tex = NULL;
+    ID3D12Fence *fence = NULL;
+    void *rtv_heap = NULL, *list = NULL;
+    UINT64 plane_params[6] = { 0 };
+    SIZE_T rtv;
+    BYTE px[4];
+    HRESULT hr;
+
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &rtv_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &heap_props,
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, &IID_ID3D12Resource,
+                (void **)&tex);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&fence);
+    CHECK(SUCCEEDED(hr), "a 32x16 target for REBOX_DEBUG_VIEW (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+
+    rtv = XSLOT(rtv_heap, 9, SIZE_T)(rtv_heap);
+    XSLOT(dev, 20, void, ID3D12Resource *, const void *, SIZE_T)(dev, tex, NULL, rtv);
+    plane_params[1] = 1;
+    plane_params[2] = (UINT64)(ULONG_PTR)tex;
+    for (int round = 0; round < 2; round++)
+    {
+        /* OMSetRenderTargets 50, ClearRenderTargetView 52, Close 9; ExecuteCommandLists, Signal,
+         * PresentX (queue slots 10, 14, 30). */
+        if (round)
+        {
+            ID3D12CommandAllocator_Reset(alloc);
+            XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        }
+        XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
+        XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, round ? blue : green, 0, NULL);
+        if (round)
+        {
+            /* The pass ends (nothing bound): copied, blue. Then cleared red unbound, after the copy. */
+            XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 0, NULL, FALSE, NULL);
+            XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, red, 0, NULL);
+        }
+        XSLOT(list, 9, HRESULT)(list);
+        XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+        hr = XSLOT(queue, 30, HRESULT, UINT, const void *, const void *)(queue, 1, plane_params, NULL);
+        XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, fence, round + 1);
+        for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(fence) < (UINT64)round + 1; i++)
+            Sleep(10);
+    }
+    if (dump_dir)
+    {
+        BOOL found = read_dump_pixel(dump_dir, 5, px);
+        CHECK(found && px[1] == 255 && !px[2] && !px[0], "REBOX_DEBUG_VIEW shows the 32x16 target as it is at the "
+              "present (RGB %u %u %u)", px[2], px[1], px[0]);
+        found = read_dump_pixel(dump_dir, 6, px);
+        CHECK(found && px[0] == 255 && !px[2] && !px[1], "REBOX_DEBUG_VIEW shows its copy from when its pass ended "
+              "(RGB %u %u %u)", px[2], px[1], px[0]);
+    }
+
+done:
+    if (fence) ID3D12Fence_Release(fence);
+    if (list) XSLOT(list, 2, ULONG)(list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (tex) ID3D12Resource_Release(tex);
+    if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
+}
+
 static void test_present(void *dev, void *queue)
 {
     const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
@@ -1807,8 +1896,9 @@ static void test_present(void *dev, void *queue)
         printf("skip frame dump checks (REBOX_DUMP_FRAMES not set)\n");
         goto done;
     }
-    /* Clear colour (1, 0.5, 0.25) is RGB 255/128/64; BMP stores BGRA. */
-    for (int frame = 1; frame <= 2; frame++)
+    /* Clear colour (1, 0.5, 0.25) is RGB 255/128/64; BMP stores BGRA. Under REBOX_DEBUG_VIEW frame 1
+     * shows another target (run-smoke.sh checks which). */
+    for (int frame = getenv("REBOX_DEBUG_VIEW") ? 2 : 1; frame <= 2; frame++)
     {
         BOOL found = read_dump_pixel(dump_dir, frame, px);
         CHECK(found && px[2] == 255 && abs(px[1] - 128) <= 1 && abs(px[0] - 64) <= 1,
@@ -1838,7 +1928,8 @@ done:
     {
         UINT64 (WINAPI *usage)(void) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"), "ReboxGpuBytesInUse");
         ID3D12Resource_Release(tex);
-        if (usage && scratch_before)
+        /* REBOX_DEBUG_VIEW holds the targets it saw for some presents more. */
+        if (usage && scratch_before && !getenv("REBOX_DEBUG_VIEW"))
             CHECK(usage() == scratch_before, "texture scratch memory freed with the texture");
     }
     if (rtv_heap) XSLOT(rtv_heap, 2, ULONG)(rtv_heap);
@@ -2375,6 +2466,58 @@ static BYTE *mesh_container(const UINT32 *code, UINT code_size, SIZE_T *size)
     memcpy(fssm + payload + code_at + 24, code, code_size);
     container = console_container_around(fssm, fssm_size, NULL, NULL, 0, size);
     return container;
+}
+
+/* A container whose PSV0 part names its entry point (PSVRuntimeInfo3, no resources, the name in the
+ * string table), as the title's every shader has one: REBOX_FAST (fast.c) picks programs by it. */
+static BYTE *named_container(const char *name, SIZE_T *size)
+{
+    UINT len = (UINT)strlen(name) + 1, strings = (len + 3) & ~3u;
+    UINT psv0 = 4 + 52 + 4 + 4 + strings, total = 32 + 4 + 8 + psv0;
+    BYTE *out = calloc(1, total), *body;
+
+    memcpy(out, "DXBC", 4);
+    *(UINT32 *)(out + 20) = 1;
+    *(UINT32 *)(out + 24) = total;
+    *(UINT32 *)(out + 28) = 1;
+    *(UINT32 *)(out + 32) = 36;
+    memcpy(out + 36, "PSV0", 4);
+    *(UINT32 *)(out + 40) = psv0;
+    body = out + 44;
+    *(UINT32 *)body = 52;                 /* runtime info size */
+    *(UINT32 *)(body + 4 + 48) = 0;       /* EntryFunctionName: string 0 */
+    *(UINT32 *)(body + 56) = 0;           /* no resources */
+    *(UINT32 *)(body + 60) = strings;
+    memcpy(body + 64, name, len);
+    *size = total;
+    return out;
+}
+
+static void test_program_names(void)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    BOOL (WINAPI *program_name)(const void *, SIZE_T, char *, SIZE_T) = (void *)GetProcAddress(m, "ReboxProgramName");
+    const char *(WINAPI *left_out)(const void *, SIZE_T) = (void *)GetProcAddress(m, "ReboxProgramLeftOut");
+    const char *fast = getenv("REBOX_FAST");
+    BYTE *rays, *gbuffer;
+    SIZE_T rays_size, gbuffer_size;
+    char name[128] = "";
+
+    CHECK(program_name && left_out, "d3d12_xs exports ReboxProgramName and ReboxProgramLeftOut");
+    if (!program_name || !left_out)
+        return;
+    rays = named_container("CS_RTShadowTrace32HQ_0a1b2c3d_Wrapped", &rays_size);
+    gbuffer = named_container("MS_VS_Transform_eb34a03f_Wrapped", &gbuffer_size);
+    CHECK(program_name(rays, rays_size, name, sizeof(name)) && !strcmp(name, "CS_RTShadowTrace32HQ_0a1b2c3d_Wrapped"),
+          "a container's PSV0 entry name is read (%s)", name);
+    CHECK(!program_name("REBOX-FAKE", 10, name, sizeof(name)), "bytes that aren't a container have no name");
+    if (fast && *fast == '1')
+        CHECK(left_out(rays, rays_size) && !left_out(gbuffer, gbuffer_size),
+              "REBOX_FAST=1 leaves out a ray tracing program and keeps a G-buffer one");
+    else
+        CHECK(!left_out(rays, rays_size), "without REBOX_FAST nothing is left out");
+    free(rays);
+    free(gbuffer);
 }
 
 static void test_console_mesh_compile(void)
@@ -6670,6 +6813,7 @@ static void test_xbox(void)
     test_depth_uav_texture(dev);
     test_console_mesh_stream();
     test_console_mesh_compile();
+    test_program_names();
     test_guest_buffer_entry();
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_NONE);
@@ -6694,6 +6838,8 @@ static void test_xbox(void)
     test_present(dev, queue);
     test_ffx(dev, queue);
     test_present_format(dev, queue);
+    if (getenv("REBOX_DEBUG_VIEW") && !strcmp(getenv("REBOX_DEBUG_VIEW"), "32x16"))
+        test_debug_view_snapshot(dev, queue);
 
     /* Slot 60, graphics PSO with an extension array (TomBox): console VS/PS
      * bytes get fallbacks unless REBOX_SHADER_FALLBACK=0. */

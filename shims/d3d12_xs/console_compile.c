@@ -26,6 +26,8 @@
 
 #include "../common/rebox_log.h"
 #include "../../anyps5/rebox_anyps5.h"
+#include "fast.h"
+#include "../../generated/standin_shaders.h"
 #include "console_compile.h"
 #include "console_fssm.h"
 #include "console_desc.h"
@@ -1719,6 +1721,7 @@ enum { OUTCOME_OK, OUTCOME_BUDGET, OUTCOME_QUEUED, OUTCOME_WAIT, OUTCOME_PROGRAM
 static const char *const outcome_names[OUTCOMES] = { "ok", "past the frame's budget", "compiling in the background",
                                                      "past their wait", "program failed before", "failed" };
 static volatile LONG outcomes[4][OUTCOMES]; /* [compute, vertex, pixel, mesh] */
+static volatile LONG standins; /* pixel stand-ins given (REBOX_STANDIN_PIXEL) */
 static __thread UINT call_outcome;
 
 static UINT outcome_kind(const struct rebox_deferred_shader *h, SIZE_T size)
@@ -1750,6 +1753,11 @@ static void outcomes_log(void)
         else
             line[at = start] = 0; /* none of this kind */
     }
+    {
+        LONG n = InterlockedExchange(&standins, 0);
+        if (n && at < (int)sizeof(line) - 64)
+            at += snprintf(line + at, sizeof(line) - at, "; pixel stand-ins (REBOX_STANDIN_PIXEL) %ld", n);
+    }
     if (total)
         rebox_log("d3d12_xs:   console compiles since the last census: %s", line);
 }
@@ -1759,10 +1767,16 @@ void console_display_draws_log(void)
     outcomes_log();
     AcquireSRWLockExclusive(&display_draw_lock);
     for (UINT i = 0; i < display_draw_count; i++)
-        rebox_log("d3d12_xs:   %s %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx",
+    {
+        /* With the programs' names where known (fast.c), so a census reads as passes. */
+        const char *vs_name = fast_id_name(display_draws[i].vs), *ps_name = fast_id_name(display_draws[i].ps);
+        rebox_log("d3d12_xs:   %s %d: %ld %s of %u %s, vertex stage %016llx, pixel stage %016llx%s%s%s%s%s",
                   display_draws[i].target < 0 ? "other target" : "display target", display_draws[i].target, display_draws[i].times, display_draws[i].indexed ? "indexed draws" : "draws",
                   display_draws[i].count, display_draws[i].rect ? "(rect list)" : "",
-                  (unsigned long long)display_draws[i].vs, (unsigned long long)display_draws[i].ps);
+                  (unsigned long long)display_draws[i].vs, (unsigned long long)display_draws[i].ps,
+                  vs_name || ps_name ? " (" : "", vs_name ? vs_name : "", vs_name && ps_name ? ", " : "",
+                  ps_name ? ps_name : "", vs_name || ps_name ? ")" : "");
+    }
     display_draw_count = 0;
     ReleaseSRWLockExclusive(&display_draw_lock);
 }
@@ -1905,10 +1919,15 @@ static void trace_call(const struct rebox_compile_in *in, HRESULT hr)
     if (trace_op.op)
         snprintf(op, sizeof(op), " | %s %u %u %u rt %ux%u f%u", trace_op.op, trace_op.a, trace_op.b, trace_op.c,
                  trace_op.width, trace_op.height, trace_op.format);
-    rebox_log("d3d12_xs: trace %ld #%ld [%04lx] %s %016llx stage %016llx: %s%s%s%s%s", compile_frame,
-              InterlockedIncrement(&seq), GetCurrentThreadId(), kinds[outcome_kind(h, in ? in->shader_size : 0)],
-              (unsigned long long)code, (unsigned long long)stage, outcome_names[min(call_outcome, OUTCOMES - 1)],
-              *message ? " (" : "", message, *message ? ")" : "", op);
+    {
+        const char *name = fast_id_name(stage);
+        if (!name)
+            name = fast_id_name(code);
+        rebox_log("d3d12_xs: trace %ld #%ld [%04lx] %s %016llx stage %016llx%s%s: %s%s%s%s%s", compile_frame,
+                  InterlockedIncrement(&seq), GetCurrentThreadId(), kinds[outcome_kind(h, in ? in->shader_size : 0)],
+                  (unsigned long long)code, (unsigned long long)stage, name ? " " : "", name ? name : "",
+                  outcome_names[min(call_outcome, OUTCOMES - 1)], *message ? " (" : "", message, *message ? ")" : "", op);
+    }
 }
 
 static LONG64 frame_budget_ticks(void)
@@ -2143,6 +2162,34 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
 /* With REBOX_WATCH_STAGE naming a graphics stage, each of its compiles' results is logged (the first
  * 64): whether its draws are skipped, and why. Each call's outcome is counted for the census, and
  * traced under REBOX_FRAME_TRACE. */
+/* REBOX_STANDIN_PIXEL=mesh (the default under REBOX_FAST) or all: a draw whose first stage compiled
+ * but whose pixel stage is still compiling (or failed, or is past the frame's budget or its wait)
+ * gets a stand-in pixel stage (generated/standin_shaders.h: every colour output a grey that darkens
+ * with distance) instead of being left out, so geometry reaches the G-buffer and the forward target
+ * while the title's own pixel stages compile. Once the real one is ready the draw's pipeline key
+ * changes and it takes over. "mesh": only mesh pipelines (the G-buffer, decals, shadows), not
+ * vertex-stage ones, among which are the full-screen passes a grey would cover the picture with.
+ * REBOX_STANDIN_PIXEL=0 turns it off. */
+static int standin_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0)
+    {
+        const char *v = getenv("REBOX_STANDIN_PIXEL"), *fast = getenv("REBOX_FAST");
+        if (v && *v)
+            mode = !strcmp(v, "all") ? 2 : !strcmp(v, "mesh") || !strcmp(v, "1") ? 1 : 0;
+        else
+            mode = fast && *fast && strcmp(fast, "0") ? 1 : 0;
+        if (mode)
+            rebox_log("d3d12_xs: REBOX_STANDIN_PIXEL: %s draws whose pixel stage isn't ready draw with a grey stand-in",
+                      mode == 2 ? "all" : "mesh");
+    }
+    return mode;
+}
+
+static __thread struct { UINT32 stage; BOOL ok; } first_stage; /* this thread's last vertex or mesh compile */
+
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     HRESULT hr;
@@ -2150,6 +2197,26 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 
     call_outcome = OUTCOME_FAILED;
     hr = console_compile(in, out);
+    /* vkd3d-proton compiles a draw's first stage, then its pixel stage, on the same thread. */
+    if (h && in->shader_size >= sizeof(*h) && h->version == 2)
+    {
+        if (h->stage != 0x10)
+        {
+            first_stage.stage = h->stage;
+            first_stage.ok = SUCCEEDED(hr);
+        }
+        else if (FAILED(hr) && out && first_stage.ok && standin_mode()
+                 && (standin_mode() == 2 || first_stage.stage == 0x80))
+        {
+            memset(out, 0, sizeof(*out));
+            out->spirv = standin_pixel_spirv;
+            out->spirv_words = ARRAYSIZE(standin_pixel_spirv);
+            out->key[0] = 0x5354414e44494e31ull; /* "STANDIN1": a variant of its own */
+            out->key[1] = 0x50495845ull;
+            InterlockedIncrement(&standins);
+            hr = S_OK;
+        }
+    }
     InterlockedIncrement(&outcomes[outcome_kind(h, in ? in->shader_size : 0)][min(call_outcome, OUTCOMES - 1)]);
     if (console_trace_active())
         trace_call(in, hr);

@@ -30,6 +30,8 @@ EXPORTS
     ReboxConsoleFromContainer
     ReboxConsoleFree
     ReboxConsoleGraphicsFromContainer
+    ReboxProgramName
+    ReboxProgramLeftOut
     ReboxTitleMemoryWritten
     ReboxDetileSize
     ReboxTile

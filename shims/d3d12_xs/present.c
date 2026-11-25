@@ -57,6 +57,7 @@
 
 #include "../common/rebox_log.h"
 #include "blit.h"
+#include "debug_view.h"
 #include "present.h"
 #include "title_textures.h"
 #include "proxy.h"
@@ -75,6 +76,7 @@ struct present_queue
         ID3D12CommandAllocator *alloc;
         ID3D12GraphicsCommandList *list;
         UINT64 done;
+        ID3D12Resource *viewed; /* REBOX_DEBUG_VIEW's target, referenced until the list is done */
     } ring[RING];
     UINT64 frames;
 
@@ -172,6 +174,11 @@ BOOL present_tracked_state(void *resource, D3D12_RESOURCE_STATES *state)
         return FALSE;
     *state = value;
     return TRUE;
+}
+
+BOOL present_tracked(void *resource, UINT *kind, UINT *value)
+{
+    return lookup(resource, kind, value);
 }
 
 void present_track_barriers(UINT count, const D3D12_RESOURCE_BARRIER *barriers)
@@ -790,6 +797,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     DXGI_FORMAT format;
     UINT kind = TRACK_LEGACY, from = D3D12_RESOURCE_STATE_COMMON;
     BOOL show, dump, convert, scale = FALSE;
+    struct debug_view_pick view = { 0 };
     UINT out_w, out_h;
     UINT64 frame, total = 0;
     /* REBOX_DUMP_GPU_TEXTURE=<hex title address>: at each dumped frame, also the GPU contents of the
@@ -890,6 +898,21 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
             return S_OK;
     }
     lookup(plane, &kind, &from);
+    /* REBOX_DEBUG_VIEW (debug_view.c): a target of the title's in place of the plane, drawn into our
+     * RGBA8 copy as the conversion would be. */
+    if (debug_view_pick(&view))
+    {
+        if (ensure_convert(s, (UINT)desc.Width, desc.Height))
+        {
+            convert = TRUE;
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        else
+        {
+            ID3D12Resource_Release(view.res);
+            view.res = NULL;
+        }
+    }
 
     /* The window's client size, when it differs from the plane's: vkd3d-proton's swapchain shows a
      * 4K plane unscaled in a smaller window (a quarter of it in a 1920x1080 tile), so the plane is
@@ -915,7 +938,11 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     show = ensure_swapchain(s, out_w, out_h, scale ? DXGI_FORMAT_R8G8B8A8_UNORM : format) && frame_slot_free(s);
     dump = dump_wanted(frame);
     if (!show && !dump)
+    {
+        if (view.res)
+            ID3D12Resource_Release(view.res);
         return S_OK;
+    }
 
     /* Reuse the oldest list once the GPU is done with it. */
     r = frame % RING;
@@ -926,10 +953,35 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
     ID3D12CommandAllocator_Reset(s->ring[r].alloc);
     ID3D12GraphicsCommandList_Reset(s->ring[r].list, s->ring[r].alloc, NULL);
+    if (s->ring[r].viewed)
+        ID3D12Resource_Release(s->ring[r].viewed);
+    s->ring[r].viewed = view.res;
 
-    transition(s->ring[r].list, plane, kind, from, convert, TRUE);
     src = plane;
-    if (convert)
+    if (view.res)
+    {
+        /* Our snapshot rests in COMMON; the title's own target is where its barriers left it. */
+        UINT view_kind = TRACK_LEGACY, view_from = D3D12_RESOURCE_STATE_COMMON;
+        BOOL drawn;
+        if (!view.snapshot)
+            lookup(view.res, &view_kind, &view_from);
+        transition(s->ring[r].list, view.res, view_kind, view_from, TRUE, TRUE);
+        drawn = debug_view_record(s->ring[r].list, &view, s->convert, (UINT)desc.Width, desc.Height);
+        transition(s->ring[r].list, view.res, view_kind, view_from, TRUE, FALSE);
+        if (!drawn)
+        {
+            /* Not a format it can show: the plane after all. */
+            transition(s->ring[r].list, plane, kind, from, TRUE, TRUE);
+            ReboxBlit(s->ring[r].list, plane, (UINT)desc.Width, desc.Height, s->convert, (UINT)desc.Width, desc.Height);
+            transition(s->ring[r].list, plane, kind, from, TRUE, FALSE);
+        }
+        barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        src = s->convert;
+        desc = ID3D12Resource_GetDesc(src);
+    }
+    else
+        transition(s->ring[r].list, plane, kind, from, convert, TRUE);
+    if (convert && !view.res)
     {
         ReboxBlit(s->ring[r].list, plane, (UINT)desc.Width, desc.Height, s->convert, (UINT)desc.Width, desc.Height);
         barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1002,7 +1054,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     }
     if (convert)
         barrier(s->ring[r].list, s->convert, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(s->ring[r].list, plane, kind, from, convert, FALSE);
+    if (!view.res)
+        transition(s->ring[r].list, plane, kind, from, convert, FALSE);
 
     if (SUCCEEDED(ID3D12GraphicsCommandList_Close(s->ring[r].list)))
     {
