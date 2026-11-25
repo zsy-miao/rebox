@@ -39,6 +39,7 @@
 #include "proxy.h"
 #include "title_textures.h"
 #include "dxgi_device.h"
+#include "debug_view.h"
 #include "derived_pso.h"
 #include "state_object.h"
 
@@ -89,6 +90,7 @@ struct proxy
     UINT vertex_buffer_mask;
     D3D12_INDEX_BUFFER_VIEW index_buffer;      /* lists: as bound, for REBOX_WATCH_STAGE's vertex log */
     SIZE_T render_target0;     /* lists: the first bound render target view (REBOX_WATCH_STAGE logs it) */
+    struct debug_view_list debug_view; /* lists: REBOX_DEBUG_VIEW's view of what is bound */
     struct cpu_write *cpu_writes;  /* lists: writes outside GPU memory, made after the GPU's work (cpu_writes_*) */
     UINT cpu_write_count, cpu_write_capacity;
     struct cpu_write *gpu_writes;  /* lists: writes to GPU memory (WriteBufferImmediate), for list_wait */
@@ -696,11 +698,16 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
     return (UINT64)(ULONG_PTR)cpu;
 }
 
+static void forget_target_views(void *resource);
+
 static ULONG STDMETHODCALLTYPE resource_Release(void *self)
 {
     ULONG refs = orig_resource_release(self);
     struct scratch **p, *sc = NULL;
 
+    /* REBOX_DEBUG_VIEW references what views name when they are bound: never a texture gone. */
+    if (!refs && debug_view_on())
+        forget_target_views(self);
     if (refs || !scratch_list)
         return refs;
     AcquireSRWLockExclusive(&scratch_lock);
@@ -1481,6 +1488,8 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(struct proxy *p, 
     shadow_write_uav(cpu, resource, desc);
 }
 
+static void note_target_view(ID3D12Resource *resource, UINT format, SIZE_T cpu, BOOL depth);
+
 /* Slot 21: CreateDepthStencilView, as on PC, with the console's own formats made desktop ones. */
 static void STDMETHODCALLTYPE device_CreateDepthStencilView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_DEPTH_STENCIL_VIEW_DESC *desc, SIZE_T cpu)
@@ -1493,20 +1502,24 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(struct proxy *p, ID3
         pc.Format = pc_format(desc->Format);
         desc = &pc;
     }
+    note_target_view(resource, desc ? desc->Format : 0, cpu, TRUE);
     ID3D12Device_CreateDepthStencilView(INNER(p, ID3D12Device), resource, desc, h);
 }
 
 /* Slot 20: CreateRenderTargetView, as on PC; views of display-sized textures are logged. */
 /* Every render target view's texture size and view format by handle (open addressing; a later view
  * at the same handle replaces it), so a watched stage's draws can name their target. */
-static struct { volatile SIZE_T cpu; UINT width, height, format; UINT64 address; } rtv_info[4096];
+static struct { volatile SIZE_T cpu; UINT width, height, format; UINT64 address; ID3D12Resource *resource; BOOL depth; } rtv_info[4096];
 
 static UINT rtv_slot(SIZE_T cpu)
 {
     return (UINT)((cpu >> 5) * 2654435761u) % ARRAYSIZE(rtv_info);
 }
 
-static void note_rtv(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
+/* Depth stencil views are kept here too (depth set), for REBOX_DEBUG_VIEW: their handles are in heaps
+ * of their own, so they never meet a render target view's. resource isn't referenced: the title's
+ * views of a released texture aren't bound again. */
+static void note_target_view(ID3D12Resource *resource, UINT format, SIZE_T cpu, BOOL depth)
 {
     D3D12_RESOURCE_DESC d;
     if (!resource || !cpu)
@@ -1520,12 +1533,27 @@ static void note_rtv(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DE
             UINT uploads = 0;
             rtv_info[i].width = (UINT)d.Width;
             rtv_info[i].height = d.Height;
-            rtv_info[i].format = desc ? desc->Format : d.Format;
+            rtv_info[i].format = format ? format : d.Format;
             rtv_info[i].address = 0;
+            rtv_info[i].resource = resource;
+            rtv_info[i].depth = depth;
             title_texture_info(resource, &rtv_info[i].address, &uploads);
             return;
         }
     }
+}
+
+static void note_rtv(ID3D12Resource *resource, const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
+{
+    note_target_view(resource, desc ? desc->Format : 0, cpu, FALSE);
+}
+
+/* A texture released for good: views naming it name nothing (REBOX_DEBUG_VIEW only). */
+static void forget_target_views(void *resource)
+{
+    for (UINT i = 0; i < ARRAYSIZE(rtv_info); i++)
+        if (rtv_info[i].resource == resource)
+            rtv_info[i].resource = NULL;
 }
 
 /* An RTV copied from one handle to another keeps what it views (CopyDescriptors*). */
@@ -1549,6 +1577,8 @@ static void copy_rtv_info(SIZE_T dst, SIZE_T src)
             rtv_info[i].height = rtv_info[from].height;
             rtv_info[i].format = rtv_info[from].format;
             rtv_info[i].address = rtv_info[from].address;
+            rtv_info[i].resource = rtv_info[from].resource;
+            rtv_info[i].depth = rtv_info[from].depth;
             return;
         }
     }
@@ -1560,6 +1590,15 @@ static UINT64 rtv_address(SIZE_T cpu)
         if (rtv_info[i].cpu == cpu)
             return rtv_info[i].address ? rtv_info[i].address : 1;
     return 0;
+}
+
+/* The texture a render target or depth stencil view at this handle views, or NULL. */
+static ID3D12Resource *target_view_resource(SIZE_T cpu)
+{
+    for (UINT n = 0, i = rtv_slot(cpu); cpu && n < ARRAYSIZE(rtv_info) && rtv_info[i].cpu; n++, i = (i + 1) % ARRAYSIZE(rtv_info))
+        if (rtv_info[i].cpu == cpu)
+            return rtv_info[i].resource;
+    return NULL;
 }
 
 static BOOL find_rtv(SIZE_T cpu, UINT *width, UINT *height, UINT *format)
@@ -1639,7 +1678,7 @@ static void STDMETHODCALLTYPE device_CopyDescriptors(struct proxy *p, UINT dst_c
     }
     ID3D12Device_CopyDescriptors(INNER(p, ID3D12Device), dst_count, dst_starts, dst_sizes, src_count, src_starts,
                                  src_sizes, type);
-    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && dst_starts && src_starts)
+    if ((type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) && dst_starts && src_starts)
     {
         UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), type);
         UINT di = 0, si = 0, dn = 0, sn = 0;
@@ -1662,7 +1701,7 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT
     D3D12_CPU_DESCRIPTOR_HANDLE d = { dst = shadow_cpu_to_inner(dst) }, s = { src = shadow_cpu_to_inner(src) };
     ID3D12Device_CopyDescriptorsSimple(INNER(p, ID3D12Device), count, d, s, type);
     shadow_copy(dst, src, count);
-    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+    if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV)
     {
         UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(INNER(p, ID3D12Device), type);
         for (UINT i = 0; i < count; i++)
@@ -1674,7 +1713,9 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT
  * ExecuteIndirect from BeginEvent. */
 static SRWLOCK signatures_lock = SRWLOCK_INIT;
 static void **signatures;
+static BYTE *signature_kinds; /* what each one's last argument does: SIGNATURE_* */
 static UINT signature_count, signature_capacity;
+enum { SIGNATURE_OTHER, SIGNATURE_DRAW, SIGNATURE_MESH };
 
 /* Signatures that dispatch rays: ExecuteIndirect skips them while a placeholder ray tracing
  * pipeline is set (vkd3d-proton would read a pipeline it was never given). */
@@ -1697,6 +1738,21 @@ static BOOL is_command_signature(void *object)
         found = signatures[i] == object;
     ReleaseSRWLockShared(&signatures_lock);
     return found;
+}
+
+/* Whether a command signature draws (SIGNATURE_DRAW), dispatches meshes (SIGNATURE_MESH) or neither. */
+static UINT signature_kind(void *object)
+{
+    UINT kind = SIGNATURE_OTHER;
+    AcquireSRWLockShared(&signatures_lock);
+    for (UINT i = 0; i < signature_count; i++)
+        if (signatures[i] == object)
+        {
+            kind = signature_kinds[i];
+            break;
+        }
+    ReleaseSRWLockShared(&signatures_lock);
+    return kind;
 }
 
 /* The console's own indirect argument types: 104 and 105 (DISPATCHX, DISPATCH_L2) are dispatches
@@ -1791,14 +1847,29 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
         {
             UINT capacity = signature_capacity ? signature_capacity * 2 : 64;
             void **grown = realloc(signatures, capacity * sizeof(*signatures));
+            BYTE *kinds = grown ? realloc(signature_kinds, capacity) : NULL;
             if (grown)
-            {
                 signatures = grown;
+            if (kinds)
+            {
+                signature_kinds = kinds;
                 signature_capacity = capacity;
             }
         }
         if (signature_count < signature_capacity)
+        {
+            UINT kind = SIGNATURE_OTHER;
+            for (UINT i = 0; desc && desc->pArgumentDescs && i < desc->NumArgumentDescs; i++)
+            {
+                UINT type = desc->pArgumentDescs[i].Type;
+                if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
+                    kind = SIGNATURE_DRAW;
+                else if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
+                    kind = SIGNATURE_MESH;
+            }
+            signature_kinds[signature_count] = (BYTE)kind;
             signatures[signature_count++] = *out;
+        }
         for (UINT i = 0; desc && desc->pArgumentDescs && i < desc->NumArgumentDescs; i++)
             if (desc->pArgumentDescs[i].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS
                     && ray_signature_count < (LONG)ARRAYSIZE(ray_signatures))
@@ -2071,6 +2142,12 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
             rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
         return;
     }
+    if (debug_view_on())
+    {
+        UINT kind = signature_kind(signature);
+        if (kind != SIGNATURE_OTHER)
+            debug_view_draw(&p->debug_view, kind == SIGNATURE_MESH);
+    }
     traced = trace_begin(p, TRUE, count_buffer ? "indirect-counted" : "indirect", count, 0, 0);
     ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
             p->inner, signature, count, args, offset, count_buffer, count_offset);
@@ -2097,6 +2174,12 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         }
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
+        if (debug_view_on())
+        {
+            UINT kind = signature_kind(a);
+            if (kind != SIGNATURE_OTHER)
+                debug_view_draw(&p->debug_view, kind == SIGNATURE_MESH);
+        }
         traced = trace_begin(p, TRUE, e ? "indirect-counted" : "indirect", (UINT)b, 0, 0);
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
                 p->inner, a, (UINT)b, c, d, e, f);
@@ -5940,6 +6023,16 @@ static void STDMETHODCALLTYPE list_OMSetRenderTargets(struct proxy *p, UINT coun
     }
     if (display >= 0)
         InterlockedIncrement(&display_binds[display]);
+    /* REBOX_DEBUG_VIEW (debug_view.c): which textures this pass draws into. */
+    if (debug_view_on())
+    {
+        ID3D12Resource *bound[8] = { 0 };
+        UINT n = rts ? min(count, 8u) : 0;
+        for (UINT i = 0; i < n; i++)
+            bound[i] = target_view_resource(single ? rts[0].ptr + i * 32 : rts[i].ptr);
+        debug_view_bind(INNER(p, ID3D12GraphicsCommandList), &p->debug_view, bound, n,
+                        ds ? target_view_resource(ds->ptr) : NULL, display >= 0);
+    }
     ID3D12GraphicsCommandList_OMSetRenderTargets(INNER(p, ID3D12GraphicsCommandList), count, rts, single, ds);
 }
 
@@ -6068,6 +6161,8 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
+    if (debug_view_on())
+        debug_view_draw(&p->debug_view, FALSE);
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
         return;
     if (p->display_bound || draw_census())
@@ -6091,6 +6186,8 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
+    if (debug_view_on())
+        debug_view_draw(&p->debug_view, FALSE);
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
     traced = trace_begin(p, TRUE, "indexed", indices, instances, 0);
@@ -6564,6 +6661,8 @@ static void STDMETHODCALLTYPE list_Dispatch(struct proxy *p, UINT x, UINT y, UIN
 static void STDMETHODCALLTYPE list_DispatchMesh(struct proxy *p, UINT x, UINT y, UINT z)
 {
     BOOL traced = trace_begin(p, TRUE, "mesh", x, y, z);
+    if (debug_view_on())
+        debug_view_draw(&p->debug_view, TRUE);
     ((void (STDMETHODCALLTYPE *)(void *, UINT, UINT, UINT))PC_SLOT(p->inner, 79))(p->inner, x, y, z);
     trace_end(traced);
 }
@@ -6656,6 +6755,14 @@ static void STDMETHODCALLTYPE list_CopyRaytracingAccelerationStructure(struct pr
     ID3D12GraphicsCommandList4_CopyRaytracingAccelerationStructure(INNER(p, ID3D12GraphicsCommandList4), dst, src, mode);
 }
 
+/* Slot 9: Close, forwarded; REBOX_DEBUG_VIEW copies the target it shows if this list's last pass drew it. */
+static HRESULT STDMETHODCALLTYPE list_Close(struct proxy *p)
+{
+    if (debug_view_on())
+        debug_view_close(INNER(p, ID3D12GraphicsCommandList), &p->debug_view);
+    return ID3D12GraphicsCommandList_Close(INNER(p, ID3D12GraphicsCommandList));
+}
+
 static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAllocator *alloc, ID3D12PipelineState *pso)
 {
     struct embedded **e, *keep = NULL, *drop = NULL;
@@ -6668,6 +6775,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
 
     p->resets++;
     p->ray_pipeline = FALSE;
+    memset(&p->debug_view, 0, sizeof(p->debug_view));
     while (p->active)
     {
         struct embedded *a = p->active;
@@ -7135,7 +7243,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(119, list_CopyRaytracingAccelerationStructure),             /* PC 74 */
         FN(120, list_SetPipelineState1),              /* PC 75 (Unreal 5: 54 calls in a run) */
         FN(121, list_DispatchRays),                   /* PC 76 */
-        FN(10, list_Reset),
+        FN(9, list_Close), FN(10, list_Reset),
         FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced), FN(14, list_Dispatch),
         FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),
@@ -7197,7 +7305,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(131, list_PipelineSyncX), FN(132, list_PipelineSyncX),
         FN(101, list_DriverHintX),                    /* the older 99 */
         FN(123, list_DispatchRays),                   /* PC 76 */
-        FN(10, list_Reset),
+        FN(9, list_Close), FN(10, list_Reset),
         FN(12, list_DrawInstanced), FN(13, list_DrawIndexedInstanced), FN(14, list_Dispatch),
         FN(50, list_OMSetRenderTargets), FN(52, list_ClearRenderTargetView),
         FN(26, list_ResourceBarrier),

@@ -17,5 +17,7 @@ void present_queue_destroy(struct present_queue *state);
  * barriers the title records. */
 void present_track_state(void *resource, D3D12_RESOURCE_STATES state);
 BOOL present_tracked_state(void *resource, D3D12_RESOURCE_STATES *state);
+/* Either kind: *kind 1 for a legacy state, 2 for an enhanced-barrier layout, in *value. */
+BOOL present_tracked(void *resource, UINT *kind, UINT *value);
 void present_track_barriers(UINT count, const D3D12_RESOURCE_BARRIER *barriers);
 void present_track_enhanced(UINT32 count, const D3D12_BARRIER_GROUP *groups);

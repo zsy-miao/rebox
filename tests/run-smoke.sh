@@ -160,3 +160,29 @@ echo "ok   REBOX_STACK_SAMPLE logs every thread's stack from a copy, without fau
 grep -q "write watch: smoke.exe+0x[0-9a-f]* writes 0x7e0000008" <<<"$out" || { echo "FAIL REBOX_WRITE_WATCH logged no writer"; exit 1; }
 echo "ok   REBOX_WRITE_WATCH names the instruction that writes a watched range"
 echo "ok   fault reports name module+RVA, the target, the GPU window and the stack"
+
+# REBOX_FAST leaves programs out by their names; REBOX_DEBUG_VIEW shows a drawn target in place of
+# the plane. Every test's draws count towards the first present: the largest target drawn is a tie
+# of 64x48 ones, the first bound wins, the console draw's (a red triangle over all of it), so frame 1
+# is red where the plane is orange; frame 2 had no draws, and shows the plane.
+echo "== fake.bin, REBOX_FAST=1 and REBOX_DEBUG_VIEW=auto"
+out=$(REBOX_FAST=1 REBOX_DEBUG_VIEW=auto "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) \
+    || { echo "$out" | grep -E "FAIL|DEBUG_VIEW|REBOX_FAST" | head -40; exit 1; }
+grep -q "ok   REBOX_FAST=1 leaves out a ray tracing program and keeps a G-buffer one" <<<"$out" \
+    && grep -q "REBOX_FAST: leaving out programs in rays,hair,volumetrics,reflections,particles" <<<"$out" \
+    || { echo "FAIL REBOX_FAST did not pick programs by name"; grep -E "REBOX_FAST|program" <<<"$out" | head; exit 1; }
+echo "ok   REBOX_FAST leaves out programs by the names their containers carry"
+grep -Eq "REBOX_DEBUG_VIEW=auto at present 1: showing the largest render target drawn, colour 64x48 format 28" <<<"$out" \
+    && [[ $(od -An -tu1 -j54 -N3 "$work/frames/frame_1.bmp" | tr -s ' ') == " 0 0 255" ]] \
+    && grep -q "ok   presented frame 2 has the cleared pixels" <<<"$out" \
+    || { echo "FAIL REBOX_DEBUG_VIEW did not show the drawn target"; grep -E "DEBUG_VIEW|presented frame" <<<"$out" | head
+         od -An -tu1 -j54 -N4 "$work/frames/frame_1.bmp"; exit 1; }
+echo "ok   REBOX_DEBUG_VIEW picks the drawn target and shows its pixels"
+# The copy made when the chosen target's pass ends (test_debug_view_snapshot): frame 5 the target as
+# it is at the present, frame 6 the copy (blue), not the target as a later clear left it (red).
+echo "== fake.bin, REBOX_DEBUG_VIEW=32x16"
+out=$(REBOX_DEBUG_VIEW=32x16 REBOX_DUMP_FRAMES_AT=1,2,3,4,5,6 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) \
+    || { echo "$out" | grep -E "FAIL|DEBUG_VIEW" | head -40; exit 1; }
+grep -q "ok   REBOX_DEBUG_VIEW shows its copy from when its pass ended" <<<"$out" \
+    || { echo "FAIL REBOX_DEBUG_VIEW did not show the copy"; grep -E "DEBUG_VIEW" <<<"$out" | head; exit 1; }
+echo "ok   REBOX_DEBUG_VIEW copies the target when its pass ends and shows the copy"
