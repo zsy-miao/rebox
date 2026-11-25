@@ -39,6 +39,9 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size);
  * cut at the committed run's end and at GPU memory above; TRUE if some of it, from address on, is
  * GPU memory now. */
 BOOL gpu_memory_adopt_some(UINT64 address, UINT64 size);
+/* For vkd3d-proton (patch 0033): whether the buffer heap under 2 MiB it is making is to be memory
+ * of its own rather than a piece of a chunk (the heap of title memory being made GPU memory). */
+BOOL WINAPI ReboxHeapWhole(UINT64 size);
 /* Logs, and clears, the counts of requests not made GPU memory by reason (with the census). */
 void gpu_memory_adopt_failures_log(void);
 /* If address is identity-mapped GPU memory (CPU address == GPU VA), the end of its chunk. */

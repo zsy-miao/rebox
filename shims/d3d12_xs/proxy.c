@@ -2075,17 +2075,53 @@ static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_AD
 /* A root view's size is a guess (ROOT_VIEW_SIZE, below): as much of it from the address on as can
  * be is made GPU memory, cut at the committed run's end or GPU memory above (a mesh draw's root
  * view whose guessed 64 KiB couldn't all be had stayed out entirely, and its shader read zeros). */
-static D3D12_GPU_VIRTUAL_ADDRESS root_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size,
-                                            BOOL *empty)
+/* Root views read as empty since the last census, by pipeline (compute, graphics) and kind
+ * (constant buffer, shader resource, unordered access), with the last one's root index and
+ * address: whether a culling compute's outputs (root UAVs) are lost too, or only a draw's inputs. */
+enum { ROOT_CBV, ROOT_SRV, ROOT_UAV };
+static volatile LONG root_empty[2][3], root_empty_index[2][3];
+static volatile LONG64 root_empty_address[2][3];
+
+static D3D12_GPU_VIRTUAL_ADDRESS root_adopt(const char *what, BOOL graphics, UINT kind, UINT index,
+                                            D3D12_GPU_VIRTUAL_ADDRESS address, UINT size, BOOL *empty)
 {
-    return adopt_bound(what, address, size, TRUE, empty);
+    address = adopt_bound(what, address, size, TRUE, empty);
+    if (*empty)
+    {
+        InterlockedIncrement(&root_empty[graphics][kind]);
+        InterlockedExchange(&root_empty_index[graphics][kind], (LONG)index);
+        InterlockedExchange64(&root_empty_address[graphics][kind], (LONG64)address);
+    }
+    return address;
 }
 
-/* A graphics root view bound: whether it reads as empty, for the debug view's probe. */
-static void note_root_view(struct proxy *p, UINT index, BOOL empty)
+void proxy_root_views_census_log(void)
+{
+    static const char *const pipelines[2] = { "compute", "graphics" }, *const kinds[3] = { "CBV", "SRV", "UAV" };
+    char line[512];
+    int at = 0;
+
+    for (UINT g = 0; g < 2; g++)
+        for (UINT k = 0; k < 3; k++)
+        {
+            LONG n = InterlockedExchange(&root_empty[g][k], 0);
+            if (n && at < (int)sizeof(line) - 96)
+                at += snprintf(line + at, sizeof(line) - at, "%s %s %s %ld (the last root %ld at %#llx)",
+                               at ? ";" : "", pipelines[g], kinds[k], n, root_empty_index[g][k],
+                               (unsigned long long)root_empty_address[g][k]);
+        }
+    if (at)
+        rebox_log("d3d12_xs:   root views in title memory read as empty since the last census:%s", line);
+}
+
+/* A graphics root view bound: whether it reads as empty, and where it is, for the debug view's
+ * probe. */
+static void note_root_view(struct proxy *p, UINT index, UINT64 address, BOOL empty)
 {
     if (index < 32)
         p->debug_view.root_views_empty = (p->debug_view.root_views_empty & ~(1u << index)) | ((UINT)!!empty << index);
+    if (index < ARRAYSIZE(p->debug_view.root_view_address))
+        p->debug_view.root_view_address[index] = address;
 }
 
 /* Slots 41-46: Set{Compute,Graphics}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC
@@ -2234,7 +2270,7 @@ static void ia_buffer_check(const char *what, int slot, D3D12_GPU_VIRTUAL_ADDRES
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root constant buffer", FALSE, ROOT_CBV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
@@ -2242,16 +2278,16 @@ static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root constant buffer", TRUE, ROOT_CBV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root constant buffer", FALSE, index, address);
-    note_root_view(p, index, empty);
+    note_root_view(p, index, address, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root shader resource", FALSE, ROOT_SRV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
@@ -2259,16 +2295,16 @@ static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy
 static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root shader resource", TRUE, ROOT_SRV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root shader resource", FALSE, index, address);
-    note_root_view(p, index, empty);
+    note_root_view(p, index, address, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root unordered access", FALSE, ROOT_UAV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
@@ -2276,9 +2312,9 @@ static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct prox
 static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
     BOOL empty;
-    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE, &empty);
+    address = root_adopt("a root unordered access", TRUE, ROOT_UAV, index, address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root unordered access", TRUE, index, address);
-    note_root_view(p, index, empty);
+    note_root_view(p, index, address, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 

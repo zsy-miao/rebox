@@ -20,6 +20,7 @@ struct debug_view_list
     RECT scissor;
     UINT viewports, scissors;
     UINT root_views_empty;
+    UINT64 root_view_address[8]; /* the graphics root views' addresses, by root index */
 };
 
 BOOL debug_view_on(void);

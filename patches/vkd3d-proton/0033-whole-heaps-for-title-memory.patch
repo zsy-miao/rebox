@@ -1,0 +1,41 @@
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -2017,6 +2017,27 @@
+                     !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_DAMAGE_NOT_ZEROED_ALLOCATIONS)));
+ }
+
++/* rebox (patch 0033): whether d3d12_xs wants the buffer heap being made to be memory of its own
++ * (ReboxHeapWhole). Title memory it makes GPU memory in place is a heap whose allocation the
++ * gpuva_identity layer puts at the title's address; it can't do that to a chunk the heap is only a
++ * piece of. Without this such heaps had to be 2 MiB or more, and title memory between GPU memory
++ * less than 2 MiB apart stayed out of GPU memory. */
++static bool vkd3d_rebox_heap_whole(uint64_t size)
++{
++    typedef int (*PFN_heap_whole)(uint64_t size);
++    static PFN_heap_whole fn;
++    static bool resolved;
++    vkd3d_module_t module;
++
++    if (!resolved)
++    {
++        if ((module = vkd3d_dlopen("d3d12_xs.dll")))
++            fn = (PFN_heap_whole)vkd3d_dlsym(module, "ReboxHeapWhole");
++        resolved = true;
++    }
++    return fn && fn(size);
++}
++
+ static bool vkd3d_memory_info_allow_suballocate(struct d3d12_device *device,
+         const struct vkd3d_allocate_memory_info *info)
+ {
+@@ -2035,7 +2056,8 @@
+     /* For buffers, we'll need to allocate VA space,
+      * and we must allocate a minimum amount due to our trie data structure. */
+     if (!(info->heap_flags & D3D12_HEAP_FLAG_DENY_BUFFERS))
+-        return info->memory_requirements.size < VKD3D_VA_BLOCK_SIZE;
++        return info->memory_requirements.size < VKD3D_VA_BLOCK_SIZE &&
++                !vkd3d_rebox_heap_whole(info->memory_requirements.size);
+
+     /* A suballocated image heap will have to support buffer + image placements. */
+     if (device->d3d12_caps.options.ResourceHeapTier < D3D12_RESOURCE_HEAP_TIER_2)

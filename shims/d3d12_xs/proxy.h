@@ -21,6 +21,8 @@ ID3D12GraphicsCommandList *proxy_list(void *list, ID3D12DescriptorHeap **heaps, 
  * (forwarded to the PC slot). */
 void proxy_frame_presented(void);
 void proxy_log_slot_stats(void);
+/* Logs, and clears, the counts of root views read as empty by pipeline and kind (with the census). */
+void proxy_root_views_census_log(void);
 
 /* The QueryPerformanceCounter time before which every submission (ExecuteCommandLists through the
  * proxies) has finished on the GPU, as last seen (every 20 ms); 0 before the first. Memory the GPU

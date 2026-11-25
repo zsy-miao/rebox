@@ -2370,6 +2370,7 @@ static void outcomes_log(void)
             rebox_log("d3d12_xs:   guest buffers in title memory read as empty since the last census "
                       "(not GPU memory, and couldn't be made so): %ld", empty);
     }
+    proxy_root_views_census_log();
     gpu_memory_adopt_failures_log();
 }
 

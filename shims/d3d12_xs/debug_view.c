@@ -375,6 +375,11 @@ static struct
         D3D12_VIEWPORT viewport;
         RECT scissor;
         UINT root_views_empty, empty_buffers;
+        /* The first root view read as empty's address (root index: the lowest bit of
+         * root_views_empty), and where the arguments are read from (GPU VA, 0: no ExecuteIndirect)
+         * and whether that is in Rebox's GPU memory chunks (title memory made GPU memory). */
+        UINT64 empty_view_address, args_va;
+        BYTE args_in_chunks;
     } slots[PROBE_SLOTS];
 } probe = { .remaining = -1 };
 
@@ -542,17 +547,31 @@ static void probe_report(LONG now)
         s->with_empty_inputs += probe.slots[i].empty_buffers || probe.slots[i].root_views_empty;
         if (recorded && probe.slots[i].mesh && detailed < 12)
         {
-            char view[160];
+            char view[160], where[160];
+            int n = 0;
             detailed++;
             probe_view_text(i, view, sizeof(view));
+            where[0] = 0;
+            if (probe.slots[i].args_va)
+                n += snprintf(where + n, sizeof(where) - n, "; arguments at %#llx (%s)",
+                              (unsigned long long)probe.slots[i].args_va,
+                              probe.slots[i].args_in_chunks ? "Rebox GPU memory" : "vkd3d-proton's own memory");
+            if (probe.slots[i].root_views_empty && n < (int)sizeof(where))
+            {
+                UINT b = 0;
+                while (!(probe.slots[i].root_views_empty & (1u << b)))
+                    b++;
+                snprintf(where + n, sizeof(where) - n, "; root view %u at %#llx", b,
+                         (unsigned long long)probe.slots[i].empty_view_address);
+            }
             rebox_log("d3d12_xs:   draw %u (%s): arguments %u %u %u%s%s, clipper %llu in %llu out, pixels %llu, samples "
-                      "%llu; %s; read as empty: %u guest buffers, root views %#x", i,
+                      "%llu; %s; read as empty: %u guest buffers, root views %#x%s", i,
                       console_draw_fate_name(probe.slots[i].fate), args[0], args[1], args[2],
                       probe.slots[i].args_words ? "" : " (not read)",
                       probe.slots[i].has_count ? (count ? ", counted" : ", count 0") : "",
                       (unsigned long long)st->CInvocations, (unsigned long long)st->CPrimitives,
                       (unsigned long long)st->PSInvocations, (unsigned long long)samples, view,
-                      probe.slots[i].empty_buffers, probe.slots[i].root_views_empty);
+                      probe.slots[i].empty_buffers, probe.slots[i].root_views_empty, where);
         }
     }
     for (UINT k = 0; k < 3; k++)
@@ -654,6 +673,24 @@ void debug_view_draw_begin(ID3D12GraphicsCommandList *list, struct debug_view_li
     probe.slots[slot].viewport = l->viewport;
     probe.slots[slot].scissor = l->scissor;
     probe.slots[slot].root_views_empty = l->root_views_empty;
+    probe.slots[slot].empty_view_address = 0;
+    for (UINT b = 0; b < ARRAYSIZE(l->root_view_address); b++)
+        if (l->root_views_empty & (1u << b))
+        {
+            probe.slots[slot].empty_view_address = l->root_view_address[b];
+            break;
+        }
+    probe.slots[slot].args_va = 0;
+    probe.slots[slot].args_in_chunks = 0;
+    if (args)
+    {
+        UINT64 va = ID3D12Resource_GetGPUVirtualAddress(args);
+        if (va)
+        {
+            probe.slots[slot].args_va = va + args_offset;
+            probe.slots[slot].args_in_chunks = (BYTE)gpu_memory_holds_gpu(va + args_offset, 12);
+        }
+    }
     ID3D12GraphicsCommandList_BeginQuery(list, probe.occlusion, D3D12_QUERY_TYPE_OCCLUSION, slot);
     ID3D12GraphicsCommandList_BeginQuery(list, probe.stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot);
     l->probe = slot + 1;

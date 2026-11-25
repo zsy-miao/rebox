@@ -1883,6 +1883,31 @@ static void test_present(void *dev, void *queue)
                 ibv.Format = DXGI_FORMAT_R16_UINT;
                 XSLOT(list, 48, void, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW *)(list, 0, 1, &vbv);
                 XSLOT(list, 47, void, const D3D12_INDEX_BUFFER_VIEW *)(list, &ibv);
+                /* Title memory in a run under 2 MiB (192 KiB committed on its own): made GPU memory
+                 * too, as a heap of its own (vkd3d-proton patch 0033), where title memory is made
+                 * so at all (the GPU VA identity layer is there). */
+                {
+                    HMODULE xs = GetModuleHandleA("d3d12_xs.dll");
+                    BOOL (WINAPI *query)(const void *, void **, SIZE_T *) =
+                            xs ? (void *)GetProcAddress(xs, "ReboxGpuQuery") : NULL;
+                    BOOL (WINAPI *whole)(UINT64) = xs ? (void *)GetProcAddress(xs, "ReboxHeapWhole") : NULL;
+                    static BYTE *small;
+                    SIZE_T size = 0;
+                    CHECK(whole && !whole(1 << 16), "d3d12_xs exports ReboxHeapWhole, FALSE outside adoption");
+                    if (!small)
+                        small = VirtualAlloc(NULL, 3 << 16, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    if (query && small && query(ia_memory, NULL, NULL))
+                    {
+                        void *base = NULL;
+                        vbv.BufferLocation = (UINT64)(ULONG_PTR)small + 0x100;
+                        vbv.SizeInBytes = 1 << 12;
+                        XSLOT(list, 48, void, UINT, UINT, const D3D12_VERTEX_BUFFER_VIEW *)(list, 1, 1, &vbv);
+                        CHECK(query(small + 0x100, &base, &size) && size < (2u << 20),
+                              "title memory in a run under 2 MiB is made GPU memory (%p+%#zx)", base, size);
+                    }
+                    else
+                        printf("info title memory isn't made GPU memory here: short runs not tested\n");
+                }
             }
             XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
         }

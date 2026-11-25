@@ -525,11 +525,45 @@ UINT gpu_memory_regions(struct gpu_memory_region *out, UINT max)
 }
 
 /* Spans of title memory made GPU memory: 64 KiB-aligned (.#radv-rebox takes a lower-half address
- * with the page alignment), at least 2 MiB (vkd3d-proton suballocates smaller buffer heaps, so
- * the layer would never see the allocation), and as much of the committed run around the request
- * as ADOPT_GRANULE allows, so neighbouring placements land in one chunk instead of straddling two. */
+ * with the page alignment), 2 MiB or more where there is room, and as much of the committed run
+ * around the request as ADOPT_GRANULE allows, so neighbouring placements land in one chunk instead
+ * of straddling two. Where there isn't room (between chunks, or in a short run) a span down to
+ * 64 KiB fills what there is: vkd3d-proton suballocates buffer heaps under 2 MiB, so the layer
+ * would never see the allocation, unless d3d12_xs asks it not to (ReboxHeapWhole, vkd3d-proton
+ * patch 0033). Without that, such holes stayed out of GPU memory for good: a world's mesh draws'
+ * root views (a title's per-draw data, 64 KiB apart from chunks on either side) read as empty,
+ * 230 of 317 draws a frame. */
 #define ADOPT_ALIGN (64ull << 10)
 #define ADOPT_MIN (2ull << 20)
+
+/* The thread making an adopted chunk's heap under 2 MiB (under the lock, exclusive), which
+ * ReboxHeapWhole answers for; whether vkd3d-proton asked (it has patch 0033): -1 not known yet. */
+static volatile DWORD whole_heap_thread;
+static volatile LONG whole_heap_asked;
+static volatile LONG whole_heaps = -1;
+
+/* From vkd3d-proton (patch 0033), for a buffer heap under 2 MiB it is about to suballocate: TRUE
+ * to give it memory of its own instead, as the heaps of title memory made GPU memory need. */
+BOOL WINAPI ReboxHeapWhole(UINT64 size)
+{
+    if (whole_heap_thread != GetCurrentThreadId())
+        return FALSE;
+    InterlockedExchange(&whole_heap_asked, 1);
+    return TRUE;
+}
+
+/* The least span adopt makes: 64 KiB unless vkd3d-proton is known not to keep such heaps whole,
+ * or REBOX_ADOPT_SMALL=0. */
+static UINT64 adopt_min_span(void)
+{
+    static int small = -1;
+    if (small < 0)
+    {
+        const char *v = getenv("REBOX_ADOPT_SMALL");
+        small = !v || strcmp(v, "0");
+    }
+    return small && whole_heaps ? ADOPT_ALIGN : ADOPT_MIN;
+}
 /* Between chunks: none. RADV maps a read-only page past each allocation on GPUs with the SMEM
  * out-of-bounds mitigation, which kept chunks 64 KiB apart, and the first 64 KiB of the next
  * granule out of GPU memory (a root UAV there faulted the GPU); patches/mesa-radv-low-va-no-pad.patch
@@ -629,10 +663,13 @@ enum { ADOPT_FAIL_RECENT, ADOPT_FAIL_UNCOMMITTED, ADOPT_FAIL_PAST_RUN, ADOPT_FAI
        ADOPT_FAIL_MAP, ADOPT_FAILS };
 static const char *const adopt_fail_names[ADOPT_FAILS] = {
     "failed within the last second", "not committed memory", "running past the committed run",
-    "straddling GPU memory", "a span under 2 MiB between GPU memory or the run's ends", "the layer didn't map it" };
+    "straddling GPU memory", "too small a span between GPU memory or the run's ends", "the layer didn't map it" };
 static volatile LONG adopt_fails[ADOPT_FAILS];
 static volatile LONG64 adopt_fail_example[ADOPT_FAILS], adopt_fail_example_end[ADOPT_FAILS];
 static volatile LONG adopt_trimmed;
+/* What the last request not in committed memory found at its address (VirtualQuery's state,
+ * protection and type): not committed, read-only, or physical pages' views not mapped yet. */
+static volatile DWORD uncommitted_state, uncommitted_protect, uncommitted_type;
 
 static void adopt_fail(UINT reason, UINT64 address, UINT64 end)
 {
@@ -654,6 +691,9 @@ void gpu_memory_adopt_failures_log(void)
             at += snprintf(line + at, sizeof(line) - at, "%s %ld %s (the last %#llx-%#llx)", at ? ";" : "", n,
                            adopt_fail_names[r], (unsigned long long)adopt_fail_example[r],
                            (unsigned long long)adopt_fail_example_end[r]);
+        if (n && r == ADOPT_FAIL_UNCOMMITTED && at < (int)sizeof(line) - 80)
+            at += snprintf(line + at, sizeof(line) - at, " (state %#lx, protection %#lx, type %#lx there)",
+                           uncommitted_state, uncommitted_protect, uncommitted_type);
     }
     line[at] = 0;
     if (at || trimmed)
@@ -772,8 +812,15 @@ adopt:
     ReleaseSRWLockShared(&lock);
     if (!committed_run(address, base, limit, FALSE, &run_start, &run_end))
     {
+        MEMORY_BASIC_INFORMATION mbi;
         adopt_fail(ADOPT_FAIL_UNCOMMITTED, address, end);
         note_adopt_failed(address, end);
+        if (VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)))
+        {
+            uncommitted_state = mbi.State;
+            uncommitted_protect = mbi.Protect;
+            uncommitted_type = mbi.Type;
+        }
         return held_head;
     }
     if (end > run_end && trim && run_end > address)
@@ -833,7 +880,7 @@ adopt:
             }
         }
     }
-    if (base > address || limit < end || limit - base < ADOPT_MIN)
+    if (base > address || limit < end || limit - base < adopt_min_span())
     {
         ReleaseSRWLockExclusive(&lock);
         adopt_fail(straddles ? ADOPT_FAIL_STRADDLE : ADOPT_FAIL_SPAN, address, end);
@@ -851,8 +898,27 @@ adopt:
     box->size = bytes;
     MemoryBarrier();
     box->address = base;
+    if (bytes < ADOPT_MIN)
+    {
+        whole_heap_asked = 0;
+        whole_heap_thread = GetCurrentThreadId();
+    }
     c = chunk_create(device, bytes, TRUE, TRUE);
     box->address = 0;
+    if (bytes < ADOPT_MIN)
+    {
+        whole_heap_thread = 0;
+        if (whole_heaps < 0 || (whole_heaps && !whole_heap_asked))
+        {
+            /* Not asked: vkd3d-proton without patch 0033, which suballocated the heap; no more
+             * spans under 2 MiB. */
+            whole_heaps = whole_heap_asked;
+            rebox_log("d3d12_xs: title memory spans under 2 MiB %s (%#llx+%#llx)",
+                      whole_heaps ? "are made GPU memory as heaps of their own"
+                                  : "can't be made GPU memory: vkd3d-proton suballocates such heaps (it lacks "
+                                    "patch 0033)", (unsigned long long)base, (unsigned long long)bytes);
+        }
+    }
     if (c && (UINT64)(ULONG_PTR)c->cpu == base && c->gpu == base && box->result == base)
     {
         c->adopted = TRUE;
