@@ -19,9 +19,11 @@ EXPORTS
     ReboxShadowRead
     ReboxShadowFind
     ReboxShadowFindIndex
+    ReboxShadowInnerCpu
     ReboxShadowSrvForUav
     ReboxGuestBufferEntry
     ReboxConsoleCompile
+    ReboxConsoleDrawBlock
     ReboxConsoleRectStages
     ReboxFallbackPso
     ReboxConsoleLastResult

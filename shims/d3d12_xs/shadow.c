@@ -62,6 +62,8 @@ struct shadow_heap
     UINT64 title_va, gpu_va;       /* title_va 0 for heaps that aren't shader-visible */
     UINT reserved, reserved_used;  /* hidden slots after count in vkd3d-proton's heap */
     UINT32 (*reserved_words)[4];   /* the S# each used one holds */
+    UINT *reserved_head, *reserved_next; /* reserved_words by hash (reserved_find), or NULL: walked */
+    UINT reserved_buckets;
     ID3D12Resource **res;          /* CBV/SRV/UAV: count entries, the resource each slot's view is of
                                     * (not referenced), made on the first view of one */
     ID3D12Resource **reserved_res; /* the same for the reserved tail (shadow_reserve_srv) */
@@ -403,6 +405,8 @@ static void heap_free(struct shadow_heap *h)
     else
         free(h->data);
     free(h->reserved_words);
+    free(h->reserved_head);
+    free(h->reserved_next);
     free(h->views);
     free(h->uavs);
     free(h);
@@ -1092,6 +1096,89 @@ enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index)
     return view;
 }
 
+/* The reserved tail's slots by their words: a draw's T#s the title wrote itself, its dummy views and
+ * the samplers made from literals each looked through every used slot, under the lock exclusive,
+ * at every draw (thousands of slots once a world's textures are viewed there). */
+static UINT reserved_hash(const struct shadow_heap *h, const UINT32 key[4])
+{
+    UINT64 a = key[0] | (UINT64)key[1] << 32, b = key[2] | (UINT64)key[3] << 32;
+    UINT64 x = a * 0x9e3779b97f4a7c15ull ^ b * 0xc2b2ae3d27d4eb4full;
+    x ^= x >> 29;
+    return (UINT)((x * 0x9e3779b97f4a7c15ull) >> 32) & (h->reserved_buckets - 1);
+}
+
+/* Under the lock: the first used reserved slot holding these words, or ~0u. */
+static UINT reserved_find(const struct shadow_heap *h, const UINT32 key[4])
+{
+    UINT found = ~0u;
+    if (!h->reserved_words)
+        return ~0u;
+    if (!h->reserved_head)
+    {
+        for (UINT i = 0; i < h->reserved_used; i++)
+            if (!memcmp(h->reserved_words[i], key, 16))
+                return i;
+        return ~0u;
+    }
+    /* A slot's words can change after it went in (shadow_forget_reserved): compared again. */
+    for (UINT i = h->reserved_head[reserved_hash(h, key)]; i != ~0u; i = h->reserved_next[i])
+        if (i < found && i < h->reserved_used && !memcmp(h->reserved_words[i], key, 16))
+            found = i;
+    return found;
+}
+
+/* Under the lock, exclusive: reserved slot i, its words just written, is found by them. The index is
+ * made with the first slot; without memory for it, the slots are walked. */
+static void reserved_note(struct shadow_heap *h, UINT i)
+{
+    UINT b;
+    if (!i && !h->reserved_head)
+    {
+        UINT buckets = 16;
+        while (buckets < h->reserved && buckets < (1u << 30))
+            buckets <<= 1;
+        h->reserved_head = malloc(buckets * sizeof(*h->reserved_head));
+        h->reserved_next = malloc(h->reserved * sizeof(*h->reserved_next));
+        if (!h->reserved_head || !h->reserved_next)
+        {
+            free(h->reserved_head);
+            free(h->reserved_next);
+            h->reserved_head = h->reserved_next = NULL;
+        }
+        else
+        {
+            memset(h->reserved_head, 0xff, buckets * sizeof(*h->reserved_head));
+            h->reserved_buckets = buckets;
+        }
+    }
+    if (!h->reserved_head || i >= h->reserved)
+        return;
+    b = reserved_hash(h, h->reserved_words[i]);
+    h->reserved_next[i] = h->reserved_head[b];
+    h->reserved_head[b] = i;
+}
+
+/* The reserved slot of the heap (of type) at heap_cpu holding these words, looked for under the lock
+ * shared: the usual case at a draw, which then doesn't queue the other recording threads behind it. */
+static BOOL reserved_lookup(SIZE_T heap_cpu, D3D12_DESCRIPTOR_HEAP_TYPE type, const UINT32 key[4], UINT *index)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&lock);
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+        if (h->cpu_start == heap_cpu && h->type == type && h->reserved)
+        {
+            UINT i = reserved_find(h, key);
+            if (i != ~0u)
+            {
+                *index = h->count + i;
+                found = TRUE;
+            }
+            break;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 /* Whether a heap's reserved tail has room; the first times it doesn't, logged: what would have gone
  * there binds nothing. Under lock. */
 static BOOL reserve_room(const struct shadow_heap *h)
@@ -1187,12 +1274,14 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
         key[2] = u->has_desc ? u->desc.Format : 0;
         key[3] = u->has_desc ? (UINT32)u->desc.ViewDimension | u->desc.Texture2DArray.MipSlice << 8
                  | u->desc.Texture2DArray.FirstArraySlice << 16 : ~0u;
-        for (UINT i = 0; i < heap->reserved_used && !found; i++)
-            if (!memcmp(heap->reserved_words[i], key, 16))
+        {
+            UINT i = reserved_find(heap, key);
+            if (i != ~0u)
             {
                 *index = heap->count + i;
                 found = TRUE;
             }
+        }
         if (!found && device && reserve_room(heap)
                 && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
         {
@@ -1202,6 +1291,7 @@ BOOL shadow_reserve_srv_for_uav(SIZE_T heap_cpu, UINT uav_index, UINT *index)
 
             srv_from_uav(u, &srv);
             memcpy(heap->reserved_words[i], key, 16);
+            reserved_note(heap, i);
             *index = heap->count + i;
             cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
             ID3D12Device_CreateShaderResourceView(device, u->res, &srv, cpu);
@@ -1263,16 +1353,21 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
     key[1] = (UINT32)(r >> 32);
     key[2] = 0x53525621; /* "!VRS": not the srv_for_uav keys, whose word 2 is a format */
     key[3] = 0;
+    if (reserved_lookup(heap_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, key, index))
+        return TRUE;
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
         if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && h->reserved)
             heap = h;
-    for (UINT i = 0; heap && i < heap->reserved_used && !found; i++)
-        if (!memcmp(heap->reserved_words[i], key, 16))
+    if (heap)
+    {
+        UINT i = reserved_find(heap, key);
+        if (i != ~0u)
         {
             *index = heap->count + i;
             found = TRUE;
         }
+    }
     if (heap && !found && device && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
@@ -1312,6 +1407,7 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index)
         {
             i = heap->reserved_used++;
             memcpy(heap->reserved_words[i], key, 16);
+            reserved_note(heap, i);
             *index = heap->count + i;
             cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
             ID3D12Device_CreateShaderResourceView(device, res, &srv, cpu);
@@ -1376,16 +1472,21 @@ BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index)
     const UINT32 key[4] = { 0x4c4c554e /* NULL */, storage, 0, 0 };
     BOOL found = FALSE;
 
+    if (reserved_lookup(heap_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, key, index))
+        return TRUE;
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
         if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && h->reserved)
             heap = h;
-    for (UINT i = 0; heap && heap->reserved_words && i < heap->reserved_used && !found; i++)
-        if (!memcmp(heap->reserved_words[i], key, 16))
+    if (heap)
+    {
+        UINT i = reserved_find(heap, key);
+        if (i != ~0u)
         {
             *index = heap->count + i;
             found = TRUE;
         }
+    }
     if (heap && !found && device && dummy_texture(device) && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
@@ -1394,6 +1495,7 @@ BOOL shadow_reserve_null(SIZE_T heap_cpu, BOOL storage, UINT *index)
         UINT i = heap->reserved_used++;
 
         memcpy(heap->reserved_words[i], key, 16);
+        reserved_note(heap, i);
         *index = heap->count + i;
         cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
         if (storage)
@@ -1420,16 +1522,21 @@ BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
     struct shadow_heap *heap = NULL;
     BOOL found = FALSE;
 
+    if (reserved_lookup(heap_cpu, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, words, index))
+        return TRUE;
     AcquireSRWLockExclusive(&lock);
     for (struct shadow_heap *h = heaps; h && !heap; h = h->next)
         if (h->cpu_start == heap_cpu && h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && h->reserved)
             heap = h;
-    for (UINT i = 0; heap && i < heap->reserved_used && !found; i++)
-        if (!memcmp(heap->reserved_words[i], words, 16))
+    if (heap)
+    {
+        UINT i = reserved_find(heap, words);
+        if (i != ~0u)
         {
             *index = heap->count + i;
             found = TRUE;
         }
+    }
     if (heap && !found && device && reserve_room(heap)
             && (heap->reserved_words || (heap->reserved_words = calloc(heap->reserved, 16))))
     {
@@ -1439,6 +1546,7 @@ BOOL shadow_reserve_sampler(SIZE_T heap_cpu, const UINT32 words[4], UINT *index)
 
         console_decode_sampler(words, &desc);
         memcpy(heap->reserved_words[i], words, 16);
+        reserved_note(heap, i);
         *index = heap->count + i;
         cpu.ptr = heap->cpu_start + (SIZE_T)*index * heap->stride;
         ID3D12Device_CreateSampler(device, &desc, cpu);
@@ -1516,6 +1624,13 @@ BOOL WINAPI ReboxShadowFind(const UINT32 *words, UINT word_count, BOOL sampler, 
                 + (SIZE_T)best->index * best->heap->stride;
     ReleaseSRWLockShared(&lock);
     return best != NULL;
+}
+
+/* For tests: vkd3d-proton's CPU handle for a handle as the title has it (the heap_cpu a console compile
+ * is given). */
+SIZE_T WINAPI ReboxShadowInnerCpu(SIZE_T cpu)
+{
+    return shadow_cpu_to_inner(cpu);
 }
 
 /* For tests: the index of a slot of the heap at cpu (a handle as the title has it) holding these

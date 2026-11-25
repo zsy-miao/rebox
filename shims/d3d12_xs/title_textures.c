@@ -82,6 +82,7 @@ struct title_texture
 struct page_node { UINT64 page; struct title_texture *t; struct page_node *next; };
 static struct title_texture *by_resource[INDEX_BUCKETS];
 static struct page_node *by_page[INDEX_BUCKETS];
+static UINT unpaged; /* textures by_page doesn't have (no memory for their pages): title_texture_at walks */
 
 static SIZE_T resource_bucket(const ID3D12Resource *r)
 {
@@ -105,7 +106,10 @@ static void index_add(struct title_texture *t)
     t->rnext = by_resource[b];
     by_resource[b] = t;
     if (!t->size || !(t->pages = calloc(n, sizeof(*t->pages))))
+    {
+        unpaged++;
         return;
+    }
     for (UINT64 page = g0; page <= g1; page++)
         t->pages[k++].page = page;
     for (UINT64 page = c0; cpu && page <= c1; page++)
@@ -130,6 +134,8 @@ static void index_remove(struct title_texture *t)
             *r = t->rnext;
             break;
         }
+    if (!t->pages)
+        unpaged--;
     for (UINT k = 0; k < t->page_count; k++)
     {
         struct page_node **at;
@@ -1006,9 +1012,19 @@ ID3D12Resource *title_texture_at(UINT64 address)
     ID3D12Resource *res = NULL;
 
     AcquireSRWLockShared(&lock);
-    for (t = textures; t && !res; t = t->next)
-        if (t->address == address)
-            res = t->resource;
+    /* By the page of its address: every T# a draw binds that isn't in a heap asked, and walking
+     * every texture (tens of thousands in a world) took most of a draw's bindings. Pages are
+     * indexed newest first, as the list is kept. */
+    if (!unpaged)
+    {
+        for (struct page_node *n = by_page[page_bucket(address >> 16)]; n && !res; n = n->next)
+            if (n->page == address >> 16 && n->t->address == address)
+                res = n->t->resource;
+    }
+    else
+        for (t = textures; t && !res; t = t->next)
+            if (t->address == address)
+                res = t->resource;
     ReleaseSRWLockShared(&lock);
     return res;
 }

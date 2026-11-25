@@ -384,11 +384,12 @@ static struct host_buffer { UINT64 hash, gpu; SIZE_T size; const void *cpu; stru
  * DRAW_RING / 256 slots). */
 #define DRAW_RING (128u << 20)
 
+static SRWLOCK ring_lock = SRWLOCK_INIT;
+static BYTE *ring_cpu;
+static UINT64 ring_gpu, ring_head;
+
 static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 {
-    static SRWLOCK ring_lock = SRWLOCK_INIT;
-    static BYTE *ring_cpu;
-    static UINT64 ring_gpu, ring_head;
     SIZE_T aligned = (size + 255) & ~(SIZE_T)255;
     UINT64 at;
 
@@ -426,6 +427,18 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 UINT64 console_draw_buffer(const void *data, SIZE_T size)
 {
     return draw_buffer(data, size, NULL);
+}
+
+/* For tests: size bytes of the per-draw ring at a GPU address draw_buffer gave (a draw block). */
+BOOL WINAPI ReboxConsoleDrawBlock(UINT64 va, void *out, SIZE_T size)
+{
+    BOOL ok;
+    AcquireSRWLockShared(&ring_lock);
+    ok = ring_cpu && va >= ring_gpu && size <= DRAW_RING && va - ring_gpu <= DRAW_RING - size;
+    if (ok)
+        memcpy(out, ring_cpu + (va - ring_gpu), size);
+    ReleaseSRWLockShared(&ring_lock);
+    return ok;
 }
 
 /* GPU memory holding these bytes; equal contents share it. */
@@ -473,6 +486,7 @@ static UINT64 page_table(UINT32 *bytes)
 {
     static SRWLOCK table_lock = SRWLOCK_INIT;
     static UINT64 table_va;
+    static volatile UINT64 table_ready_va; /* table_va once a table has been made there */
     static LONG table_key[3];
     static ULONGLONG table_built;
     static BYTE *table_cpu;
@@ -486,7 +500,14 @@ static UINT64 page_table(UINT32 *bytes)
     UINT64 va = 0;
 
     *bytes = 16 + PAGE_TABLE_CAPACITY * sizeof(struct page_range);
-    AcquireSRWLockShared(&table_lock);
+    /* Being made again by another thread (which takes milliseconds): its address is the same, as it is
+     * made in place. Waiting for the lock here made every draw of every recording thread wait. */
+    if (!TryAcquireSRWLockShared(&table_lock))
+    {
+        if ((va = table_ready_va))
+            return va;
+        AcquireSRWLockShared(&table_lock);
+    }
     if (table_va && !memcmp(key, table_key, sizeof(key)))
     {
         va = table_va;
@@ -507,10 +528,7 @@ static UINT64 page_table(UINT32 *bytes)
     ReleaseSRWLockShared(&table_lock);
     if (!TryAcquireSRWLockExclusive(&table_lock))
     {
-        AcquireSRWLockShared(&table_lock);
-        va = table_va;
-        ReleaseSRWLockShared(&table_lock);
-        if (va)
+        if ((va = table_ready_va))
             return va;
         AcquireSRWLockExclusive(&table_lock);
     }
@@ -593,7 +611,7 @@ static UINT64 page_table(UINT32 *bytes)
             out[i] = (struct page_range){ ~0ull, ~0ull, 0, 0, 0 };
     }
     memcpy(table_key, key, sizeof(key));
-    va = table_va;
+    va = table_ready_va = table_va;
     ReleaseSRWLockExclusive(&table_lock);
     free(ranges);
     return va;
@@ -1035,10 +1053,12 @@ static LONG failed_stage_count;
 /* Compile timings for the log, by kind (graphics stages, compute) and by who asked: a title thread
  * at its draw or dispatch, which waits for it, or a background worker (a program's first compile, a
  * graphics variant), whose time the title doesn't wait for. Phases: memory regions, waiting for the
- * compiler lock, AnyPS5, bindings (parts: identity, heap lookups, page table, host buffers),
- * finalizing a module. */
+ * compiler lock, AnyPS5, bindings (parts: identity, heap lookups, page table, host buffers, guest
+ * buffer table entries, T#s found by their texture's address, dummy views and view checks, late
+ * fills' sources, the log's notes), finalizing a module. */
 enum { PHASE_REGIONS, PHASE_LOCK, PHASE_ANYPS5, PHASE_BINDINGS, PHASE_MODULE, PHASES };
-enum { PART_IDENTITY, PART_LOOKUPS, PART_PAGE_TABLE, PART_HOST_BUFFERS, PARTS };
+enum { PART_IDENTITY, PART_LOOKUPS, PART_PAGE_TABLE, PART_HOST_BUFFERS, PART_GUEST_ENTRIES, PART_BY_ADDRESS,
+       PART_SLOTS, PART_LATE, PART_NOTES, PARTS };
 static struct compile_stats
 {
     volatile LONG calls, memo_skips;
@@ -1068,6 +1088,9 @@ static void part_add(UINT part, LONG64 ticks)
     if (stats)
         InterlockedAdd64(&stats->part[part], ticks);
 }
+
+/* Times stmt into a part of the bindings phase. */
+#define TIMED(part, stmt) do { LONG64 timed_start_ = ticks_now(); stmt; part_add(part, ticks_now() - timed_start_); } while (0)
 
 static double qpc_frequency(void)
 {
@@ -1780,9 +1803,18 @@ UINT64 console_stage_id(const void *shader, SIZE_T size)
 /* Whether a stage is REBOX_WATCH_STAGE's. */
 BOOL console_stage_watched(UINT64 id)
 {
-    const char *watch = getenv("REBOX_WATCH_STAGE");
+    /* Read once: bindings ask several times for every descriptor of every draw. */
+    static volatile LONG state; /* 0 unread, 1 none, 2 watching */
+    static char watch[17];
     char text[24];
-    if (!watch || !id)
+    if (!state)
+    {
+        const char *v = getenv("REBOX_WATCH_STAGE");
+        if (v && strlen(v) >= 16)
+            memcpy(watch, v, 16);
+        InterlockedExchange(&state, v && strlen(v) >= 16 ? 2 : 1);
+    }
+    if (state != 2 || !id)
         return FALSE;
     snprintf(text, sizeof(text), "%016llx", (unsigned long long)id);
     return !strncmp(watch, text, 16);
@@ -2318,18 +2350,21 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         n = InterlockedIncrement(&stats->calls);
         if (!(n & (n - 1)))
         {
-            char rows[2][400];
+            char rows[2][640];
             for (UINT b = 0; b < 2; b++)
             {
                 const struct compile_stats *st = &kind[b];
                 double ms = 1000.0 / qpc_frequency() / max(st->calls - (st == stats), 1);
                 snprintf(rows[b], sizeof(rows[b]), "%ld, %.2f ms each (memory regions %.2f, lock %.2f, AnyPS5 %.2f, "
-                         "bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers %.2f], module "
+                         "bindings %.2f [identity %.2f, lookups %.2f, page table %.2f, host buffers %.2f, V#s %.2f, "
+                         "T#s by address %.2f, dummies and views %.2f, late fills %.2f, notes %.2f], module "
                          "%.2f), %ld skipped as failing", st->calls - (st == stats), st->ticks * ms,
                          st->phase[PHASE_REGIONS] * ms, st->phase[PHASE_LOCK] * ms, st->phase[PHASE_ANYPS5] * ms,
                          st->phase[PHASE_BINDINGS] * ms, st->part[PART_IDENTITY] * ms, st->part[PART_LOOKUPS] * ms,
                          st->part[PART_PAGE_TABLE] * ms, st->part[PART_HOST_BUFFERS] * ms,
-                         st->phase[PHASE_MODULE] * ms, st->memo_skips);
+                         st->part[PART_GUEST_ENTRIES] * ms, st->part[PART_BY_ADDRESS] * ms, st->part[PART_SLOTS] * ms,
+                         st->part[PART_LATE] * ms, st->part[PART_NOTES] * ms, st->phase[PHASE_MODULE] * ms,
+                         st->memo_skips);
             }
             char refused[64] = "";
             if (graphics)
@@ -2935,6 +2970,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     for (UINT32 i = 0; i < sa5.binding_count(result); i++)
     {
         struct sa5_binding b;
+        LONG64 notes_start = ticks_now();
         sa5.binding(result, i, &b);
         if (graphics)
         {
@@ -2947,6 +2983,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                              b.word_count ? ":" : "", b.word_count > 0 ? b.words[0] : 0, b.word_count > 1 ? b.words[1] : 0,
                              b.word_count > 2 ? b.words[2] : 0, b.word_count > 3 ? b.words[3] : 0);
         }
+        part_add(PART_NOTES, ticks_now() - notes_start);
         if (b.role == 0 && b.kind == 1)
         {
             /* Guest storage buffers (every V#, constant buffers included) are reached through their
@@ -2978,11 +3015,12 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                   "%llu bytes)", (unsigned long long)stage_id, b.binding, e, w[0], w[1], w[2], w[3],
                                   (unsigned long long)base, (unsigned long long)bytes);
                 }
-                ReboxGuestBufferEntry(w, table + e * 4);
+                TIMED(PART_GUEST_ENTRIES, ReboxGuestBufferEntry(w, table + e * 4));
                 /* An empty V# of a graphics stage: maybe one the title writes before it submits. */
                 if (graphics && !(w[0] | w[1] | w[2] | w[3]) && empty_count < ARRAYSIZE(empty_sources))
                 {
-                    UINT64 source = late_buffer_source(h, in, zero_buffers++);
+                    UINT64 source;
+                    TIMED(PART_LATE, source = late_buffer_source(h, in, zero_buffers++));
                     if (source)
                     {
                         empty_sources[empty_count] = source;
@@ -3083,6 +3121,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             {
                 const UINT32 *w = b.words + e * per;
                 SIZE_T heap = (SIZE_T)in->heap_cpu[sampler];
+                LONG64 part_start = ticks_now();
                 if (graphics && !sampler)
                 {
                     /* The first graphics stages' textures: which resource, and whether its texels
@@ -3096,12 +3135,15 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     static struct { UINT64 id; LONG count; } per_stage[128];
                     static LONG stages_seen;
                     BOOL stage_first = FALSE;
+                    /* Read before they're counted: once the first 128 stages and their 4 textures
+                     * are logged, every draw's every texture counted on the same shared lines. */
                     for (LONG k = 0; k < min(stages_seen, 128); k++)
                         if (per_stage[k].id == stage_id)
                         {
-                            stage_first = InterlockedIncrement(&per_stage[k].count) <= 4;
+                            stage_first = per_stage[k].count < 4 && InterlockedIncrement(&per_stage[k].count) <= 4;
                             goto counted;
                         }
+                    if (stages_seen < 128)
                     {
                         LONG k = InterlockedIncrement(&stages_seen) - 1;
                         if (k < 128)
@@ -3162,13 +3204,15 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                  * last resort. */
                 LONG64 lookup_start = ticks_now();
                 UINT views = 0;
+                part_add(PART_NOTES, lookup_start - part_start);
                 for (UINT v = SHADOW_VIEW_NONE; v <= SHADOW_VIEW_SAMPLER; v++)
                     views |= view_fits(b.kind, (enum shadow_view)v) ? 1u << v : 0;
                 BOOL found = shadow_find_index_view(heap, w, per, sampler, !sampler, views, index)
                         || (sampler && shadow_reserve_sampler(heap, w, index))
                         || (sampler && shadow_find_index(heap, w, per, sampler, TRUE, index));
                 BOOL null_view = FALSE;
-                part_add(PART_LOOKUPS, ticks_now() - lookup_start);
+                part_start = ticks_now();
+                part_add(PART_LOOKUPS, part_start - lookup_start);
                 /* A texture descriptor the title wrote outside our heaps, or an empty slot, reads
                  * as zero, like a console null descriptor (a UE5 title: dummy T#s with base 0x9200):
                  * a zeroed dummy texture (shadow_reserve_null); binding the empty slot itself
@@ -3187,8 +3231,18 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                       (void *)res);
                     }
                 }
+                {
+                    LONG64 now = ticks_now();
+                    part_add(PART_BY_ADDRESS, now - part_start);
+                    part_start = now;
+                }
                 if ((b.kind == 4 || b.kind == 5) && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
                     null_view = shadow_reserve_null(heap, b.kind == 5, index);
+                {
+                    LONG64 now = ticks_now();
+                    part_add(PART_SLOTS, now - part_start);
+                    part_start = now;
+                }
                 if (console_stage_watched(stage_id))
                 {
                     static LONG resolved_shown;
@@ -3203,8 +3257,15 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3])
                         && pending_count < ARRAYSIZE(pending))
                 {
-                    UINT64 source = late_source(h, in, zero_textures++);
+                    UINT64 source;
                     static LONG noted;
+                    {
+                        LONG64 late_start = ticks_now(), late_ticks;
+                        source = late_source(h, in, zero_textures++);
+                        late_ticks = ticks_now() - late_start;
+                        part_add(PART_LATE, late_ticks);
+                        part_start += late_ticks; /* not the notes' */
+                    }
                     if (console_stage_watched(stage_id) || InterlockedIncrement(&noted) <= 4)
                         rebox_log("d3d12_xs: console shader %016llx: empty T# (%08x %08x %08x %08x), noted at %#llx",
                                   (unsigned long long)stage_id, w[4], w[5], w[6], w[7], (unsigned long long)source);
@@ -3278,6 +3339,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     log_failure(h, "a descriptor it binds isn't in the bound heap", detail);
                     goto done;
                 }
+                {
+                    LONG64 now = ticks_now();
+                    part_add(PART_NOTES, now - part_start);
+                    part_start = now;
+                }
                 /* A storage image AnyPS5 also binds as a sampled image (size queries): an SRV of
                  * the same texture in the reserved tail. Empty slots are refused: binding one
                  * crashed lavapipe. */
@@ -3293,6 +3359,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                     log_failure(h, "a binding doesn't match the view in its slot", detail);
                     goto done;
                 }
+                part_add(PART_SLOTS, ticks_now() - part_start);
             }
             remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, in->bindless[b.kind][0],
                                                         in->bindless[b.kind][1], b.count, &indices[index_count],

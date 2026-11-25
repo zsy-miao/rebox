@@ -52,6 +52,84 @@ struct allocation
 static SRWLOCK lock = SRWLOCK_INIT;
 static struct chunk *chunks;
 static volatile LONG chunks_generation; /* bumped under the lock after chunks changes */
+
+/* The chunks by GPU VA, for lookups by address: every guest buffer a draw binds asked several
+ * times, each a walk of every chunk (a world's adopted title memory makes hundreds), at thousands
+ * of draws a frame. Made again under the lock, exclusive, when chunks_generation has moved on. */
+struct span { UINT64 gpu, end; BOOL identity; };
+static struct span *spans;
+static UINT span_count, span_capacity;
+static LONG spans_generation = -1;
+static BOOL spans_overlap; /* chunks overlapping in GPU VA (never seen): the walks instead */
+
+static int compare_spans(const void *a, const void *b)
+{
+    const struct span *x = a, *y = b;
+    return x->gpu < y->gpu ? -1 : x->gpu > y->gpu;
+}
+
+/* Under the lock, exclusive. */
+static void spans_make(void)
+{
+    UINT n = 0;
+    for (struct chunk *c = chunks; c; c = c->next)
+        n++;
+    if (n > span_capacity)
+    {
+        struct span *more = realloc(spans, n * 2 * sizeof(*spans));
+        if (!more)
+        {
+            span_count = 0;
+            spans_overlap = TRUE; /* walks until it can be made */
+            spans_generation = chunks_generation;
+            return;
+        }
+        spans = more;
+        span_capacity = n * 2;
+    }
+    n = 0;
+    for (struct chunk *c = chunks; c; c = c->next)
+        spans[n++] = (struct span){ c->gpu, c->gpu + c->size, (UINT64)(ULONG_PTR)c->cpu == c->gpu };
+    qsort(spans, n, sizeof(*spans), compare_spans);
+    spans_overlap = FALSE;
+    for (UINT i = 1; i < n && !spans_overlap; i++)
+        spans_overlap = spans[i].gpu < spans[i - 1].end;
+    span_count = n;
+    spans_generation = chunks_generation;
+}
+
+/* Takes the lock, shared, with the spans made for the chunks there are; FALSE if they can't be
+ * used (the chunks are to be walked). */
+static BOOL lock_spans(void)
+{
+    AcquireSRWLockShared(&lock);
+    if (spans_generation != chunks_generation)
+    {
+        ReleaseSRWLockShared(&lock);
+        AcquireSRWLockExclusive(&lock);
+        if (spans_generation != chunks_generation)
+            spans_make();
+        ReleaseSRWLockExclusive(&lock);
+        AcquireSRWLockShared(&lock);
+    }
+    /* chunks_generation moves only under the lock, exclusive: what was made is current. */
+    return spans_generation == chunks_generation && !spans_overlap;
+}
+
+/* Under lock_spans: the span holding address, or NULL. */
+static const struct span *span_at(UINT64 address)
+{
+    UINT lo = 0, hi = span_count;
+    while (lo < hi) /* the first span starting past address */
+    {
+        UINT mid = lo + (hi - lo) / 2;
+        if (spans[mid].gpu <= address)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo && address < spans[lo - 1].end ? &spans[lo - 1] : NULL;
+}
 static UINT64 bytes_in_use;
 static struct allocation *table[BUCKETS];
 
@@ -366,9 +444,14 @@ BOOL gpu_memory_holds_gpu(UINT64 gpu, UINT64 size)
 {
     BOOL found = FALSE;
 
-    AcquireSRWLockShared(&lock);
-    for (struct chunk *c = chunks; c && !found; c = c->next)
-        found = gpu >= c->gpu && gpu + size <= c->gpu + c->size;
+    if (lock_spans())
+    {
+        const struct span *s = span_at(gpu);
+        found = s && gpu + size <= s->end;
+    }
+    else
+        for (struct chunk *c = chunks; c && !found; c = c->next)
+            found = gpu >= c->gpu && gpu + size <= c->gpu + c->size;
     ReleaseSRWLockShared(&lock);
     return found;
 }
@@ -519,7 +602,20 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
         return FALSE;
     /* Already GPU memory, the usual case (every root view bound asks): before committed_run, whose
      * VirtualQuery calls made a frame's bindings take seconds once a world streams in. */
-    AcquireSRWLockShared(&lock);
+    if (lock_spans())
+    {
+        /* As the walks below, by binary search. */
+        const struct span *s = span_at(address);
+        BOOL held = s && end <= s->end;
+        if (!held)
+            while (address < end && (s = span_at(address)))
+                address = s->end;
+        ReleaseSRWLockShared(&lock);
+        if (held || address >= end)
+            return TRUE;
+        c = NULL;
+        goto adopt;
+    }
     for (c = chunks; c && !(address >= c->gpu && end <= c->gpu + c->size); c = c->next)
         ;
     /* A request that starts in GPU memory and runs past it: only the rest is to be made so (a
@@ -541,6 +637,7 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     ReleaseSRWLockShared(&lock);
     if (c || address >= end)
         return TRUE;
+adopt:
     size = end - address;
     /* The span: the granule-aligned neighbourhood, inside the run, 2 MiB-aligned inwards. */
     base = address & ~(ADOPT_GRANULE - 1);
@@ -639,7 +736,17 @@ BOOL gpu_memory_identity_extent(UINT64 address, UINT64 *end)
 {
     BOOL found = FALSE;
 
-    AcquireSRWLockShared(&lock);
+    if (lock_spans())
+    {
+        const struct span *s = span_at(address);
+        if (s && s->identity)
+        {
+            *end = s->end;
+            found = TRUE;
+        }
+        ReleaseSRWLockShared(&lock);
+        return found;
+    }
     for (struct chunk *c = chunks; c; c = c->next)
         if ((UINT64)(ULONG_PTR)c->cpu == c->gpu && address >= c->gpu && address < c->gpu + c->size)
         {
@@ -655,7 +762,19 @@ BOOL gpu_memory_identity_run_end(UINT64 address, UINT64 *end)
 {
     BOOL found = FALSE, moved;
 
-    AcquireSRWLockShared(&lock);
+    if (lock_spans())
+    {
+        const struct span *s;
+        while ((s = span_at(address)) && s->identity)
+        {
+            address = s->end;
+            found = TRUE;
+        }
+        ReleaseSRWLockShared(&lock);
+        if (found)
+            *end = address;
+        return found;
+    }
     do
     {
         moved = FALSE;

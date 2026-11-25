@@ -3522,6 +3522,276 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* A console mesh stage's bindings at every draw (console_compile.c's compile_now after AnyPS5's memo
+ * hits): a V# and four T#s from a table in GPU memory, the first T# a view in a shader-visible heap,
+ * the others T#s the title wrote itself that name no texture (bound to the dummy). Timed per call
+ * with few textures and GPU memory chunks, then with thousands, as a world has; with the binding
+ * cache (ReboxConsoleBindingStats), a change to a descriptor in the table or in the heap must give
+ * new bindings, and an unchanged one the same. */
+static const UINT32 bindings_bench_code[] = {
+    0xbfa00003,                         /* s_inst_prefetch 3 */
+    0xf4080508, 0xfa000000,             /* s_load_dwordx4 s[20:23], s[16:17], 0x0: the V# */
+    0xf40c0608, 0xfa000020,             /* s_load_dwordx8 s[24:31], s[16:17], 0x20: T# 0 */
+    0xf40c0808, 0xfa000040,             /* s_load_dwordx8 s[32:39], s[16:17], 0x40: T# 1 */
+    0xf40c0a08, 0xfa000060,             /* s_load_dwordx8 s[40:47], s[16:17], 0x60: T# 2 */
+    0xf40c0c08, 0xfa000080,             /* s_load_dwordx8 s[48:55], s[16:17], 0x80: T# 3 */
+    0xbf8cc07f,                         /* s_waitcnt lgkmcnt(0) */
+    0xf4200e0a, 0xfa000000,             /* s_buffer_load_dword s56, s[20:23], 0x0 */
+    0xbf8cc07f,
+    0x7e080280, 0x7e0a0280,             /* v_mov_b32 v4, 0; v_mov_b32 v5, 0 */
+    0xf0000f08, 0x00060804,             /* image_load v[8:11], v[4:5], s[24:31] dmask:0xf 2D */
+    0xf0000f08, 0x00080c04,             /* image_load v[12:15], v[4:5], s[32:39] */
+    0xf0000f08, 0x000a1004,             /* image_load v[16:19], v[4:5], s[40:47] */
+    0xf0000f08, 0x000c1404,             /* image_load v[20:23], v[4:5], s[48:55] */
+    0xbf8c3f70,                         /* s_waitcnt vmcnt(0) */
+    0xd7650000, 0x000100c1, 0xd7660000, 0x000200c1, 0xb07c1003, 0xbf900009, 0x7d880083, 0xbefe046a,
+    0x7e020d00, 0x7e040280,
+    0x7e060238,                         /* v_mov_b32 v3, s56 */
+    0xf80008cf, 0x03020201,             /* exp pos0 v1, v2, v2, v3 done */
+    0xf800020f, 0x14100c08,             /* exp param0 v8, v12, v16, v20 */
+    0x7d840080, 0xbefe046a, 0x7e0802ff, 0x00200400,
+    0xf8000941, 0x00000004, 0xbf810000,
+};
+
+/* The heap slots a mesh stage's draw block gives its bindings (after the 24 words of addresses and
+ * lengths), through ReboxConsoleDrawBlock; FALSE without that export. */
+static BOOL bench_slots(const struct rebox_compile_out *out, UINT32 *slots, UINT count)
+{
+    BOOL (WINAPI *block)(UINT64, void *, SIZE_T) = (void *)GetProcAddress(GetModuleHandleA("d3d12_xs.dll"),
+            "ReboxConsoleDrawBlock");
+    UINT32 words[24 + 8];
+    UINT64 va = out->push[24] | (UINT64)out->push[25] << 32;
+    if (!block || count > 8 || !block(va, words, (24 + count) * 4))
+        return FALSE;
+    memcpy(slots, words + 24, count * 4);
+    return TRUE;
+}
+
+static double bench_compiles(HRESULT (WINAPI *compile)(const struct rebox_compile_in *, struct rebox_compile_out *),
+                             const struct rebox_compile_in *in, UINT calls, UINT *failed)
+{
+    struct rebox_compile_out out;
+    LARGE_INTEGER a, b, f;
+    *failed = 0;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    for (UINT i = 0; i < calls; i++)
+        *failed += FAILED(compile(in, &out));
+    QueryPerformanceCounter(&b);
+    return (double)(b.QuadPart - a.QuadPart) * 1e6 / f.QuadPart / calls;
+}
+
+/* The lookups a binding makes, timed: a T# by its texture's address (console_texture_of) and a guest
+ * buffer at a title address (guest_buffer_mappable's GPU memory lookups), in ns a call. */
+static void bench_lookups(const UINT32 *t, double *texture_ns, double *buffer_ns)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    ID3D12Resource *(WINAPI *texture_of)(const UINT32 *) = (void *)GetProcAddress(m, "ReboxConsoleTextureOf");
+    UINT64 (WINAPI *buffer_length)(UINT64, UINT64) = (void *)GetProcAddress(m, "ReboxGuestBufferLength");
+    LARGE_INTEGER a, b, f;
+    UINT64 sink = 0;
+    QueryPerformanceFrequency(&f);
+    *texture_ns = *buffer_ns = 0;
+    if (texture_of)
+    {
+        QueryPerformanceCounter(&a);
+        for (UINT i = 0; i < 20000; i++)
+            sink += (UINT_PTR)texture_of(t);
+        QueryPerformanceCounter(&b);
+        *texture_ns = (double)(b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / 20000;
+    }
+    if (buffer_length)
+    {
+        QueryPerformanceCounter(&a);
+        for (UINT i = 0; i < 20000; i++)
+            sink += buffer_length(0x3000000000ull + (i & 15) * 0x10000, 256);
+        QueryPerformanceCounter(&b);
+        *buffer_ns = (double)(b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / 20000;
+    }
+    if (sink == 1)
+        printf("\n");
+}
+
+static void test_console_bindings(void *dev)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void *(WINAPI *from_container)(const void *, SIZE_T, UINT32, SIZE_T *) = (void *)GetProcAddress(m,
+            "ReboxConsoleGraphicsFromContainer");
+    HRESULT (WINAPI *compile)(const struct rebox_compile_in *, struct rebox_compile_out *) = (void *)GetProcAddress(m,
+            "ReboxConsoleCompile");
+    void (WINAPI *release)(void *) = (void *)GetProcAddress(m, "ReboxConsoleFree");
+    HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) = (void *)GetProcAddress(m,
+            "ReboxShadowHeap");
+    void (WINAPI *cache_stats)(UINT64 *) = (void *)GetProcAddress(m, "ReboxConsoleBindingStats");
+    SIZE_T (WINAPI *inner_cpu)(SIZE_T) = (void *)GetProcAddress(m, "ReboxShadowInnerCpu");
+    gpu_alloc_fn galloc = (gpu_alloc_fn)(void *)GetProcAddress(m, "ReboxGpuAlloc");
+    gpu_free_fn gfree = (gpu_free_fn)(void *)GetProcAddress(m, "ReboxGpuFree");
+    enum { TEXTURES = 2048, CHUNKS = 512, CALLS = 2000 };
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, TEXTURES,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE };
+    static ID3D12Resource *textures[TEXTURES];
+    static void *chunks[CHUNKS];
+    void *heap = NULL;
+    UINT32 *table = NULL, sgprs[32] = { 0 }, slots[4], again[4], t0[8];
+    UINT64 table_gpu = 0, title_va, stats[4] = { 0 }, before[4] = { 0 };
+    const struct rebox_deferred_shader *h = NULL;
+    struct rebox_compile_in in;
+    struct rebox_compile_out out;
+    UINT inc, stride, count, made = 0, chunk_count = 0, failed;
+    SIZE_T cpu, size, blob_size = 0;
+    BYTE *container = NULL, *data;
+    double small, large, texture_ns[2], buffer_ns[2];
+    HRESULT hr;
+
+    if (!title_heap_va() || !from_container || !compile || !release || !shadow_heap || !galloc || !gfree)
+    {
+        printf("skip console bindings: no title heap addresses or exports\n");
+        return;
+    }
+    if (!GetModuleHandleA("rebox_anyps5.dll") && !LoadLibraryA("rebox_anyps5.dll"))
+    {
+        printf("skip console bindings: no rebox_anyps5.dll\n");
+        return;
+    }
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    for (UINT i = 0; SUCCEEDED(hr) && i < 2; i++, made++)
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&textures[i]);
+    if (SUCCEEDED(hr))
+        hr = galloc(4096, 256, (void **)&table, &table_gpu);
+    CHECK(SUCCEEDED(hr), "objects for the console bindings test (%#lx)", hr);
+    if (FAILED(hr))
+        goto done;
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, textures[0], NULL, cpu);
+    if (FAILED(shadow_heap(cpu, &title_va, (void **)&data, &stride, &count)))
+    {
+        printf("skip console bindings: no shadow heap\n");
+        goto done;
+    }
+    memcpy(t0, data, 32);
+
+    /* The table: a V# of 16 bytes at +0x800, T# 0 the heap's view, T#s 1-3 at addresses no texture is at. */
+    memset(table, 0, 4096);
+    table[0] = (UINT32)(table_gpu + 0x800);
+    table[1] = (UINT32)((table_gpu + 0x800) >> 32) & 0xffff;
+    table[2] = 16;
+    table[3] = (77u << 12) | 0xfac;
+    for (UINT k = 0; k < 4; k++)
+    {
+        memcpy(table + 8 + 8 * k, t0, 32);
+        if (k)
+            table[8 + 8 * k] = 0x00123400 + k * 0x100, table[9 + 8 * k] = (t0[1] & ~0xffu) | 0x3f;
+    }
+    if (!(container = mesh_container(bindings_bench_code, sizeof(bindings_bench_code), &size))
+            || !(h = from_container(container, size, 0x80, &blob_size)))
+    {
+        CHECK(0, "a deferred mesh stage for the console bindings test");
+        goto done;
+    }
+    memset(&in, 0, sizeof(in));
+    for (UINT k = 0; k < 7; k++)
+        in.bindless[k][0] = 0, in.bindless[k][1] = k;
+    in.shader = h;
+    in.shader_size = (UINT32)blob_size;
+    in.user_sgpr_count = 32;
+    in.user_sgprs = sgprs;
+    in.heap_cpu[0] = inner_cpu ? inner_cpu(cpu) : cpu;
+    in.increment[0] = inc;
+    sgprs[8] = (UINT32)table_gpu;
+    sgprs[9] = (UINT32)(table_gpu >> 32);
+    hr = compile(&in, &out);
+    if (FAILED(hr))
+    {
+        char message[512];
+        void (WINAPI *last)(char *, SIZE_T) = (void *)GetProcAddress(m, "ReboxConsoleLastResult");
+        if (last)
+            last(message, sizeof(message));
+        CHECK(0, "the console bindings test's mesh stage compiles (%#lx: %s)", hr, last ? message : "?");
+        goto done;
+    }
+    if (bench_slots(&out, slots, 4))
+        CHECK(slots[0] == 0 && slots[1] >= TEXTURES && slots[1] == slots[2] && slots[2] == slots[3],
+              "T# 0 binds its heap slot (%u), the T#s at no texture's address the dummy (%u %u %u)", slots[0],
+              slots[1], slots[2], slots[3]);
+
+    small = bench_compiles(compile, &in, CALLS, &failed);
+    bench_lookups(table + 16, &texture_ns[0], &buffer_ns[0]);
+    /* A world's registries: thousands of textures viewed, hundreds of GPU memory chunks. */
+    for (; made < TEXTURES; made++)
+    {
+        if (FAILED(XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&textures[made])))
+            break;
+        XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, textures[made],
+                NULL, cpu + (SIZE_T)made * inc);
+    }
+    for (UINT64 gpu; chunk_count < CHUNKS && SUCCEEDED(galloc(256, 128 << 10, &chunks[chunk_count], &gpu)); chunk_count++)
+        ;
+    compile(&in, &out); /* the memory regions and page table made again */
+    large = bench_compiles(compile, &in, CALLS, &failed);
+    bench_lookups(table + 16, &texture_ns[1], &buffer_ns[1]);
+    printf("     console bindings bench: %.1f us a draw with few textures and chunks, %.1f us with %u textures and "
+           "%u more GPU memory chunks (%u calls each, %u failed); a T# by address %.0f then %.0f ns, a guest buffer "
+           "at a title address %.0f then %.0f ns\n", small, large, made, chunk_count, CALLS, failed, texture_ns[0],
+           texture_ns[1], buffer_ns[0], buffer_ns[1]);
+    CHECK(!failed, "the console bindings test's draws compile (%u failed)", failed);
+
+    if (!cache_stats)
+        goto done;
+    /* Unchanged: the same slots, from the cache. */
+    cache_stats(before);
+    hr = compile(&in, &out);
+    cache_stats(stats);
+    CHECK(SUCCEEDED(hr) && bench_slots(&out, again, 4) && !memcmp(again, slots, sizeof(slots)) && stats[0] > before[0],
+          "an unchanged draw reuses its bindings (slots %u %u %u %u, %llu hits)", again[0], again[1], again[2], again[3],
+          (unsigned long long)stats[0]);
+    /* T# 1 made the view in slot 5: a new binding. */
+    memcpy(table + 16, data + 5 * stride, 32);
+    hr = compile(&in, &out);
+    CHECK(SUCCEEDED(hr) && bench_slots(&out, again, 4) && again[0] == 0 && again[1] == 5,
+          "a T# changed in the table gives its new slot (%u %u)", again[0], again[1]);
+    /* Slot 0 viewing another texture: T# 0's words are nowhere in the heap now, so its texture is found
+     * by the address in them and viewed in the reserved tail. */
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, textures[1], NULL, cpu);
+    hr = compile(&in, &out);
+    CHECK(SUCCEEDED(hr) && bench_slots(&out, again, 4) && again[0] >= TEXTURES && again[0] != slots[1] && again[1] == 5,
+          "a heap slot written again gives the T# it held a view of its own (%u, the dummy is %u)", again[0], slots[1]);
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, textures[0], NULL, cpu);
+    hr = compile(&in, &out);
+    CHECK(SUCCEEDED(hr) && bench_slots(&out, again, 4) && again[0] == 0,
+          "and written back, binds it again (%u)", again[0]);
+    /* An empty T#: the dummy, and noted for a late fill at every draw, cached or not. */
+    memset(table + 24, 0, 32);
+    cache_stats(before);
+    compile(&in, &out);
+    hr = compile(&in, &out);
+    cache_stats(stats);
+    CHECK(SUCCEEDED(hr) && stats[2] >= before[2] + 2 && bench_slots(&out, again, 4) && again[2] == slots[1],
+          "an empty T# binds the dummy and is noted for a late fill at each draw (%llu notes)",
+          (unsigned long long)(stats[2] - before[2]));
+
+done:
+    if (h)
+        release((void *)h);
+    free(container);
+    for (UINT i = 0; i < chunk_count; i++)
+        gfree(chunks[i]);
+    if (table)
+        gfree(table);
+    for (UINT i = 0; i < made; i++)
+        if (textures[i])
+            ID3D12Resource_Release(textures[i]);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 /* A single-level texture's SRV and UAV have the same T#: a binding finds the slot holding the view
  * it wants (a storage image bound to the SRV's slot, or a sampled one to the UAV's, was refused), and
  * a sampled binding of a UAV copied from a CPU heap still gets an SRV of its texture. */
@@ -6690,6 +6960,7 @@ static void test_xbox(void)
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);
     test_shadow_views(dev);
+    test_console_bindings(dev);
     test_console_dispatch(dev, queue);
     test_present(dev, queue);
     test_ffx(dev, queue);

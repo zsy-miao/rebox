@@ -138,7 +138,16 @@ static void encode_buffer(UINT64 va, UINT64 size, UINT stride, DXGI_FORMAT forma
  * a synthetic one, unique per resource object, above every real VA: the T#
  * only has to tell views apart. */
 static SRWLOCK texture_lock = SRWLOCK_INIT;
-static struct texture_id { ID3D12Resource *res; UINT64 va; struct texture_id *next; } *texture_ids[256];
+static struct texture_id { ID3D12Resource *res; UINT64 va; struct texture_id *next, *va_next; } *texture_ids[4096];
+/* The same by address: console_texture_of, for every T# a draw binds that isn't in a heap (one the
+ * title wrote itself), walked every texture ever viewed, tens of thousands in a world. */
+#define TEXTURE_VA_BUCKETS 16384
+static struct texture_id *texture_vas[TEXTURE_VA_BUCKETS];
+
+static SIZE_T texture_va_bucket(UINT64 va)
+{
+    return (SIZE_T)((va >> 24) * 0x9e3779b97f4a7c15ull >> 50);
+}
 static UINT64 next_texture_va = 1ull << 47;
 
 static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
@@ -148,7 +157,7 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
 
     if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return ID3D12Resource_GetGPUVirtualAddress(res);
-    bucket = &texture_ids[((ULONG_PTR)res >> 4) & 255];
+    bucket = &texture_ids[((ULONG_PTR)res >> 4) & 4095];
     AcquireSRWLockExclusive(&texture_lock);
     for (t = *bucket; t && t->res != res; t = t->next)
         ;
@@ -161,6 +170,8 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
         next_texture_va += 1ull << 24;
         t->next = *bucket;
         *bucket = t;
+        t->va_next = texture_vas[texture_va_bucket(t->va)];
+        texture_vas[texture_va_bucket(t->va)] = t;
     }
     if (t)
         va = t->va;
@@ -175,10 +186,17 @@ void console_texture_forget(ID3D12Resource *res)
     struct texture_id **p, *t;
 
     AcquireSRWLockExclusive(&texture_lock);
-    for (p = &texture_ids[((ULONG_PTR)res >> 4) & 255]; (t = *p); p = &t->next)
+    for (p = &texture_ids[((ULONG_PTR)res >> 4) & 4095]; (t = *p); p = &t->next)
         if (t->res == res)
         {
+            struct texture_id **v;
             *p = t->next;
+            for (v = &texture_vas[texture_va_bucket(t->va)]; *v; v = &(*v)->va_next)
+                if (*v == t)
+                {
+                    *v = t->va_next;
+                    break;
+                }
             free(t);
             break;
         }
@@ -198,10 +216,9 @@ ID3D12Resource *console_texture_of(const UINT32 words[2])
     struct texture_id *t;
 
     AcquireSRWLockShared(&texture_lock);
-    for (UINT i = 0; i < ARRAYSIZE(texture_ids) && !res; i++)
-        for (t = texture_ids[i]; t && !res; t = t->next)
-            if (t->va == va)
-                res = t->res;
+    for (t = texture_vas[texture_va_bucket(va)]; t && !res; t = t->va_next)
+        if (t->va == va)
+            res = t->res;
     ReleaseSRWLockShared(&texture_lock);
     /* A T# the title wrote itself holds the texture's address as the title knows it. */
     return res ? res : proxy_texture_at(va);
