@@ -1,0 +1,43 @@
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 9f3c3bc..c0ed0b7 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -7560,6 +7560,27 @@ static void d3d12_command_list_check_vbo_alignment(struct d3d12_command_list *li
+ static VkPipeline d3d12_command_list_rebox_graphics_pipeline(struct d3d12_command_list *list,
+         uint32_t *dynamic_state_flags);
+ 
++/* rebox (patch 0032): tells d3d12_xs whether a console draw found its pipeline
++ * (ReboxConsoleDrawPipeline). A variant whose pipeline the workers are still building (patch 0016)
++ * has none, and the draw is left out, though both its stages compiled: d3d12_xs counts such draws
++ * apart for REBOX_DEBUG_VIEW. */
++static void vkd3d_rebox_draw_pipeline(bool found)
++{
++    typedef void (*PFN_draw_pipeline)(BOOL);
++    static PFN_draw_pipeline fn;
++    static bool resolved;
++    vkd3d_module_t module;
++
++    if (!resolved)
++    {
++        if ((module = vkd3d_dlopen("d3d12_xs.dll")))
++            fn = (PFN_draw_pipeline)vkd3d_dlsym(module, "ReboxConsoleDrawPipeline");
++        resolved = true;
++    }
++    if (fn)
++        fn(found);
++}
++
+ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_list *list,
+         enum vkd3d_pipeline_type pipeline_type)
+ {
+@@ -7612,7 +7633,10 @@ static bool d3d12_command_list_update_graphics_pipeline(struct d3d12_command_lis
+     list->rebox.rect_pipeline = false;
+     if ((pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+             && d3d12_pipeline_state_rebox_graphics(list->state))
++    {
+         vk_pipeline = d3d12_command_list_rebox_graphics_pipeline(list, &new_active_flags);
++        vkd3d_rebox_draw_pipeline(vk_pipeline != VK_NULL_HANDLE);
++    }
+ 
+     /* rebox (patch 0018): a PSO with only fallback shaders has no pipeline; its fallback would draw
+      * nothing, so the draw is left out. */

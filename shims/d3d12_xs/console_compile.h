@@ -124,6 +124,18 @@ void console_screen_pass(BOOL on);
 /* Whether a ReboxConsoleCompile call on this thread since the last query waited for its compile
  * (cleared by asking): vkd3d-proton (patch 0030) builds its pipeline at once. */
 BOOL WINAPI ReboxConsoleMustDraw(void);
+/* What became of a draw, mesh dispatch or ExecuteIndirect: console_draw_watch_begin before the
+ * inner call, console_draw_watch_end after it (proxy.c, for REBOX_DEBUG_VIEW's per-target counts).
+ * vkd3d-proton (patch 0032) tells whether a console draw found its pipeline. */
+enum
+{
+    DRAW_FATE_RECORDED, DRAW_FATE_STANDIN, DRAW_FATE_COMPILED, DRAW_FATE_PIPELINE_BUILDING,
+    DRAW_FATE_FIRST_COMPILING, DRAW_FATE_FIRST_FAILED, DRAW_FATE_PIXEL_NOT_READY, DRAW_FATE_PLAIN, DRAW_FATES
+};
+void WINAPI ReboxConsoleDrawPipeline(BOOL found);
+void console_draw_watch_begin(void);
+UINT console_draw_watch_end(void);
+const char *console_draw_fate_name(UINT fate);
 /* REBOX_FRAME_TRACE: whether this present is traced, and the draw, ExecuteIndirect or dispatch about
  * to compile its stages (op NULL: none), with its first render target (console_compile.c). */
 BOOL console_trace_active(void);

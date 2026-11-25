@@ -12,6 +12,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d12.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -549,17 +550,21 @@ static BOOL usable_region(const MEMORY_BASIC_INFORMATION *mbi)
     return mbi->AllocationBase && mbi->State == MEM_COMMIT && (mbi->Protect & usable) && !(mbi->Protect & PAGE_GUARD);
 }
 
-static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, UINT64 *start, UINT64 *end)
+static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, BOOL reach_back, UINT64 *start, UINT64 *end)
 {
     MEMORY_BASIC_INFORMATION mbi;
-    UINT64 run_start, run_end;
+    UINT64 run_start, run_end, reach;
 
     if (!VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) || !usable_region(&mbi))
         return FALSE;
     run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
     run_end = run_start + mbi.RegionSize;
-    /* Not back past the allocation's base, as the walk from the base never went. */
-    lo = max(lo, (UINT64)(ULONG_PTR)mbi.AllocationBase);
+    /* Not back past the allocation's base, as the walk from the base never went; with reach_back,
+     * at least ADOPT_MIN back. Physical pages are mapped as views of 64 KiB each, every one its own
+     * allocation: a request near the end of a run of them stopped at its own view, found less than
+     * ADOPT_MIN, and the data there (a mesh draw's root view) stayed out of GPU memory for good. */
+    reach = address > ADOPT_MIN ? (address - ADOPT_MIN) & ~(ADOPT_ALIGN - 1) : 0;
+    lo = max(lo, reach_back ? min((UINT64)(ULONG_PTR)mbi.AllocationBase, reach) : (UINT64)(ULONG_PTR)mbi.AllocationBase);
     while (run_start > lo && VirtualQuery((void *)(ULONG_PTR)(run_start - 1), &mbi, sizeof(mbi))
            && usable_region(&mbi))
         run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
@@ -598,19 +603,73 @@ static void note_adopt_failed(UINT64 address, UINT64 end)
     adopt_failures[slot].at = GetTickCount64();
 }
 
+/* Why requests weren't made GPU memory, since the last gpu_memory_adopt_failures_log: the first
+ * logs were spent long before a world (8 in all), and a mesh draw's root view that was read as
+ * zeros left the depth buffer at its clear value with no word of why. */
+enum { ADOPT_FAIL_RECENT, ADOPT_FAIL_UNCOMMITTED, ADOPT_FAIL_PAST_RUN, ADOPT_FAIL_STRADDLE, ADOPT_FAIL_SPAN,
+       ADOPT_FAIL_MAP, ADOPT_FAILS };
+static const char *const adopt_fail_names[ADOPT_FAILS] = {
+    "failed within the last second", "not committed memory", "running past the committed run",
+    "straddling GPU memory", "a span under 2 MiB between GPU memory or the run's ends", "the layer didn't map it" };
+static volatile LONG adopt_fails[ADOPT_FAILS];
+static volatile LONG64 adopt_fail_example[ADOPT_FAILS], adopt_fail_example_end[ADOPT_FAILS];
+static volatile LONG adopt_trimmed;
+
+static void adopt_fail(UINT reason, UINT64 address, UINT64 end)
+{
+    InterlockedIncrement(&adopt_fails[reason]);
+    InterlockedExchange64(&adopt_fail_example[reason], (LONG64)address);
+    InterlockedExchange64(&adopt_fail_example_end[reason], (LONG64)end);
+}
+
+void gpu_memory_adopt_failures_log(void)
+{
+    char line[1024];
+    int at = 0;
+    LONG trimmed = InterlockedExchange(&adopt_trimmed, 0);
+
+    for (UINT r = 0; r < ADOPT_FAILS && at < (int)sizeof(line) - 160; r++)
+    {
+        LONG n = InterlockedExchange(&adopt_fails[r], 0);
+        if (n)
+            at += snprintf(line + at, sizeof(line) - at, "%s %ld %s (the last %#llx-%#llx)", at ? ";" : "", n,
+                           adopt_fail_names[r], (unsigned long long)adopt_fail_example[r],
+                           (unsigned long long)adopt_fail_example_end[r]);
+    }
+    line[at] = 0;
+    if (at || trimmed)
+        rebox_log("d3d12_xs:   title memory not made GPU memory since the last census:%s; %ld requests of a "
+                  "guessed size cut to what could be", at ? line : " none", trimmed);
+}
+
+static BOOL adopt(UINT64 address, UINT64 size, BOOL trim);
+
 /* Makes [address, address + size) of the title's own memory GPU-visible at the same address: a
  * heap whose memory VK_LAYER_REBOX_gpuva_identity puts at that device address, fills with the
  * title's bytes and maps over the title's pages in one go (asked through the mailbox,
  * layers/gpuva_mailbox.h). TRUE if the range is GPU memory now. */
 BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
 {
+    return adopt(address, size, FALSE);
+}
+
+/* For a request whose size is a guess (a root view's, a guest buffer's 64 KiB): as much of it from
+ * address on as can be, the end cut to the committed run's and to GPU memory above it. TRUE if
+ * some of it, from address on, is GPU memory now. */
+BOOL gpu_memory_adopt_some(UINT64 address, UINT64 size)
+{
+    return adopt(address, size, TRUE);
+}
+
+static BOOL adopt(UINT64 address, UINT64 size, BOOL trim)
+{
     static struct gpuva_mailbox *(WINAPI *get_mailbox)(void);
     static LONG logged;
     ID3D12Device *device = rebox_shared_device();
-    UINT64 end = address + size, run_start, run_end, base, limit, bytes;
+    UINT64 end = address + size, run_start, run_end, base, limit, bytes, asked, asked_end;
     struct gpuva_mailbox *box;
     struct chunk *c;
-    BOOL ok = FALSE;
+    BOOL ok = FALSE, held_head, straddles = FALSE;
     static int enabled = -1;
 
     /* REBOX_ADOPT=0: none, to tell problems of memory replaced in place from others. */
@@ -628,6 +687,8 @@ BOOL gpu_memory_adopt(UINT64 address, UINT64 size)
     }
     if (!device || !size || !get_mailbox || !(box = get_mailbox()) || box->magic != GPUVA_MAILBOX_MAGIC)
         return FALSE;
+    asked = address;
+    asked_end = end;
     /* Already GPU memory, the usual case (every root view bound asks): before committed_run, whose
      * VirtualQuery calls made a frame's bindings take seconds once a world streams in. */
     if (lock_spans())
@@ -672,12 +733,36 @@ adopt:
     limit = (end + ADOPT_GRANULE - 1) & ~(ADOPT_GRANULE - 1);
     if (limit - end < ADOPT_MIN) /* near the granule's end: into the next one too */
         limit += ADOPT_GRANULE;
+    /* With trim, FALSE only if nothing from the address asked for on is GPU memory. */
+    held_head = trim && address > asked;
     if (adopt_failed_recently(address, end))
-        return FALSE;
-    if (!committed_run(address, base, limit, &run_start, &run_end) || end > run_end)
     {
+        adopt_fail(ADOPT_FAIL_RECENT, address, end);
+        return held_head;
+    }
+    if (!committed_run(address, base, limit, FALSE, &run_start, &run_end))
+    {
+        adopt_fail(ADOPT_FAIL_UNCOMMITTED, address, end);
         note_adopt_failed(address, end);
-        return FALSE;
+        return held_head;
+    }
+    if (end > run_end && trim && run_end > address)
+    {
+        end = run_end;
+        InterlockedIncrement(&adopt_trimmed);
+    }
+    if (end > run_end)
+    {
+        adopt_fail(ADOPT_FAIL_PAST_RUN, address, end);
+        note_adopt_failed(address, end);
+        return held_head;
+    }
+    /* Too little around it from its own allocation on (a physical page's view): back past it. */
+    if (min(limit, run_end) - max(base, run_start) < ADOPT_MIN)
+    {
+        UINT64 back_start, back_end;
+        if (committed_run(address, base, limit, TRUE, &back_start, &back_end) && back_start < run_start)
+            run_start = back_start;
     }
     if (base < run_start)
         base = run_start;
@@ -687,6 +772,15 @@ adopt:
     limit &= ~(ADOPT_ALIGN - 1);
 
     AcquireSRWLockExclusive(&lock);
+    /* With trim: up to GPU memory above, rather than straddling it (a root view's guessed 64 KiB
+     * ran into the next chunk, and none of it was made GPU memory). */
+    if (trim)
+        for (c = chunks; c; c = c->next)
+            if (c->gpu > address && c->gpu < end)
+            {
+                end = c->gpu;
+                InterlockedIncrement(&adopt_trimmed);
+            }
     /* Already GPU memory, wholly; otherwise keep clear of the chunks there are. */
     for (c = chunks; c; c = c->next)
     {
@@ -703,19 +797,23 @@ adopt:
             else if (c->gpu >= end)
                 limit = (c->gpu & ~(ADOPT_ALIGN - 1)) - ADOPT_GAP;
             else
+            {
                 limit = base; /* the request straddles a chunk: nothing to do */
+                straddles = TRUE;
+            }
         }
     }
     if (base > address || limit < end || limit - base < ADOPT_MIN)
     {
         ReleaseSRWLockExclusive(&lock);
-        note_adopt_failed(address, end);
+        adopt_fail(straddles ? ADOPT_FAIL_STRADDLE : ADOPT_FAIL_SPAN, address, end);
+        note_adopt_failed(address, asked_end);
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: title memory %#llx+%#llx can't be made GPU-visible in place (committed run "
                       "%#llx-%#llx, span %#llx-%#llx)", (unsigned long long)address, (unsigned long long)size,
                       (unsigned long long)run_start, (unsigned long long)run_end, (unsigned long long)base,
                       (unsigned long long)limit);
-        return FALSE;
+        return held_head;
     }
     bytes = limit - base;
     /* The layer copies the title's bytes in before it maps the memory over them. */
@@ -757,7 +855,9 @@ adopt:
         rebox_log("d3d12_xs: title memory %#llx+%#llx %s GPU-visible in place (for %#llx+%#llx)",
                   (unsigned long long)base, (unsigned long long)bytes, ok ? "made" : "could not be made",
                   (unsigned long long)address, (unsigned long long)size);
-    return ok;
+    if (!ok)
+        adopt_fail(ADOPT_FAIL_MAP, address, end);
+    return ok || held_head;
 }
 
 BOOL gpu_memory_identity_extent(UINT64 address, UINT64 *end)

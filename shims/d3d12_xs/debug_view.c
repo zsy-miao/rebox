@@ -14,7 +14,11 @@
  *   REBOX_DEBUG_VIEW=largest      the largest render target drawn this frame, display-sized aside
  *   REBOX_DEBUG_VIEW=<W>x<H>[f<format>]  the most-drawn target of that size (and DXGI format)
  *   REBOX_DEBUG_VIEW=0x<address>  the texture placed at that title address
- * The pick is logged when it changes, and the frame's candidates every 60 presents.
+ * The pick is logged when it changes, and the frame's candidates every 60 presents. When the target
+ * shown had 64 draws or more, what became of them is logged too (at most every 10 s): how many were
+ * recorded with a pipeline, and why the rest were left out (a stage still compiling or failed, or
+ * the pipeline still being built: vkd3d-proton patch 0032), so a target still at its clear value
+ * tells draws that never reached the GPU from draws that drew nothing.
  *
  * The target is copied when the pass that drew it ends (the next OMSetRenderTargets of that list,
  * or its Close), so a later pass reusing its memory doesn't hide it, and the copy is shown.
@@ -37,6 +41,7 @@
 
 #include "../common/rebox_log.h"
 #include "../../generated/blit_shaders.h"
+#include "console_compile.h"
 #include "debug_view.h"
 #include "gpu_memory.h"
 #include "present.h"
@@ -63,6 +68,7 @@ struct target
     UINT64 address;
     BOOL depth, display;
     volatile LONG draws, mesh, binds;  /* this frame */
+    volatile LONG fates[DRAW_FATES];   /* this frame's draws by what became of them (console_compile.h) */
     LONG seen;            /* the last present it was bound in */
     int partners[8];      /* as render target 0: 1 + the other targets of its last bind */
 };
@@ -330,20 +336,46 @@ void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
         l->snapshot_res = picked;
 }
 
-void debug_view_draw(struct debug_view_list *l, BOOL mesh)
+void debug_view_draw(struct debug_view_list *l, BOOL mesh, UINT fate)
 {
+    fate = min(fate, DRAW_FATES - 1u);
     if (l->rt && targets[l->rt - 1].res == l->rt_res)
     {
         InterlockedIncrement(&targets[l->rt - 1].draws);
+        InterlockedIncrement(&targets[l->rt - 1].fates[fate]);
         if (mesh)
             InterlockedIncrement(&targets[l->rt - 1].mesh);
     }
     if (l->depth && targets[l->depth - 1].res == l->depth_res)
     {
         InterlockedIncrement(&targets[l->depth - 1].draws);
+        InterlockedIncrement(&targets[l->depth - 1].fates[fate]);
         if (mesh)
             InterlockedIncrement(&targets[l->depth - 1].mesh);
     }
+}
+
+/* Under targets_lock: what became of this frame's draws into the target shown, when there were
+ * enough to matter (a scene, not a loading screen's few) and at most every 10 s: whether any of
+ * them reached the GPU, or why not. */
+static void log_fates(LONG now, const struct target *t)
+{
+    static ULONGLONG last;
+    ULONGLONG tick = GetTickCount64();
+    char line[1024];
+    int at = 0;
+
+    if (t->draws < 64 || (last && tick - last < 10000))
+        return;
+    last = tick;
+    for (UINT f = 0; f < DRAW_FATES && at < (int)sizeof(line) - 96; f++)
+        if (t->fates[f])
+            at += snprintf(line + at, sizeof(line) - at, "%s %ld %s", at ? "," : "", t->fates[f],
+                           console_draw_fate_name(f));
+    line[at] = 0;
+    rebox_log("d3d12_xs: REBOX_DEBUG_VIEW: present %ld: the %ld draws (%ld mesh) into the %s %llux%u shown:%s", now,
+              t->draws, t->mesh, t->depth ? "depth buffer" : "target", (unsigned long long)t->desc.Width,
+              t->desc.Height, line);
 }
 
 void debug_view_close(ID3D12GraphicsCommandList *list, struct debug_view_list *l)
@@ -497,6 +529,7 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
                       (unsigned long long)t->desc.Width, t->desc.Height, t->desc.Format, (unsigned long long)t->address,
                       t->draws, t->mesh, t->binds);
         last = t->res;
+        log_fates(now, t);
         pick->desc = t->desc;
         pick->depth = t->depth;
         pick->res = t->res;
@@ -524,6 +557,7 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
         if (t->draws || t->binds)
             t->seen = now;
         t->draws = t->mesh = t->binds = 0;
+        memset((void *)t->fates, 0, sizeof(t->fates));
         if (now - t->seen > EVICT_PRESENTS && t->res != pick->res && t->res != snap.of)
         {
             ID3D12Resource_Release(t->res);

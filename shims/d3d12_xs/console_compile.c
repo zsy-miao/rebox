@@ -1532,6 +1532,10 @@ static UINT64 late_source(const struct rebox_deferred_shader *h, const struct re
  * vkd3d-proton's own. *bytes is cut to the GPU memory that runs on from the address: the shader
  * reads the buffer at that address directly, bounded only by its length, so a V# whose records
  * run past that memory (into title memory between two GPU memory ranges) faulted the GPU. */
+/* Guest buffers in title memory read as empty since the last census (its first logs are long spent
+ * by a world). */
+static volatile LONG guest_buffers_empty;
+
 static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
 {
     static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
@@ -1641,9 +1645,12 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
     }
     if (to_cpu)
         address = to_cpu(address);
-    if ((gpu_memory_identity_extent(address, &end) && end >= address + check) || gpu_memory_adopt(address, check))
+    /* check is a guess too: as much of it as can be (a mesh draw's root view in title memory whose
+     * 64 KiB ran past the committed run, or into GPU memory above, was read as empty). Then cut to
+     * the GPU memory there is. */
+    if ((gpu_memory_identity_extent(address, &end) && end >= address + check) || gpu_memory_adopt_some(address, check))
     {
-        if (!gpu_memory_identity_run_end(address, &end) || end < address + check)
+        if (!gpu_memory_identity_run_end(address, &end) || end <= address)
             end = address + check;
         if (*bytes > end - address)
         {
@@ -1659,6 +1666,7 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
     }
     {
         static LONG logged;
+        InterlockedIncrement(&guest_buffers_empty);
         if (InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx isn't GPU memory and can't be made so: read as empty",
                       (unsigned long long)*base, (unsigned long long)check);
@@ -2090,6 +2098,13 @@ static void outcomes_log(void)
     }
     if (total)
         rebox_log("d3d12_xs:   console compiles since the last census: %s", line);
+    {
+        LONG empty = InterlockedExchange(&guest_buffers_empty, 0);
+        if (empty)
+            rebox_log("d3d12_xs:   guest buffers in title memory read as empty since the last census "
+                      "(not GPU memory, and couldn't be made so): %ld", empty);
+    }
+    gpu_memory_adopt_failures_log();
 }
 
 void console_display_draws_log(void)
@@ -2687,6 +2702,62 @@ static int standin_mode(void)
 
 static __thread struct { UINT32 stage; BOOL ok; } first_stage; /* this thread's last vertex or mesh compile */
 
+/* What became of one draw (console_draw_watch_begin/_end, around the inner call; debug_view.c counts
+ * them per target). vkd3d-proton compiles a console draw's first stage, then its pixel stage, then
+ * looks up the pipeline made of the two, and tells which it found (patch 0032,
+ * ReboxConsoleDrawPipeline): a variant whose pipeline its workers are still building is listed with
+ * none, and the draw is left out without a word (patch 0016), however "ok" the census calls its
+ * stages. */
+static __thread struct
+{
+    BOOL on, standin;
+    int first, pixel;  /* the stages' outcomes (OUTCOME_*), -1: not compiled */
+    int pipeline;      /* 0: not told, 1: found, 2: none (being built, or failed) */
+} draw_watch;
+
+void WINAPI ReboxConsoleDrawPipeline(BOOL found)
+{
+    draw_watch.pipeline = found ? 1 : 2;
+}
+
+void console_draw_watch_begin(void)
+{
+    draw_watch.on = TRUE;
+    draw_watch.standin = FALSE;
+    draw_watch.first = draw_watch.pixel = -1;
+    draw_watch.pipeline = 0;
+}
+
+UINT console_draw_watch_end(void)
+{
+    UINT fate;
+    draw_watch.on = FALSE;
+    if (draw_watch.first < 0)
+        fate = DRAW_FATE_PLAIN;
+    else if (draw_watch.first == OUTCOME_FAILED || draw_watch.first == OUTCOME_PROGRAM_FAILED)
+        fate = DRAW_FATE_FIRST_FAILED;
+    else if (draw_watch.first != OUTCOME_OK)
+        fate = DRAW_FATE_FIRST_COMPILING;
+    else if (draw_watch.pixel >= 0 && draw_watch.pixel != OUTCOME_OK && !draw_watch.standin)
+        fate = DRAW_FATE_PIXEL_NOT_READY;
+    else if (draw_watch.pipeline == 2)
+        fate = DRAW_FATE_PIPELINE_BUILDING;
+    else if (draw_watch.pipeline == 0)
+        fate = DRAW_FATE_COMPILED;
+    else
+        fate = draw_watch.standin ? DRAW_FATE_STANDIN : DRAW_FATE_RECORDED;
+    return fate;
+}
+
+const char *console_draw_fate_name(UINT fate)
+{
+    static const char *const names[DRAW_FATES] = {
+        "recorded", "recorded with a stand-in pixel stage", "compiled (pipeline unknown: vkd3d-proton without patch 0032)",
+        "left out while vkd3d-proton builds the pipeline", "left out, first stage compiling",
+        "left out, first stage failed", "left out, pixel stage not ready", "not a console draw" };
+    return fate < DRAW_FATES ? names[fate] : "?";
+}
+
 
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
@@ -2712,7 +2783,15 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
             out->key[0] = 0x5354414e44494e31ull; /* "STANDIN1": a variant of its own */
             out->key[1] = 0x50495845ull;
             InterlockedIncrement(&standins);
+            draw_watch.standin = TRUE;
             hr = S_OK;
+        }
+        if (draw_watch.on)
+        {
+            if (h->stage != 0x10)
+                draw_watch.first = (int)min(call_outcome, OUTCOMES - 1);
+            else
+                draw_watch.pixel = (int)min(call_outcome, OUTCOMES - 1);
         }
     }
     InterlockedIncrement(&outcomes[outcome_kind(h, in ? in->shader_size : 0)][min(call_outcome, OUTCOMES - 1)]);

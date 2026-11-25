@@ -35,6 +35,12 @@ BOOL gpu_memory_heap_at(UINT64 address, ID3D12Heap **heap, UINT64 *offset);
  * to 64 KiB pages), keeping its contents; TRUE if it is GPU memory now (or already was). Needs
  * VK_LAYER_REBOX_gpuva_identity's mailbox (REBOX_GPUVA_MAILBOX=1). */
 BOOL gpu_memory_adopt(UINT64 address, UINT64 size);
+/* The same for a size that is a guess (a root view's): as much of it from address on as can be,
+ * cut at the committed run's end and at GPU memory above; TRUE if some of it, from address on, is
+ * GPU memory now. */
+BOOL gpu_memory_adopt_some(UINT64 address, UINT64 size);
+/* Logs, and clears, the counts of requests not made GPU memory by reason (with the census). */
+void gpu_memory_adopt_failures_log(void);
 /* If address is identity-mapped GPU memory (CPU address == GPU VA), the end of its chunk. */
 BOOL gpu_memory_identity_extent(UINT64 address, UINT64 *end);
 /* The end of the identity window's highest allocation, or 0 (no mailbox, or none yet). */

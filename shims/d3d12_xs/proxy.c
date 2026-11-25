@@ -1634,6 +1634,20 @@ static void trace_end(BOOL traced)
         console_trace_op(NULL, 0, 0, 0, 0, 0, 0);
 }
 
+/* REBOX_DEBUG_VIEW: around a draw's inner call, what became of it (console_draw_watch_end), counted
+ * against the targets bound. */
+static void debug_view_watch_begin(void)
+{
+    if (debug_view_on())
+        console_draw_watch_begin();
+}
+
+static void debug_view_watch_end(struct proxy *p, BOOL mesh)
+{
+    if (debug_view_on())
+        debug_view_draw(&p->debug_view, mesh, console_draw_watch_end());
+}
+
 static void STDMETHODCALLTYPE device_CreateRenderTargetView(struct proxy *p, ID3D12Resource *resource,
         const D3D12_RENDER_TARGET_VIEW_DESC *desc, SIZE_T cpu)
 {
@@ -1893,7 +1907,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
 /* Returns the address to give vkd3d-proton: one in a GPU-only view of title memory is the CPU
  * address behind it (xmem gives the view memory of its own, so the title's data is at the CPU
  * address, which is what gets made GPU memory). */
-static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+static D3D12_GPU_VIRTUAL_ADDRESS adopt_bound(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size,
+                                             BOOL guessed)
 {
     static LONG logged;
     UINT64 end;
@@ -1904,10 +1919,24 @@ static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_AD
     address = gpu_view_to_cpu(address);
     if (gpu_memory_identity_extent(address, &end) && end >= address + size)
         return address;
-    if (!gpu_memory_adopt(address, size) && InterlockedIncrement(&logged) <= 8)
+    if (!(guessed ? gpu_memory_adopt_some(address, size) : gpu_memory_adopt(address, size))
+            && InterlockedIncrement(&logged) <= 8)
         rebox_log("d3d12_xs: %s at %#llx+%#x is not GPU memory and could not be made so: the GPU reads nothing there",
                   what, (unsigned long long)address, size);
     return address;
+}
+
+static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+{
+    return adopt_bound(what, address, size, FALSE);
+}
+
+/* A root view's size is a guess (ROOT_VIEW_SIZE, below): as much of it from the address on as can
+ * be is made GPU memory, cut at the committed run's end or GPU memory above (a mesh draw's root
+ * view whose guessed 64 KiB couldn't all be had stayed out entirely, and its shader read zeros). */
+static D3D12_GPU_VIRTUAL_ADDRESS root_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+{
+    return adopt_bound(what, address, size, TRUE);
 }
 
 /* Slots 41-46: Set{Compute,Graphics}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC
@@ -2008,42 +2037,42 @@ static void ia_buffer_check(const char *what, int slot, D3D12_GPU_VIRTUAL_ADDRES
 
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
     address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
@@ -2127,6 +2156,7 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
         void *count_buffer, UINT64 count_offset)
 {
     BOOL traced;
+    UINT kind;
 
     if (!signature || !is_command_signature(signature))
     {
@@ -2143,16 +2173,15 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
             rebox_log("d3d12_xs: ExecuteIndirect of rays without a real ray tracing pipeline: skipped");
         return;
     }
-    if (debug_view_on())
-    {
-        UINT kind = signature_kind(signature);
-        if (kind != SIGNATURE_OTHER)
-            debug_view_draw(&p->debug_view, kind == SIGNATURE_MESH);
-    }
+    kind = debug_view_on() ? signature_kind(signature) : SIGNATURE_OTHER;
+    if (kind != SIGNATURE_OTHER)
+        debug_view_watch_begin();
     traced = trace_begin(p, TRUE, count_buffer ? "indirect-counted" : "indirect", count, 0, 0);
     ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
             p->inner, signature, count, args, offset, count_buffer, count_offset);
     trace_end(traced);
+    if (kind != SIGNATURE_OTHER)
+        debug_view_watch_end(p, kind == SIGNATURE_MESH);
 }
 
 /* List slot 61. The two measurements disagree: Leonida (the retail FSR DLL) calls it with
@@ -2175,16 +2204,15 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         }
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
-        if (debug_view_on())
-        {
-            UINT kind = signature_kind(a);
-            if (kind != SIGNATURE_OTHER)
-                debug_view_draw(&p->debug_view, kind == SIGNATURE_MESH);
-        }
+        UINT kind = debug_view_on() ? signature_kind(a) : SIGNATURE_OTHER;
+        if (kind != SIGNATURE_OTHER)
+            debug_view_watch_begin();
         traced = trace_begin(p, TRUE, e ? "indirect-counted" : "indirect", (UINT)b, 0, 0);
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
                 p->inner, a, (UINT)b, c, d, e, f);
         trace_end(traced);
+        if (kind != SIGNATURE_OTHER)
+            debug_view_watch_end(p, kind == SIGNATURE_MESH);
         return;
     }
     ((void (STDMETHODCALLTYPE *)(void *, UINT_PTR, void *, UINT_PTR))PC_SLOT(p->inner, 57))(p->inner, (UINT_PTR)a,
@@ -6183,10 +6211,12 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
-    if (debug_view_on())
-        debug_view_draw(&p->debug_view, FALSE);
+    debug_view_watch_begin();
     if (p->rect_list && rect_lists_on_cpu() && draw_rects(p, vertices, instances, first_vertex, first_instance))
+    {
+        debug_view_watch_end(p, FALSE);
         return;
+    }
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, vertices, p->rect_list, FALSE);
     traced = trace_begin(p, TRUE, p->rect_list ? "draw-rect" : "draw", vertices, instances, 0);
@@ -6197,6 +6227,7 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
                                             first_instance);
     console_screen_pass(FALSE);
     trace_end(traced);
+    debug_view_watch_end(p, FALSE);
     console_display_draw_end();
     log_watched_vertex_buffers(p, first_vertex, vertices);
 }
@@ -6208,14 +6239,14 @@ static void STDMETHODCALLTYPE list_DrawIndexedInstanced(struct proxy *p, UINT in
 
     if (p->display_bound)
         InterlockedIncrement(&display_draws[p->display_bound - 1]);
-    if (debug_view_on())
-        debug_view_draw(&p->debug_view, FALSE);
+    debug_view_watch_begin();
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, indices, p->rect_list, TRUE);
     traced = trace_begin(p, TRUE, "indexed", indices, instances, 0);
     ID3D12GraphicsCommandList_DrawIndexedInstanced(INNER(p, ID3D12GraphicsCommandList), indices, instances, first_index,
                                                    base_vertex, first_instance);
     trace_end(traced);
+    debug_view_watch_end(p, FALSE);
     if (console_stage_watched(console_last_draw_vs()) && p->index_buffer.BufferLocation)
     {
         /* The vertices from the draw's first index on (a quad batch's indices run in order). */
@@ -6683,9 +6714,9 @@ static void STDMETHODCALLTYPE list_Dispatch(struct proxy *p, UINT x, UINT y, UIN
 static void STDMETHODCALLTYPE list_DispatchMesh(struct proxy *p, UINT x, UINT y, UINT z)
 {
     BOOL traced = trace_begin(p, TRUE, "mesh", x, y, z);
-    if (debug_view_on())
-        debug_view_draw(&p->debug_view, TRUE);
+    debug_view_watch_begin();
     ((void (STDMETHODCALLTYPE *)(void *, UINT, UINT, UINT))PC_SLOT(p->inner, 79))(p->inner, x, y, z);
+    debug_view_watch_end(p, TRUE);
     trace_end(traced);
 }
 

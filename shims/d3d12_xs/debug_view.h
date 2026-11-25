@@ -20,7 +20,8 @@ BOOL debug_view_on(void);
  * the pass that drew the chosen target ends). display: a display-sized target is among rts. */
 void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l, ID3D12Resource *const *rts,
                      UINT count, ID3D12Resource *depth, BOOL display);
-void debug_view_draw(struct debug_view_list *l, BOOL mesh);
+/* After a draw, mesh dispatch or ExecuteIndirect: fate is what became of it (DRAW_FATE_*). */
+void debug_view_draw(struct debug_view_list *l, BOOL mesh, UINT fate);
 void debug_view_close(ID3D12GraphicsCommandList *list, struct debug_view_list *l);
 
 /* From PresentX (present.c): the target to show this present, referenced; FALSE for none. *snapshot:
