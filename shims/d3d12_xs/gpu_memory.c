@@ -456,6 +456,22 @@ BOOL gpu_memory_holds_gpu(UINT64 gpu, UINT64 size)
     return found;
 }
 
+/* If gpu is inside one of the chunks (by GPU VA), the end of that chunk. */
+BOOL gpu_memory_gpu_extent(UINT64 gpu, UINT64 *end)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+    for (struct chunk *c = chunks; c && !found; c = c->next)
+        if (gpu >= c->gpu && gpu < c->gpu + c->size)
+        {
+            *end = c->gpu + c->size;
+            found = TRUE;
+        }
+    ReleaseSRWLockShared(&lock);
+    return found;
+}
+
 /* Bytes of title memory made GPU memory in place: the title's own pages stay behind them. */
 UINT64 gpu_memory_adopted_bytes(void)
 {

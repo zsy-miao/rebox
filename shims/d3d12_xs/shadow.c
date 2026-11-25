@@ -699,8 +699,12 @@ static enum shadow_view view_kind(ID3D12Resource *res, int is_buffer, DXGI_FORMA
     return uav ? SHADOW_VIEW_UAV_TYPED : SHADOW_VIEW_SRV_TYPED;
 }
 
-/* GPU address ranges of buffers the title made views of, for AnyPS5's BDA page table: memory a
- * shader may reach by address. Kept after the views go: a buffer's range only matters while some
+/* GPU address ranges of buffers the title made views of or asked the GPU address of (proxy.c's
+ * GetGPUVirtualAddress: a buffer used only through root views or as a vertex buffer has no view),
+ * for AnyPS5's BDA page table (memory a shader may reach by address) and for the bounds of guest
+ * buffers in the GPU memory window (shadow_buffer_range_at). Kept sorted by address and merged
+ * where they overlap or touch, so a lookup is a binary search: GetGPUVirtualAddress notes its
+ * buffer at every call. Kept after the views go: a buffer's range only matters while some
  * descriptor or pointer still names it. */
 static SRWLOCK ranges_lock = SRWLOCK_INIT;
 static struct { UINT64 begin, end; } *buffer_ranges;
@@ -713,38 +717,106 @@ LONG shadow_buffer_ranges_generation(void)
     return ranges_generation;
 }
 
-static void note_buffer_range(UINT64 va, UINT64 size)
+/* The first range whose end is at or past address (the ranges are disjoint, so their ends are
+ * sorted too). */
+static UINT range_ending_at_or_after(UINT64 address)
 {
-    if (!va || !size)
-        return;
-    AcquireSRWLockExclusive(&ranges_lock);
-    for (UINT i = 0; i < buffer_range_count; i++)
-        if (buffer_ranges[i].begin == va)
-        {
-            if (buffer_ranges[i].end < va + size)
-            {
-                buffer_ranges[i].end = va + size;
-                InterlockedIncrement(&ranges_generation);
-            }
-            ReleaseSRWLockExclusive(&ranges_lock);
-            return;
-        }
-    if (buffer_range_count == buffer_range_capacity)
+    UINT lo = 0, hi = buffer_range_count;
+    while (lo < hi)
     {
-        UINT capacity = buffer_range_capacity ? buffer_range_capacity * 2 : 256;
-        void *grown = realloc(buffer_ranges, capacity * sizeof(*buffer_ranges));
-        if (!grown)
-        {
-            ReleaseSRWLockExclusive(&ranges_lock);
-            return;
-        }
-        buffer_ranges = grown;
-        buffer_range_capacity = capacity;
+        UINT mid = lo + (hi - lo) / 2;
+        if (buffer_ranges[mid].end < address)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
-    buffer_ranges[buffer_range_count].begin = va;
-    buffer_ranges[buffer_range_count++].end = va + size;
+    return lo;
+}
+
+static BOOL range_known(UINT64 va, UINT64 end)
+{
+    UINT i = range_ending_at_or_after(end);
+    return i < buffer_range_count && buffer_ranges[i].begin <= va;
+}
+
+void shadow_note_buffer_range(UINT64 va, UINT64 size)
+{
+    UINT64 end = va + size;
+    UINT first, last;
+
+    if (!va || !size || end < va)
+        return;
+    AcquireSRWLockShared(&ranges_lock);
+    if (range_known(va, end))
+    {
+        ReleaseSRWLockShared(&ranges_lock);
+        return;
+    }
+    ReleaseSRWLockShared(&ranges_lock);
+    AcquireSRWLockExclusive(&ranges_lock);
+    if (range_known(va, end))
+    {
+        ReleaseSRWLockExclusive(&ranges_lock);
+        return;
+    }
+    /* Ranges first to last - 1 overlap or touch [va, end): they become one. */
+    first = range_ending_at_or_after(va);
+    for (last = first; last < buffer_range_count && buffer_ranges[last].begin <= end; last++)
+        ;
+    if (first < last)
+    {
+        if (buffer_ranges[first].begin < va)
+            va = buffer_ranges[first].begin;
+        if (buffer_ranges[last - 1].end > end)
+            end = buffer_ranges[last - 1].end;
+        memmove(&buffer_ranges[first + 1], &buffer_ranges[last], (buffer_range_count - last) * sizeof(*buffer_ranges));
+        buffer_range_count -= last - first - 1;
+    }
+    else
+    {
+        if (buffer_range_count == buffer_range_capacity)
+        {
+            UINT capacity = buffer_range_capacity ? buffer_range_capacity * 2 : 256;
+            void *grown = realloc(buffer_ranges, capacity * sizeof(*buffer_ranges));
+            if (!grown)
+            {
+                ReleaseSRWLockExclusive(&ranges_lock);
+                return;
+            }
+            buffer_ranges = grown;
+            buffer_range_capacity = capacity;
+        }
+        memmove(&buffer_ranges[first + 1], &buffer_ranges[first], (buffer_range_count - first) * sizeof(*buffer_ranges));
+        buffer_range_count++;
+    }
+    buffer_ranges[first].begin = va;
+    buffer_ranges[first].end = end;
     InterlockedIncrement(&ranges_generation);
     ReleaseSRWLockExclusive(&ranges_lock);
+}
+
+BOOL shadow_buffer_range_at(UINT64 address, UINT64 *begin, UINT64 *end)
+{
+    BOOL found = FALSE;
+    UINT i;
+
+    AcquireSRWLockShared(&ranges_lock);
+    i = range_ending_at_or_after(address + 1);
+    if (i < buffer_range_count && buffer_ranges[i].begin <= address)
+    {
+        if (begin)
+            *begin = buffer_ranges[i].begin;
+        if (end)
+            *end = buffer_ranges[i].end;
+        found = TRUE;
+    }
+    ReleaseSRWLockShared(&ranges_lock);
+    return found;
+}
+
+static void note_buffer_range(UINT64 va, UINT64 size)
+{
+    shadow_note_buffer_range(va, size);
 }
 
 static void note_buffer_view(ID3D12Resource *res)

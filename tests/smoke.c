@@ -2331,10 +2331,11 @@ static void test_guest_buffer_entry(void)
     CHECK(e[2] == 0, "a V# whose base is in the first page is empty (%u dwords)", e[2]);
     entry_of(empty, e);
     CHECK(e[2] == 0 && e[3] == 0, "an all-zero V# is empty (%u dwords)", e[2]);
-    /* 0x200000001000: a range guest_buffer_mappable takes as it is. */
+    /* 0x200000001000: in the GPU memory window, but in no buffer the title knows (none made a view
+     * of it or asked its address) and no Rebox GPU memory: read as empty, its address kept. */
     entry_of(raw, e);
-    CHECK(e[0] == 0x1000 && e[1] == 0x2000 && e[2] == 64, "a raw V# of 256 bytes at %#x%08x is 64 dwords (%u)",
-          e[1], e[0], e[2]);
+    CHECK(e[0] == 0x1000 && e[1] == 0x2000 && e[2] == 0,
+          "a raw V# of 256 bytes at %#x%08x, in no known buffer, is empty (%u dwords)", e[1], e[0], e[2]);
 }
 
 /* A console mesh shader in its container, as the target title's FSSMs have it (console_fssm.c: the

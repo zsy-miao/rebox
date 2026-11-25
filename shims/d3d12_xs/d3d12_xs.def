@@ -28,6 +28,7 @@ EXPORTS
     ReboxConsoleRectStages
     ReboxFallbackPso
     ReboxConsoleLastResult
+    ReboxConsoleMustDraw
     ReboxConsoleFaults
     ReboxGuestBufferLength
     ReboxConsoleFromContainer

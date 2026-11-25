@@ -1452,12 +1452,28 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
      * broke the shaders that use them. */
     check = min(*bytes, 0x10000ull);
     /* Below 4 GiB is the driver's low window, not title memory: only Rebox's own GPU memory
-     * chunks there are buffers a title can know of. Anything else is a V# whose words aren't an
-     * address (a float, 1.0 = 0x3f800000, faulted the GPU there). */
+     * chunks and buffers the title made views of or asked the address of (proxy.c) are buffers
+     * there. Anything else is a V# whose words aren't an address (a float, 1.0 = 0x3f800000,
+     * faulted the GPU there). */
     if (address && check && address < 0x100000000ull)
     {
-        if (gpu_memory_holds_gpu(address, check))
+        /* Read no further than the chunk's or the buffer's end: a V# with all-ones records kept a
+         * 4 GiB length there, enough to reach unmapped low addresses (a TCP read faulted the GPU at
+         * 0x90061000). */
+        if ((gpu_memory_holds_gpu(address, check) && gpu_memory_gpu_extent(address, &end))
+                || (shadow_buffer_range_at(address, NULL, &end) && end >= address + check))
+        {
+            if (*bytes > end - address)
+            {
+                static LONG logged;
+                if (*bytes - (end - address) >= 0x1000 && InterlockedIncrement(&logged) <= 8)
+                    rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx (low) runs past its memory at %#llx: cut to "
+                              "%#llx bytes", (unsigned long long)address, (unsigned long long)*bytes,
+                              (unsigned long long)end, (unsigned long long)(end - address));
+                *bytes = end - address;
+            }
             return TRUE;
+        }
         {
             static LONG logged;
             if (InterlockedIncrement(&logged) <= 8)
@@ -1480,6 +1496,40 @@ static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes)
                 rebox_log("d3d12_xs: a guest buffer at %#llx is past every allocation in the GPU memory window "
                           "(%#llx): read as empty", (unsigned long long)address, (unsigned long long)end);
             return FALSE;
+        }
+        /* A buffer the title knows there (it made a view of it or asked its GPU address: root
+         * views, vertex buffers) or a GPU memory chunk: read no further than its end. A root view
+         * is a V# the code builds around the root address with an all-ones record count, and the
+         * cut to 256 MiB still let a wild index read past its buffer into unmapped addresses. */
+        if (shadow_buffer_range_at(address, NULL, &end) || gpu_memory_gpu_extent(address, &end))
+        {
+            if (*bytes > end - address)
+            {
+                static LONG logged;
+                if (*bytes - (end - address) >= 0x1000 && InterlockedIncrement(&logged) <= 8)
+                    rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx in the GPU memory window runs past its "
+                              "buffer at %#llx: cut to %#llx bytes", (unsigned long long)address,
+                              (unsigned long long)*bytes, (unsigned long long)end, (unsigned long long)(end - address));
+                *bytes = end - address;
+            }
+            return TRUE;
+        }
+        /* In no buffer the title knows: as AnyPS5's page table does for addresses, read as empty
+         * (REBOX_WINDOW_UNKNOWN_BUFFERS=keep: cut to 256 MiB, as before). */
+        {
+            static LONG logged, keep = -1;
+            if (keep < 0)
+            {
+                char v[8];
+                DWORD n = GetEnvironmentVariableA("REBOX_WINDOW_UNKNOWN_BUFFERS", v, sizeof(v));
+                keep = n && n < sizeof(v) && !strcmp(v, "keep");
+            }
+            if (InterlockedIncrement(&logged) <= 16)
+                rebox_log("d3d12_xs: a guest buffer at %#llx+%#llx in the GPU memory window is in no buffer the "
+                          "title knows: %s", (unsigned long long)address, (unsigned long long)*bytes,
+                          keep ? "cut to 256 MiB (REBOX_WINDOW_UNKNOWN_BUFFERS=keep)" : "read as empty");
+            if (!keep)
+                return FALSE;
         }
         if (*bytes > (256ull << 20))
         {
@@ -1656,15 +1706,18 @@ static BOOL async_compiles(void)
 
 enum program_state { PROGRAM_COLD, PROGRAM_PENDING, PROGRAM_WARM, PROGRAM_FAILED };
 #define PROGRAMS 16384
-static struct { UINT64 key; LONG state; UINT calls, retries; } programs[PROGRAMS];
+static struct { UINT64 key; LONG state; UINT calls, retries, uses; } programs[PROGRAMS];
 static SRWLOCK programs_lock = SRWLOCK_INIT;
 
-/* The state of a program (by its blob's hash), claiming it as pending if it was cold. */
-static enum program_state program_claim(UINT64 key, BOOL claim)
+/* The state of a program (by its blob's hash), claiming it as pending if it was cold; *uses counts
+ * the calls for it, this one included (0 if the table had no room; uses NULL: only look). */
+static enum program_state program_claim(UINT64 key, BOOL claim, UINT *uses)
 {
     UINT slot = (UINT)(key % PROGRAMS);
     enum program_state state = PROGRAM_COLD;
 
+    if (uses)
+        *uses = 0;
     AcquireSRWLockExclusive(&programs_lock);
     for (UINT i = 0; i < 64; i++)
     {
@@ -1672,6 +1725,10 @@ static enum program_state program_claim(UINT64 key, BOOL claim)
         if (programs[at].state != PROGRAM_COLD && programs[at].key == key)
         {
             state = programs[at].state;
+            if (uses && programs[at].uses != ~0u)
+                programs[at].uses++;
+            if (uses)
+                *uses = programs[at].uses;
             break;
         }
         if (programs[at].state == PROGRAM_COLD)
@@ -1681,6 +1738,9 @@ static enum program_state program_claim(UINT64 key, BOOL claim)
                 programs[at].key = key;
                 programs[at].state = PROGRAM_PENDING;
                 programs[at].calls = programs[at].retries = 0;
+                programs[at].uses = 1;
+                if (uses)
+                    *uses = 1;
             }
             break;
         }
@@ -2128,6 +2188,7 @@ struct bounded_job
     volatile LONG refs;
     HANDLE done;
     HRESULT hr;
+    UINT64 program; /* a program's first compile (first_call_compile): its state is set when done */
     struct rebox_compile_out out;
     struct rebox_compile_in in;
     UINT32 sgprs[64];
@@ -2159,6 +2220,8 @@ static DWORD WINAPI bounded_worker(void *unused)
             bounded_tail = NULL;
         ReleaseSRWLockExclusive(&bounded_lock);
         job->hr = compile_now(&job->in, &job->out, FALSE);
+        if (job->program)
+            program_set(job->program, SUCCEEDED(job->hr) ? PROGRAM_WARM : PROGRAM_FAILED);
         SetEvent(job->done);
         bounded_release(job);
     }
@@ -2177,22 +2240,33 @@ static DWORD inline_wait_ms(BOOL graphics)
     return !ms ? 0 : graphics ? (DWORD)ms : (DWORD)max(ms, 250);
 }
 
-static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics)
+/* Compiles in on the pool, waiting at most wait ms (0: in the caller); program, if not 0, is a
+ * program claimed as pending whose state the compile sets. */
+static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics,
+                                   DWORD wait, UINT64 program)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     static LONG timeouts;
-    DWORD wait = inline_wait_ms(graphics);
     struct bounded_job *job;
     BOOL pending;
     HRESULT hr;
 
     if (!wait || !(job = calloc(1, sizeof(*job) + in->shader_size)))
-        return compile_now(in, out, FALSE);
+    {
+        hr = compile_now(in, out, FALSE);
+        if (program)
+            program_set(program, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        return hr;
+    }
     if (!(job->done = CreateEventA(NULL, TRUE, FALSE, NULL)))
     {
         free(job);
-        return compile_now(in, out, FALSE);
+        hr = compile_now(in, out, FALSE);
+        if (program)
+            program_set(program, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        return hr;
     }
+    job->program = program;
     job->refs = 2;
     job->in = *in;
     memcpy(job->shader, in->shader, in->shader_size);
@@ -2237,6 +2311,128 @@ static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_c
     return hr;
 }
 
+static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics)
+{
+    return bounded_compile_for(in, out, graphics, inline_wait_ms(graphics), 0);
+}
+
+/* First calls wait. A draw or dispatch skipped because its program is still compiling (its first
+ * call queues the compile and is skipped; later ones past REBOX_INLINE_COMPILE_WAIT_MS or the frame's
+ * budget are too) is only redrawn if the title draws it again. The world's first frame bakes
+ * lighting tables with one-time full-screen passes, and one skipped stays undone: diffuse light was
+ * gone for good (VIctory forks, GPL-3.0, facts: such passes get their own compile lane and a 20 s
+ * wait). So a program's first REBOX_FIRST_CALLS_WAIT calls (default 4; 0: none) wait for their
+ * compile, at most REBOX_FIRST_CALL_WAIT_MS each (default 20000), and so do a full-screen pass's
+ * (proxy.c: a non-indexed draw of 3 or 4 vertices and one instance) first
+ * REBOX_SCREEN_PASS_WAIT_CALLS (default 16). Later calls are skipped while compiling, as before, so
+ * the world's repeated draws don't stall frames. Waits other than a full-screen pass's stop for the
+ * rest of a frame once that frame has waited REBOX_FIRST_CALLS_FRAME_MS (default 3000) in all: a
+ * world brings a thousand new programs at once, and the title's watchdog fired when its render
+ * thread stopped presenting for long. Every wait of a second or more is logged. vkd3d-proton
+ * builds the pipeline of such a call at once instead of on its workers (ReboxConsoleMustDraw). */
+static __thread BOOL screen_pass_hint, must_draw;
+static volatile LONG first_wait_frame;
+static volatile LONG64 first_wait_ticks;
+
+void console_screen_pass(BOOL on)
+{
+    screen_pass_hint = on;
+}
+
+/* Whether a call since the last query waited for its compile (patch 0030's pipeline lookup asks,
+ * after the stages' compiles, and builds that pipeline at once). */
+BOOL WINAPI ReboxConsoleMustDraw(void)
+{
+    BOOL was = must_draw;
+    must_draw = FALSE;
+    return was;
+}
+
+static LONG env_count(const char *name, LONG fallback)
+{
+    char v[16];
+    DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+    return n && n < sizeof(v) ? atol(v) : fallback;
+}
+
+/* How long the uses-th call of a program may wait for its compile (0: as any other call). */
+static DWORD first_call_wait(UINT uses, BOOL *screen)
+{
+    static LONG first = -1, screens = -1, wait_ms = -1, frame_ms = -1;
+    LONG frame = compile_frame;
+
+    if (first < 0)
+    {
+        first = env_count("REBOX_FIRST_CALLS_WAIT", 4);
+        screens = env_count("REBOX_SCREEN_PASS_WAIT_CALLS", 16);
+        wait_ms = env_count("REBOX_FIRST_CALL_WAIT_MS", 20000);
+        frame_ms = env_count("REBOX_FIRST_CALLS_FRAME_MS", 3000);
+    }
+    *screen = FALSE;
+    if (!uses || wait_ms <= 0)
+        return 0;
+    if (screen_pass_hint && uses <= (UINT)max(screens, 0))
+    {
+        *screen = TRUE;
+        return (DWORD)wait_ms;
+    }
+    if (uses > (UINT)max(first, 0))
+        return 0;
+    if (InterlockedExchange(&first_wait_frame, frame) != frame)
+        InterlockedExchange64(&first_wait_ticks, 0);
+    if (frame_ms > 0 && first_wait_ticks * 1000.0 >= frame_ms * qpc_frequency())
+        return 0;
+    return (DWORD)wait_ms;
+}
+
+static void first_call_waited(UINT64 key, UINT uses, BOOL screen, BOOL graphics, LONG64 started, HRESULT hr)
+{
+    static volatile LONG logged;
+    LONG64 ticks = ticks_now() - started;
+    double ms = ticks * 1000.0 / qpc_frequency();
+    LONG n;
+
+    if (!screen)
+        InterlockedAdd64(&first_wait_ticks, ticks);
+    if (ms < 1000.0)
+        return;
+    n = InterlockedIncrement(&logged);
+    if (n <= 256 || !(n & (n - 1)))
+        rebox_log("d3d12_xs: console shaders: call %u of %s program %016llx%s waited %.0f ms for its compile: %s "
+                  "(%ld such waits)", uses, graphics ? "graphics" : "compute", (unsigned long long)key,
+                  screen ? " (a full-screen pass)" : "", ms,
+                  SUCCEEDED(hr) ? "compiled" : hr == E_PENDING ? "still compiling, skipped" : "failed", n);
+}
+
+/* A first call's compile, waiting at most wait ms: the program's own first compile if it was cold
+ * (claimed), else for its background compile to end and then for this call's variant. */
+static HRESULT first_call_compile(UINT64 key, enum program_state state, const struct rebox_compile_in *in,
+                                  struct rebox_compile_out *out, BOOL graphics, DWORD wait)
+{
+    LONG64 started = ticks_now(), deadline = started + (LONG64)(wait * qpc_frequency() / 1000);
+    HRESULT hr;
+
+    if (state == PROGRAM_COLD)
+        return bounded_compile_for(in, out, graphics, wait, key);
+    while (state == PROGRAM_PENDING && ticks_now() < deadline)
+    {
+        Sleep(2);
+        state = program_claim(key, FALSE, NULL);
+    }
+    if (state == PROGRAM_PENDING)
+    {
+        set_last(E_PENDING, "compiling in the background past its first-call wait", NULL);
+        return E_PENDING;
+    }
+    if (state == PROGRAM_FAILED)
+    {
+        set_last(E_FAIL, "its background compile failed", NULL);
+        return E_FAIL;
+    }
+    hr = bounded_compile_for(in, out, graphics, (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 50.0), 0);
+    return hr;
+}
+
 static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     const struct rebox_deferred_shader *h = in->shader;
@@ -2276,7 +2472,11 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
 
 static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
+    enum program_state state;
+    BOOL screen;
+    DWORD wait;
     UINT64 key;
+    UINT uses;
 
     if (in_display_draw && in && in->shader && in->shader_size >= sizeof(struct rebox_deferred_shader))
     {
@@ -2300,7 +2500,26 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
         return hr;
     }
     key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
-    switch (program_claim(key, TRUE))
+    state = program_claim(key, TRUE, &uses);
+    /* One of a program's first calls, or a full-screen pass's: waits for its compile. */
+    if (state != PROGRAM_FAILED && (wait = first_call_wait(uses, &screen)))
+    {
+        const struct rebox_deferred_shader *h = in->shader;
+        BOOL graphics = in->shader_size >= sizeof(*h) && h->version == 2;
+        LONG64 started = ticks_now();
+        HRESULT hr;
+
+        if (state == PROGRAM_WARM && in_display_draw && current_draw.target >= 0)
+            hr = compile_now(in, out, FALSE);
+        else
+            hr = first_call_compile(key, state, in, out, graphics, wait);
+        first_call_waited(key, uses, screen, graphics, started, hr);
+        if (SUCCEEDED(hr))
+            must_draw = TRUE;
+        call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr == E_PENDING ? OUTCOME_WAIT : OUTCOME_FAILED;
+        return hr;
+    }
+    switch (state)
     {
     case PROGRAM_COLD: /* claimed: compile it in the background */
         /* Ahead of the rest: a stage drawing into a display-sized target (the UI, text, the final
