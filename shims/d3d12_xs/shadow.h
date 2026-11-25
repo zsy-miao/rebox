@@ -67,8 +67,13 @@ enum shadow_view shadow_slot_view(SIZE_T heap_cpu, UINT index);
  * 0: the first slot found): the same words can be in slots of different views. */
 BOOL shadow_find_index_view(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT views,
                             UINT *index);
-/* GPU address ranges [begin, end) of buffers the title made views of; returns the count. */
+/* GPU address ranges [begin, end) of buffers the title made views of or asked the GPU address of,
+ * sorted, merged where they overlap or touch; returns the count. */
 UINT shadow_buffer_ranges(UINT64 (*out)[2], UINT max);
+/* Notes a buffer's range [va, va + size) (proxy.c's GetGPUVirtualAddress). */
+void shadow_note_buffer_range(UINT64 va, UINT64 size);
+/* The noted range holding address, if any. */
+BOOL shadow_buffer_range_at(UINT64 address, UINT64 *begin, UINT64 *end);
 /* Changes whenever a buffer range is added or grows. */
 LONG shadow_buffer_ranges_generation(void);
 

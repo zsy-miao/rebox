@@ -631,7 +631,17 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
     UINT64 title_address;
     UINT uploads;
 
-    if (va || !device_proxy)
+    if (va)
+    {
+        /* A buffer: its range is noted (a binary search once it is), so a root view or vertex
+         * buffer of a buffer the title made no view of is known memory too: its reads are bounded
+         * by it and AnyPS5's page table maps it (it read as zero, an AnyPS5 fault record). */
+        ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)self)[10])(self, &desc);
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+            shadow_note_buffer_range(va, desc.Width);
+        return va;
+    }
+    if (!device_proxy)
         return va;
     ((D3D12_RESOURCE_DESC *(STDMETHODCALLTYPE *)(void *, D3D12_RESOURCE_DESC *))(*(void ***)self)[10])(self, &desc);
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -1831,39 +1841,135 @@ static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_AD
  * committed run around the address (a compute shader read 0x37640 past one and faulted the GPU). */
 #define ROOT_VIEW_SIZE 0x10000u
 
+/* Buffers bound by address below 4 GiB (RADV's low window: Rebox's GPU memory chunks, and some of
+ * vkd3d-proton's) or in the GPU memory window (vkd3d-proton's own resources) are checked against
+ * the buffers the title knows (shadow_buffer_range_at: those it made views of or asked the GPU
+ * address of) and Rebox's GPU memory chunks; other addresses are the title's own memory (ia_adopt).
+ * An address in none of them can only fault the GPU (a TCP read at 0x90061000, and 160 GiB past
+ * the window's last allocation): it is logged, the first few, and read as empty (a root view bound
+ * to 64 KiB of zeros, a UAV to a 64 KiB sink its writes are lost to; a vertex or index buffer to
+ * none). REBOX_UNKNOWN_BUFFERS=keep only logs. A known buffer's end is returned in *end. */
+static BOOL gpu_buffer_known(UINT64 address, UINT64 *end)
+{
+    UINT64 ignored;
+    if (!end)
+        end = &ignored;
+    if (!address || (address >= 0x100000000ull && (address < 0x200000000000ull || address >= 0x210000000000ull)))
+    {
+        *end = ~0ull;
+        return TRUE;
+    }
+    return shadow_buffer_range_at(address, NULL, end) || gpu_memory_gpu_extent(address, end);
+}
+
+static BOOL unknown_buffers_kept(void)
+{
+    static int keep = -1;
+    if (keep < 0)
+    {
+        const char *v = getenv("REBOX_UNKNOWN_BUFFERS");
+        keep = v && !strcmp(v, "keep");
+    }
+    return keep;
+}
+
+static void log_unknown_buffer(const char *what, int index, UINT64 address, UINT64 size)
+{
+    static LONG logged;
+    if (InterlockedIncrement(&logged) <= 32)
+        rebox_log("d3d12_xs: %s (slot %d) at %#llx+%#llx is in no buffer the title knows (GPU memory window ends at "
+                  "%#llx): %s", what, index, (unsigned long long)address, (unsigned long long)size,
+                  (unsigned long long)gpu_memory_window_end(),
+                  unknown_buffers_kept() ? "bound as it is (REBOX_UNKNOWN_BUFFERS=keep)" : "read as empty");
+}
+
+static UINT64 root_view_check(const char *what, BOOL uav, UINT index, UINT64 address)
+{
+    static UINT64 zeros[2];
+
+    if (gpu_buffer_known(address, NULL))
+        return address;
+    log_unknown_buffer(what, index, address, 0);
+    if (unknown_buffers_kept())
+        return address;
+    if (!zeros[uav])
+    {
+        void *cpu;
+        UINT64 gpu;
+        if (SUCCEEDED(ReboxGpuAlloc(ROOT_VIEW_SIZE, 256, &cpu, &gpu)))
+        {
+            memset(cpu, 0, ROOT_VIEW_SIZE);
+            InterlockedCompareExchange64((LONG64 *)&zeros[uav], gpu, 0);
+        }
+    }
+    return zeros[uav] ? zeros[uav] : address;
+}
+
+/* A vertex or index buffer: in no buffer the title knows, none is bound (vkd3d-proton reads such
+ * a binding as zeros); in one, its size is cut to that buffer's end (a view's size isn't checked
+ * against its buffer, and robust fetches are bounded only by it). */
+static void ia_buffer_check(const char *what, int slot, D3D12_GPU_VIRTUAL_ADDRESS *address, UINT *size)
+{
+    UINT64 end;
+
+    if (gpu_buffer_known(*address, &end))
+    {
+        if (end != ~0ull && *size > end - *address)
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 8)
+                rebox_log("d3d12_xs: %s (slot %d) at %#llx+%#x runs past its buffer at %#llx: cut", what, slot,
+                          (unsigned long long)*address, *size, (unsigned long long)end);
+            *size = (UINT)(end - *address);
+        }
+        return;
+    }
+    log_unknown_buffer(what, slot, *address, *size);
+    if (unknown_buffers_kept())
+        return;
+    *address = 0;
+    *size = 0;
+}
+
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
     address = ia_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
@@ -1875,6 +1981,7 @@ static void STDMETHODCALLTYPE list_IASetIndexBuffer(struct proxy *p, const D3D12
     {
         moved = *view;
         moved.BufferLocation = ia_adopt("an index buffer", view->BufferLocation, view->SizeInBytes);
+        ia_buffer_check("an index buffer", 0, &moved.BufferLocation, &moved.SizeInBytes);
         view = &moved;
     }
     if (view)
@@ -1893,6 +2000,7 @@ static void STDMETHODCALLTYPE list_IASetVertexBuffers(struct proxy *p, UINT star
     {
         moved[i] = views[i];
         moved[i].BufferLocation = ia_adopt("a vertex buffer", views[i].BufferLocation, views[i].SizeInBytes);
+        ia_buffer_check("a vertex buffer", (int)(start + i), &moved[i].BufferLocation, &moved[i].SizeInBytes);
     }
     if (views && count <= ARRAYSIZE(moved))
         views = moved;
@@ -5960,8 +6068,12 @@ static void STDMETHODCALLTYPE list_DrawInstanced(struct proxy *p, UINT vertices,
     if (p->display_bound || draw_census())
         console_display_draw_begin(p->display_bound - 1, vertices, p->rect_list, FALSE);
     traced = trace_begin(p, TRUE, p->rect_list ? "draw-rect" : "draw", vertices, instances, 0);
+    /* A full-screen pass (a triangle, a quad or a rect): its first compiles wait longer, as it may
+     * be drawn once (the world's lighting tables). */
+    console_screen_pass((vertices == 3 || vertices == 4) && instances == 1);
     ID3D12GraphicsCommandList_DrawInstanced(INNER(p, ID3D12GraphicsCommandList), vertices, instances, first_vertex,
                                             first_instance);
+    console_screen_pass(FALSE);
     trace_end(traced);
     console_display_draw_end();
     log_watched_vertex_buffers(p, first_vertex, vertices);

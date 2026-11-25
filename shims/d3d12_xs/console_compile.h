@@ -118,6 +118,12 @@ void console_display_draw_end(void);
 void console_display_draws_log(void);
 /* A present: the next frame's compile budget starts (console_compile.c). */
 void console_frame_presented(void);
+/* Brackets a draw that looks like a full-screen pass (3 or 4 vertices, one instance, no index
+ * buffer): its stages wait for their first compiles longer (console_compile.c). */
+void console_screen_pass(BOOL on);
+/* Whether a ReboxConsoleCompile call on this thread since the last query waited for its compile
+ * (cleared by asking): vkd3d-proton (patch 0030) builds its pipeline at once. */
+BOOL WINAPI ReboxConsoleMustDraw(void);
 /* REBOX_FRAME_TRACE: whether this present is traced, and the draw, ExecuteIndirect or dispatch about
  * to compile its stages (op NULL: none), with its first render target (console_compile.c). */
 BOOL console_trace_active(void);

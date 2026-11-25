@@ -1,0 +1,66 @@
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index 5df2568..63bb963 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -3492,6 +3492,27 @@ static bool vkd3d_rebox_fallback_pso(void)
+     return fn && fn();
+ }
+ 
++/* rebox (patch 0030): whether d3d12_xs made this draw's or dispatch's console compiles wait (its
++ * ReboxConsoleMustDraw: one of a program's first calls, or a full-screen pass's, which the title
++ * may make only once, as with the lighting tables a world bakes at its first frame). Its pipeline
++ * is then made here, not by the workers, so the call isn't skipped while it is built. Asked once
++ * per lookup, which clears it. */
++static bool vkd3d_rebox_must_draw(void)
++{
++    typedef BOOL (WINAPI *PFN_must_draw)(void);
++    static PFN_must_draw fn;
++    static bool resolved;
++    vkd3d_module_t module;
++
++    if (!resolved)
++    {
++        if ((module = vkd3d_dlopen("d3d12_xs.dll")))
++            fn = (PFN_must_draw)vkd3d_dlsym(module, "ReboxConsoleMustDraw");
++        resolved = true;
++    }
++    return fn && fn();
++}
++
+ /* rebox (patch 0018): SPIR-V words of console pipelines being made at once. The driver's compile of
+  * a world's largest modules (1-2.4M words) holds GBs each, and several at once took the process's
+  * heap past 30 GB. A pipeline is made once the words in flight and its own fit in
+@@ -3724,6 +3745,7 @@ static bool rebox_pipeline_enqueue(struct rebox_pipeline_job *job)
+ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_rebox_compile_out *out)
+ {
++    bool must_draw = vkd3d_rebox_must_draw();
+     VkPipeline vk_pipeline = VK_NULL_HANDLE;
+     bool listed = false;
+     size_t i;
+@@ -3739,7 +3761,7 @@ VkPipeline d3d12_pipeline_state_rebox_variant(struct d3d12_pipeline_state *state
+     if (listed)
+         return vk_pipeline;
+ 
+-    if (rebox_pipelines_async())
++    if (rebox_pipelines_async() && !must_draw)
+     {
+         rwlock_lock_write(&state->lock);
+         for (i = 0; i < state->rebox_variant_count; i++)
+@@ -3985,6 +4007,7 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+     struct vkd3d_pipeline_key pipeline_key;
+     VkPipeline vk_pipeline = VK_NULL_HANDLE;
+     uint32_t i, slot_mask = 0, key_hash;
++    bool must_draw = vkd3d_rebox_must_draw();
+     struct rebox_graphics_build build;
+     bool listed = false;
+     uint64_t key[2];
+@@ -4123,7 +4146,7 @@ VkPipeline d3d12_pipeline_state_rebox_graphics_variant(struct d3d12_pipeline_sta
+         build.rect = true;
+     }
+     memcpy(build.key, key, sizeof(key));
+-    if (rebox_pipelines_async())
++    if (rebox_pipelines_async() && !must_draw)
+     {
+         struct rebox_pipeline_job *job = vkd3d_calloc(1, sizeof(*job));
+         struct rebox_graphics_build *copy = vkd3d_malloc(sizeof(*copy));
