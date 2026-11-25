@@ -109,6 +109,11 @@ struct proxy
     UINT64 arrival_value;
     struct fence_cell *fence_cell; /* fences: the completed value slot 12 handed out */
     volatile LONG64 fence_signalled; /* fences: the highest value a queue was told to signal */
+    BOOL bundle;                   /* lists: a bundle (never submitted itself) */
+    BOOL open;                     /* lists: in open_lists, recorded or waiting to be submitted */
+    LONG64 recording_since;        /* lists: the time of its last reset (open_lists) */
+    LONG ring_mark;                /* lists: console_ring_writes at its last reset */
+    struct proxy *open_prev, *open_next;
 };
 
 C_ASSERT(offsetof(struct proxy, inner) == INNER_OFFSET);
@@ -413,6 +418,80 @@ static void older_list_remove(struct proxy *p)
     ReleaseSRWLockExclusive(&older_lists_lock);
 }
 
+/* Lists from their reset until they are submitted: the per-draw ring's blocks (console_compile.c)
+ * are written as their draws are recorded and read when they run, so the GPU is past a block only
+ * once every list reset before it was written has been submitted and has finished
+ * (proxy_gpu_finished_before). A list closed with no block written since its reset, by any thread,
+ * holds none and leaves at once. A list recorded after its creation without a reset isn't counted
+ * until it is submitted (the target title resets its pooled lists before recording them; pooled
+ * lists fresh from creation stay open, and counting them would hold the ring for good). */
+static struct proxy *open_lists;
+static SRWLOCK open_lists_lock = SRWLOCK_INIT;
+
+/* Under open_lists_lock. */
+static void open_list_unlink(struct proxy *p)
+{
+    if (!p->open)
+        return;
+    if (p->open_prev)
+        p->open_prev->open_next = p->open_next;
+    else
+        open_lists = p->open_next;
+    if (p->open_next)
+        p->open_next->open_prev = p->open_prev;
+    p->open_prev = p->open_next = NULL;
+    p->open = FALSE;
+}
+
+static void open_list_reset(struct proxy *p)
+{
+    LARGE_INTEGER now;
+
+    if (p->bundle)
+        return;
+    AcquireSRWLockExclusive(&open_lists_lock);
+    QueryPerformanceCounter(&now);
+    p->recording_since = now.QuadPart;
+    p->ring_mark = console_ring_writes();
+    if (!p->open)
+    {
+        p->open = TRUE;
+        p->open_prev = NULL;
+        p->open_next = open_lists;
+        if (open_lists)
+            open_lists->open_prev = p;
+        open_lists = p;
+    }
+    ReleaseSRWLockExclusive(&open_lists_lock);
+}
+
+static void open_list_closed(struct proxy *p)
+{
+    AcquireSRWLockExclusive(&open_lists_lock);
+    if (p->open && console_ring_writes() == p->ring_mark)
+        open_list_unlink(p);
+    ReleaseSRWLockExclusive(&open_lists_lock);
+}
+
+static void open_list_remove(struct proxy *p)
+{
+    AcquireSRWLockExclusive(&open_lists_lock);
+    open_list_unlink(p);
+    ReleaseSRWLockExclusive(&open_lists_lock);
+}
+
+/* The earliest reset of an open list, or MAXLONG64. */
+static LONG64 open_lists_oldest(void)
+{
+    LONG64 oldest = MAXLONG64;
+
+    AcquireSRWLockShared(&open_lists_lock);
+    for (struct proxy *p = open_lists; p; p = p->open_next)
+        oldest = min(oldest, p->recording_since);
+    ReleaseSRWLockShared(&open_lists_lock);
+    return oldest;
+}
+
 static void lists_to_newer_layout(void)
 {
     SIZE_T moved;
@@ -455,6 +534,8 @@ static ULONG STDMETHODCALLTYPE proxy_Release(struct proxy *p)
             shadow_heap_destroyed((ID3D12DescriptorHeap *)p->inner);
         if (p->cls == &list_class)
             older_list_remove(p);
+        if (p->cls == &list_class || p->cls == &list_v4_class || p->cls == &copy_list_class)
+            open_list_remove(p);
         IUnknown_Release(p->inner);
         free(p);
     }
@@ -1211,6 +1292,8 @@ static HRESULT create_list(struct proxy *p, UINT type, ID3D12CommandAllocator *a
                      : newer_layouts ? &list_v4_class : &list_class, out);
     if (SUCCEEDED(hr) && out && *out && ((struct proxy *)*out)->cls == &list_class)
         older_list_add(*out);
+    if (SUCCEEDED(hr) && out && *out)
+        ((struct proxy *)*out)->bundle = t == D3D12_COMMAND_LIST_TYPE_BUNDLE;
     return hr;
 }
 
@@ -5272,19 +5355,24 @@ static BOOL gpu_wait_for_value(struct proxy *p, const struct memory_wait *w)
 /* How long the GPU takes to finish each submission: the queue signals its own fence after it, and
  * a thread notes when the fence gets there. Every 10 s: submissions finished, their average and
  * longest time, and the oldest still running. */
-struct gpu_latency_entry { ID3D12Fence *fence; UINT64 value; LONG64 at; void *queue; };
+struct gpu_latency_entry { ID3D12Fence *fence; UINT64 value; LONG64 at, since; void *queue; };
 static struct gpu_latency_entry gpu_latency[4096];
 static UINT gpu_latency_head, gpu_latency_tail;
 static SRWLOCK gpu_latency_lock = SRWLOCK_INIT;
 
 /* The QueryPerformanceCounter time before which every submission has finished on the GPU, as the
- * latency thread last saw (every 20 ms); 0 until the first submission. Entries of several queues
- * interleave, so it is a lower bound. */
+ * latency thread last saw (every 20 ms); 0 until the first submission. A submission counts from
+ * the earliest reset of its open lists (open_lists), as their recorded data dates from then.
+ * Entries of several queues interleave, so it is a lower bound. */
 static volatile LONG64 gpu_finished_before;
 
+/* That, and no later than the reset of a list not yet submitted: what has been written before it
+ * (embedded data, the per-draw ring's blocks) no list will read any more. The open lists are read
+ * first: a submission enters gpu_latency before its lists leave them (submit_lists). */
 LONG64 proxy_gpu_finished_before(void)
 {
-    return gpu_finished_before;
+    LONG64 open = open_lists_oldest();
+    return min(open, gpu_finished_before);
 }
 
 /* Memory, every 10 s: a run killed for using too much (a host OOM watcher) left no other trace.
@@ -5409,10 +5497,14 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
             gpu_latency_tail++;
         }
         {
+            /* The earliest of the unfinished ones: a submission's lists can date from long before it. */
             LARGE_INTEGER inside;
+            LONG64 before;
             QueryPerformanceCounter(&inside);
-            InterlockedExchange64(&gpu_finished_before, gpu_latency_tail != gpu_latency_head
-                                  ? gpu_latency[gpu_latency_tail % ARRAYSIZE(gpu_latency)].at : inside.QuadPart);
+            before = inside.QuadPart;
+            for (UINT i = gpu_latency_tail; i != gpu_latency_head; i++)
+                before = min(before, gpu_latency[i % ARRAYSIZE(gpu_latency)].since);
+            InterlockedExchange64(&gpu_finished_before, before);
         }
         /* Retired view resources go once the GPU is past everything submitted before them. */
         reap_before = now.QuadPart - f.QuadPart * VIEW_RETIRE_MS / 1000;
@@ -5440,7 +5532,8 @@ static DWORD WINAPI gpu_latency_thread(void *arg)
     return 0;
 }
 
-static void gpu_latency_note(struct proxy *queue)
+/* since: the earliest reset of the submission's open lists (MAXLONG64: none). */
+static void gpu_latency_note(struct proxy *queue, LONG64 since)
 {
     static LONG started;
     LARGE_INTEGER now;
@@ -5463,12 +5556,16 @@ static void gpu_latency_note(struct proxy *queue)
     /* Taken under the lock, so the thread's proxy_gpu_finished_before never passes an entry not
      * yet listed. */
     QueryPerformanceCounter(&now);
+    since = min(since, now.QuadPart);
     if (gpu_latency_head - gpu_latency_tail < ARRAYSIZE(gpu_latency))
     {
         ID3D12Fence_AddRef(queue->timing_fence);
         gpu_latency[gpu_latency_head++ % ARRAYSIZE(gpu_latency)] =
-                (struct gpu_latency_entry){ queue->timing_fence, queue->timing_value, now.QuadPart, queue };
+                (struct gpu_latency_entry){ queue->timing_fence, queue->timing_value, now.QuadPart, since, queue };
     }
+    /* At once, not at the thread's next look: the lists leave open_lists next. */
+    if (since < gpu_finished_before)
+        InterlockedExchange64(&gpu_finished_before, since);
     ReleaseSRWLockExclusive(&gpu_latency_lock);
 }
 
@@ -5590,7 +5687,24 @@ static void submit_lists(struct proxy *p, UINT count, ID3D12CommandList *const *
     }
     submit_mark(&mark, 2);
     ID3D12CommandQueue_ExecuteCommandLists(INNER(p, ID3D12CommandQueue), count, raw);
-    gpu_latency_note(p);
+    {
+        /* The submission counts from its lists' resets; then they leave open_lists. */
+        LONG64 since = MAXLONG64;
+        AcquireSRWLockShared(&open_lists_lock);
+        for (UINT i = 0; i < count; i++)
+        {
+            const struct proxy *l = (const struct proxy *)lists[i];
+            if (is_proxy(l) && l->open)
+                since = min(since, l->recording_since);
+        }
+        ReleaseSRWLockShared(&open_lists_lock);
+        gpu_latency_note(p, since);
+        AcquireSRWLockExclusive(&open_lists_lock);
+        for (UINT i = 0; i < count; i++)
+            if (is_proxy(lists[i]))
+                open_list_unlink((struct proxy *)lists[i]);
+        ReleaseSRWLockExclusive(&open_lists_lock);
+    }
     submit_mark(&mark, 3);
     /* Waits elsewhere for the values these lists write (signal_value_fences). */
     signal_value_fences(INNER(p, ID3D12CommandQueue), count, lists);
@@ -7058,6 +7172,7 @@ static HRESULT STDMETHODCALLTYPE list_Close(struct proxy *p)
 {
     if (debug_view_on())
         debug_view_close(INNER(p, ID3D12GraphicsCommandList), &p->debug_view);
+    open_list_closed(p);
     return ID3D12GraphicsCommandList_Close(INNER(p, ID3D12GraphicsCommandList));
 }
 
@@ -7099,6 +7214,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(struct proxy *p, ID3D12CommandAlloca
     p->retired = keep;
     embedded_free_list(drop);
     p->heap_count = 0;
+    open_list_reset(p);
     return ID3D12GraphicsCommandList_Reset(INNER(p, ID3D12GraphicsCommandList), proxy_unwrap(alloc), pso);
 }
 

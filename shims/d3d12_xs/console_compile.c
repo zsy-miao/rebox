@@ -385,20 +385,28 @@ static struct host_buffer { UINT64 hash, gpu; SIZE_T size; const void *cpu; stru
  * addresses and table pointers): a ring, bump-allocated and wrapped. Sharing by content never hit
  * for those, so each draw allocated GPU memory it never freed, about 10 ms each.
  *
- * A wrap reuses the ring only once the GPU has finished every submission made before
- * DRAW_RING_SUBMIT_MS after the lap began (proxy_gpu_finished_before; a block is written when its
- * draw is recorded and read when the list runs, normally well within that). Otherwise a fresh ring
- * takes over and the old one is freed once the GPU is past that much after its last block: a draw
- * block overwritten under a queued draw gave its stage another draw's guest buffer table, SRT and
- * heap slots, wild scalar reads. */
+ * A block is written when its draw is recorded and read when its list runs, which can be long
+ * after: the target title's world recorded for 40 s with no submission while the ring went round
+ * twice, and a check made only at a wrap, that the GPU had finished the submissions made early in
+ * the lap, let it overwrite blocks of lists not yet submitted. Their draw blocks and guest buffer
+ * tables then held other blocks' words, and shaders read through them at addresses no buffer held
+ * (a GPU fault at a V#'s fourth word, 0x31016204, in six runs). So the ring is reused a segment at
+ * a time: a segment the last lap wrote is written again only once its last block is older than
+ * proxy_gpu_finished_before, which counts a list still recorded or waiting to be submitted from
+ * its reset (proxy.c). Otherwise a fresh ring takes over, and the old one is freed once the GPU
+ * is past its last block. */
 #define DRAW_RING (128u << 20)
-#define DRAW_RING_SUBMIT_MS 2000
+#define DRAW_RING_SEGMENTS 32
+#define DRAW_RING_SEGMENT (DRAW_RING / DRAW_RING_SEGMENTS)
 #define DRAW_RINGS_RETIRED 8
 
 static SRWLOCK ring_lock = SRWLOCK_INIT;
 static BYTE *ring_cpu;
 static UINT64 ring_gpu, ring_head;
+static UINT64 ring_checked; /* this lap may write below this offset */
+static LONG64 ring_written[DRAW_RING_SEGMENTS]; /* each segment's last block, QueryPerformanceCounter time (0: none) */
 static LONG64 ring_lap_start; /* QueryPerformanceCounter time of the current lap's first block */
+static volatile LONG ring_writes; /* blocks written (console_ring_writes) */
 static struct { BYTE *cpu; LONG64 last; } rings_retired[DRAW_RINGS_RETIRED];
 static UINT rings_retired_count;
 static LONG64 (*ring_gpu_finished_before)(void) = proxy_gpu_finished_before;
@@ -409,6 +417,11 @@ void WINAPI ReboxConsoleRingProgress(LONG64 (*finished_before)(void))
     AcquireSRWLockExclusive(&ring_lock);
     ring_gpu_finished_before = finished_before ? finished_before : proxy_gpu_finished_before;
     ReleaseSRWLockExclusive(&ring_lock);
+}
+
+LONG console_ring_writes(void)
+{
+    return ring_writes;
 }
 
 static LONG64 qpc_now(void)
@@ -436,7 +449,7 @@ static void rings_reap(LONG64 finished_before)
     UINT kept = 0;
     for (UINT i = 0; i < rings_retired_count; i++)
     {
-        if (rings_retired[i].last + qpc_ms(DRAW_RING_SUBMIT_MS) < finished_before)
+        if (rings_retired[i].last < finished_before)
             ReboxGpuFree(rings_retired[i].cpu);
         else
             rings_retired[kept++] = rings_retired[i];
@@ -444,10 +457,60 @@ static void rings_reap(LONG64 finished_before)
     rings_retired_count = kept;
 }
 
+/* Under ring_lock: room for aligned bytes at ring_head. Each segment the last lap wrote is checked
+ * as the head reaches it; one the GPU may still read gives way to a fresh ring (or, with none to
+ * be had, is reused, as before). */
+static void ring_make_room(SIZE_T aligned)
+{
+    LONG64 finished_before = 0;
+    BOOL asked = FALSE;
+
+    while (ring_head + aligned > ring_checked)
+    {
+        UINT s = (UINT)(ring_checked / DRAW_RING_SEGMENT);
+        LONG64 written = ring_written[s];
+        BYTE *new_cpu;
+        UINT64 new_gpu;
+
+        if (written && !asked)
+        {
+            finished_before = ring_gpu_finished_before();
+            asked = TRUE;
+            if (rings_retired_count)
+                rings_reap(finished_before);
+        }
+        if (written && finished_before <= written)
+        {
+            static LONG fresh, reused;
+            if (rings_retired_count < DRAW_RINGS_RETIRED
+                    && SUCCEEDED(ReboxGpuAlloc(DRAW_RING, 256, (void **)&new_cpu, &new_gpu)))
+            {
+                if (InterlockedIncrement(&fresh) <= 8)
+                    rebox_log("d3d12_xs: the per-draw ring reached blocks of %lld ms ago the GPU may still read: a "
+                              "fresh ring (%u waiting to be freed)", (qpc_now() - written) / qpc_ms(1),
+                              rings_retired_count + 1);
+                rings_retired[rings_retired_count].cpu = ring_cpu;
+                rings_retired[rings_retired_count++].last = qpc_now();
+                ring_cpu = new_cpu;
+                ring_gpu = new_gpu;
+                memset(ring_written, 0, sizeof(ring_written));
+                ring_head = ring_checked = 0;
+                ring_lap_start = qpc_now();
+                continue;
+            }
+            if (InterlockedIncrement(&reused) <= 8)
+                rebox_log("d3d12_xs: the per-draw ring reached blocks of %lld ms ago the GPU may still read, and no "
+                          "fresh ring could be had: reused", (qpc_now() - written) / qpc_ms(1));
+        }
+        ring_checked = (UINT64)(s + 1) * DRAW_RING_SEGMENT;
+    }
+}
+
 static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
 {
     SIZE_T aligned = (size + 255) & ~(SIZE_T)255;
     UINT64 at;
+    LONG64 now;
 
     if (!size || aligned > DRAW_RING)
         return 0;
@@ -463,37 +526,11 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
         ring_lap_start = qpc_now();
     if (ring_head + aligned > DRAW_RING)
     {
-        static LONG laps, fresh;
-        LONG64 now = qpc_now(), finished_before = ring_gpu_finished_before();
-        BYTE *new_cpu;
-        UINT64 new_gpu;
-        if (rings_retired_count)
-            rings_reap(finished_before);
-        if (finished_before <= ring_lap_start + qpc_ms(DRAW_RING_SUBMIT_MS)
-                && rings_retired_count < DRAW_RINGS_RETIRED
-                && SUCCEEDED(ReboxGpuAlloc(DRAW_RING, 256, (void **)&new_cpu, &new_gpu)))
-        {
-            /* The GPU may still read this lap's blocks: a fresh ring. */
-            if (InterlockedIncrement(&fresh) <= 8)
-                rebox_log("d3d12_xs: the per-draw ring filled in %lld ms with the GPU not yet past its first "
-                          "blocks: a fresh ring (%u waiting to be freed)", (now - ring_lap_start) / qpc_ms(1),
-                          rings_retired_count + 1);
-            rings_retired[rings_retired_count].cpu = ring_cpu;
-            rings_retired[rings_retired_count++].last = now;
-            ring_cpu = new_cpu;
-            ring_gpu = new_gpu;
-        }
-        else if (finished_before <= ring_lap_start + qpc_ms(DRAW_RING_SUBMIT_MS))
-        {
-            static LONG logged;
-            if (InterlockedIncrement(&logged) <= 8)
-                rebox_log("d3d12_xs: the per-draw ring wrapped after %lld ms with the GPU not yet past its first "
-                          "blocks, and no fresh ring could be had: reused", (now - ring_lap_start) / qpc_ms(1));
-        }
-        else if (InterlockedIncrement(&laps) <= 4)
-            rebox_log("d3d12_xs: the per-draw ring wrapped after %lld ms", (now - ring_lap_start) / qpc_ms(1));
-        ring_lap_start = now;
-        ring_head = 0;
+        static LONG laps;
+        if (InterlockedIncrement(&laps) <= 4)
+            rebox_log("d3d12_xs: the per-draw ring wrapped after %lld ms", (qpc_now() - ring_lap_start) / qpc_ms(1));
+        ring_lap_start = qpc_now();
+        ring_head = ring_checked = 0;
     }
     else if (rings_retired_count)
     {
@@ -501,9 +538,14 @@ static UINT64 draw_buffer(const void *data, SIZE_T size, BYTE **cpu)
         if (!(++blocks & 4095))
             rings_reap(ring_gpu_finished_before());
     }
+    ring_make_room(aligned);
     at = ring_head;
     ring_head += aligned;
     memcpy(ring_cpu + at, data, size);
+    now = qpc_now();
+    for (UINT64 s = at / DRAW_RING_SEGMENT; s <= (at + aligned - 1) / DRAW_RING_SEGMENT; s++)
+        ring_written[s] = now;
+    InterlockedIncrement(&ring_writes);
     if (cpu)
         *cpu = ring_cpu + at;
     ReleaseSRWLockExclusive(&ring_lock);

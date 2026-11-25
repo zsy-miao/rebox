@@ -110,6 +110,8 @@ void console_resolve_late(void);
 
 /* GPU memory for one draw's data (a ring reused long after the GPU read it): its address, or 0. */
 UINT64 console_draw_buffer(const void *data, SIZE_T size);
+/* How many blocks that ring has had written, all threads together (proxy.c: did a list write any). */
+LONG console_ring_writes(void);
 
 /* Draws into a display-sized target (proxy.c): the console stages they compile are noted, and
  * console_display_draws_log names them (at the first presents). */
