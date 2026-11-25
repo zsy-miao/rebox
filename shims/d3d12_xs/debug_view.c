@@ -28,6 +28,8 @@
  *   REBOX_DEBUG_VIEW_CHANNEL=r|g|b|a  one channel as grey (default the colour)
  *   REBOX_DEBUG_VIEW_DEPTH=forward  depth with the far plane at 1 (default reversed: far at 0)
  *   REBOX_DEBUG_VIEW_DECADES=<n>    depth shown on a log scale over n decades (default 4)
+ *   REBOX_DEBUG_VIEW_PROBE=<n>      queries around the draws into the target shown in n frames
+ *                                   (default 2, 0 off): see the probe below
  * Depth is white near the camera and darker with distance; texels still at the clear value are
  * dark blue. Frame dumps (REBOX_DUMP_FRAMES) show the view too. */
 
@@ -336,9 +338,275 @@ void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
         l->snapshot_res = picked;
 }
 
-void debug_view_draw(struct debug_view_list *l, BOOL mesh, UINT fate)
+/* ---------------------------------------------------------------- probe */
+
+/* REBOX_DEBUG_VIEW_PROBE=<n> (default 2, 0 off): in n frames (at least 10 s apart) where the target
+ * shown had 64 draws or more in the frame before, each draw into it (up to PROBE_SLOTS) gets an
+ * occlusion and a pipeline statistics query, and an ExecuteIndirect's first argument record (and
+ * count) is copied as it stands at the draw. The results are logged once the GPU has them: whether
+ * the draws recorded with a pipeline dispatched any groups, got primitives to the clipper, kept
+ * any past it, ran any pixels and passed any samples, which tells where a depth buffer still at its
+ * clear value lost them. */
+#define PROBE_SLOTS 512
+#define PROBE_STRIDE 128   /* readback bytes a slot: occlusion 8, statistics 88, arguments 20, count 4 */
+#define PROBE_STATS 8
+#define PROBE_ARGS 96
+#define PROBE_ARG_BYTES 20
+#define PROBE_COUNT 116
+
+static struct
+{
+    ID3D12QueryHeap *occlusion, *stats;
+    ID3D12Resource *readback;
+    volatile BYTE *data;
+    int remaining;         /* probes left; -1: not read yet */
+    volatile LONG frame;   /* the frame whose draws are probed, or 0 */
+    volatile LONG used;    /* slots handed out */
+    ULONGLONG last_tick;
+    struct { BYTE recorded, mesh, fate, args_words, has_count; } slots[PROBE_SLOTS];
+} probe = { .remaining = -1 };
+
+static BOOL probe_setup(void)
+{
+    ID3D12Device *device = rebox_shared_device();
+    D3D12_QUERY_HEAP_DESC query = { D3D12_QUERY_HEAP_TYPE_OCCLUSION, PROBE_SLOTS, 0 };
+    D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_READBACK };
+    D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_BUFFER, 0, PROBE_SLOTS * PROBE_STRIDE, 1, 1, 1,
+                                 DXGI_FORMAT_UNKNOWN, { 1, 0 }, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_RESOURCE_FLAG_NONE };
+    void *mapped = NULL;
+    HRESULT hr;
+
+    if (probe.data)
+        return TRUE;
+    if (!device)
+        return FALSE;
+    if (FAILED(hr = ID3D12Device_CreateQueryHeap(device, &query, &IID_ID3D12QueryHeap, (void **)&probe.occlusion)))
+        goto fail;
+    query.Type = D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS;
+    if (FAILED(hr = ID3D12Device_CreateQueryHeap(device, &query, &IID_ID3D12QueryHeap, (void **)&probe.stats)))
+        goto fail;
+    if (FAILED(hr = ID3D12Device_CreateCommittedResource(device, &heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&probe.readback)))
+        goto fail;
+    if (FAILED(hr = ID3D12Resource_Map(probe.readback, 0, NULL, &mapped)))
+        goto fail;
+    probe.data = mapped;
+    return TRUE;
+
+fail:
+    rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_PROBE: setup failed (%#lx); no probe", hr);
+    probe.remaining = 0;
+    return FALSE;
+}
+
+/* Under targets_lock, at a present: probe this frame's draws into the target picked. */
+static void probe_arm(LONG now, const struct target *t)
+{
+    ULONGLONG tick = GetTickCount64();
+
+    if (probe.remaining < 0)
+    {
+        const char *v = getenv("REBOX_DEBUG_VIEW_PROBE");
+        probe.remaining = v && *v ? atoi(v) : 2;
+    }
+    if (probe.remaining <= 0 || probe.frame || t->draws < 64 || (probe.last_tick && tick - probe.last_tick < 10000)
+            || !probe_setup())
+        return;
+    memset((void *)probe.data, 0xff, PROBE_SLOTS * PROBE_STRIDE);
+    memset(probe.slots, 0, sizeof(probe.slots));
+    probe.used = 0;
+    probe.last_tick = tick;
+    probe.remaining--;
+    InterlockedExchange(&probe.frame, now);
+    rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_PROBE: the draws of frame %ld into the %s %llux%u shown get queries", now,
+              t->depth ? "depth buffer" : "target", (unsigned long long)t->desc.Width, t->desc.Height);
+}
+
+static UINT64 probe_u64(UINT slot, UINT at)
+{
+    UINT64 v;
+    memcpy(&v, (const BYTE *)probe.data + slot * PROBE_STRIDE + at, sizeof(v));
+    return v;
+}
+
+static UINT probe_u32(UINT slot, UINT at)
+{
+    UINT v;
+    memcpy(&v, (const BYTE *)probe.data + slot * PROBE_STRIDE + at, sizeof(v));
+    return v;
+}
+
+/* At a present after the probed frame: the results, once every query recorded has landed (or 8
+ * presents on: lists never submitted). */
+static void probe_report(LONG now)
+{
+    struct sums
+    {
+        UINT draws, resolved, with_args, with_groups, with_clipped_in, with_clipped_out, with_pixels, with_samples;
+        UINT64 groups, clip_in, clip_out, pixels, samples;
+    } sums[3] = { { 0 } };  /* mesh draws recorded, other draws recorded, draws left out */
+    static const char *const names[3] = { "mesh draws recorded", "other draws recorded", "draws left out" };
+    UINT used = min((UINT)probe.used, (UINT)PROBE_SLOTS), pending = 0, detailed = 0;
+
+    if (!probe.frame || now <= probe.frame)
+        return;
+    for (UINT i = 0; i < used; i++)
+        pending += probe.slots[i].recorded && probe_u64(i, 0) == ~0ull;
+    if (pending && now - probe.frame < 8)
+        return;
+    rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_PROBE: frame %ld's %u draws into the target shown%s (%u of them not "
+              "resolved: their lists never ran, or not yet):", probe.frame, used,
+              (UINT)probe.used > PROBE_SLOTS ? " (the first of more)" : "", pending);
+    for (UINT i = 0; i < used; i++)
+    {
+        const D3D12_QUERY_DATA_PIPELINE_STATISTICS *st;
+        D3D12_QUERY_DATA_PIPELINE_STATISTICS stats;
+        BOOL recorded = probe.slots[i].fate == DRAW_FATE_RECORDED || probe.slots[i].fate == DRAW_FATE_STANDIN
+                || probe.slots[i].fate == DRAW_FATE_COMPILED || probe.slots[i].fate == DRAW_FATE_PLAIN;
+        struct sums *s = &sums[!recorded ? 2 : probe.slots[i].mesh ? 0 : 1];
+        UINT64 samples = probe_u64(i, 0), groups = 0;
+        UINT args[5] = { 0 }, count = ~0u;
+
+        s->draws++;
+        if (!probe.slots[i].recorded || samples == ~0ull)
+            continue;
+        memcpy(&stats, (const BYTE *)probe.data + i * PROBE_STRIDE + PROBE_STATS, sizeof(stats));
+        st = &stats;
+        s->resolved++;
+        for (UINT w = 0; w < probe.slots[i].args_words && w < 5; w++)
+            args[w] = probe_u32(i, PROBE_ARGS + w * 4);
+        if (probe.slots[i].has_count)
+            count = probe_u32(i, PROBE_COUNT);
+        if (probe.slots[i].args_words >= 3)
+        {
+            /* A mesh record's group counts; a draw's vertex (index) count and instances. */
+            groups = probe.slots[i].mesh ? (UINT64)args[0] * args[1] * args[2] : (UINT64)args[0] * args[1];
+            if (count != ~0u && !count)
+                groups = 0;
+            s->with_args++;
+            s->with_groups += groups != 0;
+            s->groups += groups;
+        }
+        s->with_clipped_in += st->CInvocations != 0;
+        s->with_clipped_out += st->CPrimitives != 0;
+        s->with_pixels += st->PSInvocations != 0;
+        s->with_samples += samples != 0;
+        s->clip_in += st->CInvocations;
+        s->clip_out += st->CPrimitives;
+        s->pixels += st->PSInvocations;
+        s->samples += samples;
+        if (recorded && probe.slots[i].mesh && detailed < 12)
+        {
+            detailed++;
+            rebox_log("d3d12_xs:   draw %u (%s): arguments %u %u %u%s%s, clipper %llu in %llu out, pixels %llu, samples "
+                      "%llu", i, console_draw_fate_name(probe.slots[i].fate), args[0], args[1], args[2],
+                      probe.slots[i].args_words ? "" : " (direct)",
+                      probe.slots[i].has_count ? (count ? ", counted" : ", count 0") : "",
+                      (unsigned long long)st->CInvocations, (unsigned long long)st->CPrimitives,
+                      (unsigned long long)st->PSInvocations, (unsigned long long)samples);
+        }
+    }
+    for (UINT k = 0; k < 3; k++)
+        if (sums[k].draws)
+            rebox_log("d3d12_xs:   %s: %u, %u resolved; arguments read for %u, %u of them with work (%llu groups or "
+                      "vertices x instances); primitives into the clipper in %u (%llu), out of it in %u (%llu); pixels "
+                      "in %u (%llu); samples passed in %u (%llu)", names[k], sums[k].draws, sums[k].resolved,
+                      sums[k].with_args, sums[k].with_groups, (unsigned long long)sums[k].groups,
+                      sums[k].with_clipped_in, (unsigned long long)sums[k].clip_in, sums[k].with_clipped_out,
+                      (unsigned long long)sums[k].clip_out, sums[k].with_pixels, (unsigned long long)sums[k].pixels,
+                      sums[k].with_samples, (unsigned long long)sums[k].samples);
+    {
+        const struct sums *m = &sums[0];
+        const char *verdict;
+        if (!m->resolved)
+            verdict = "no recorded mesh draw was resolved";
+        else if (m->with_samples)
+            verdict = "mesh draws passed samples: depth was reached (unless depth writes are off), so a view still at "
+                      "the clear value points at the read side (a later clear, another resource, HTILE)";
+        else if (m->with_clipped_out)
+            verdict = "primitives were rasterized but no sample passed: the depth or stencil test, depth bounds, "
+                      "scissor or viewport";
+        else if (m->with_clipped_in)
+            verdict = "primitives reached the clipper and all were clipped or culled: positions (w 0, NaN, outside) "
+                      "or cull flags";
+        else if (m->with_args && !m->with_groups)
+            verdict = "every argument record read was empty at the draw: the compute pass that fills them (meshlet "
+                      "culling) didn't run or wrote nothing";
+        else if (m->with_groups)
+            verdict = "argument records had groups but no primitive reached the clipper: vkd3d-proton read other "
+                      "arguments (REBOX_INDIRECT_BARRIER) or the mesh stage output no primitives (vertex or primitive "
+                      "counts, every primitive culled)";
+        else
+            verdict = "no primitive reached the clipper";
+        rebox_log("d3d12_xs:   so: %s", verdict);
+    }
+    InterlockedExchange(&probe.frame, 0);
+}
+
+void debug_view_draw_begin(ID3D12GraphicsCommandList *list, struct debug_view_list *l, ID3D12Resource *args,
+                           UINT64 args_offset, ID3D12Resource *count, UINT64 count_offset)
+{
+    void *picked = chosen;
+    LONG slot;
+
+    l->probe = 0;
+    if (!probe.frame || probe.frame != frame || !picked || (l->depth_res != picked && l->rt_res != picked))
+        return;
+    if ((slot = InterlockedIncrement(&probe.used) - 1) >= PROBE_SLOTS)
+        return;
+    if (args || count)
+    {
+        /* Every earlier write before the copies (not taken as an indirect barrier by vkd3d-proton,
+         * so the draw's own reading stays where it was). */
+        D3D12_GLOBAL_BARRIER g = { .SyncBefore = D3D12_BARRIER_SYNC_ALL, .SyncAfter = D3D12_BARRIER_SYNC_COPY,
+                                   .AccessBefore = D3D12_BARRIER_ACCESS_COMMON,
+                                   .AccessAfter = D3D12_BARRIER_ACCESS_COPY_SOURCE };
+        D3D12_BARRIER_GROUP group = { .Type = D3D12_BARRIER_TYPE_GLOBAL, .NumBarriers = 1, .pGlobalBarriers = &g };
+        ID3D12GraphicsCommandList7_Barrier((ID3D12GraphicsCommandList7 *)list, 1, &group);
+    }
+    if (args)
+    {
+        D3D12_RESOURCE_DESC d = ID3D12Resource_GetDesc(args);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && args_offset < d.Width)
+        {
+            UINT64 n = min((UINT64)PROBE_ARG_BYTES, d.Width - args_offset) & ~3ull;
+            ID3D12GraphicsCommandList_CopyBufferRegion(list, probe.readback, (UINT64)slot * PROBE_STRIDE + PROBE_ARGS,
+                                                       args, args_offset, n);
+            probe.slots[slot].args_words = (BYTE)(n / 4);
+        }
+    }
+    if (count)
+    {
+        D3D12_RESOURCE_DESC d = ID3D12Resource_GetDesc(count);
+        if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && count_offset + 4 <= d.Width)
+        {
+            ID3D12GraphicsCommandList_CopyBufferRegion(list, probe.readback, (UINT64)slot * PROBE_STRIDE + PROBE_COUNT,
+                                                       count, count_offset, 4);
+            probe.slots[slot].has_count = 1;
+        }
+    }
+    ID3D12GraphicsCommandList_BeginQuery(list, probe.occlusion, D3D12_QUERY_TYPE_OCCLUSION, slot);
+    ID3D12GraphicsCommandList_BeginQuery(list, probe.stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot);
+    l->probe = slot + 1;
+}
+
+void debug_view_draw(ID3D12GraphicsCommandList *list, struct debug_view_list *l, BOOL mesh, UINT fate)
 {
     fate = min(fate, DRAW_FATES - 1u);
+    if (l->probe)
+    {
+        UINT slot = l->probe - 1;
+        ID3D12GraphicsCommandList_EndQuery(list, probe.occlusion, D3D12_QUERY_TYPE_OCCLUSION, slot);
+        ID3D12GraphicsCommandList_EndQuery(list, probe.stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot);
+        ID3D12GraphicsCommandList_ResolveQueryData(list, probe.occlusion, D3D12_QUERY_TYPE_OCCLUSION, slot, 1,
+                                                   probe.readback, (UINT64)slot * PROBE_STRIDE);
+        ID3D12GraphicsCommandList_ResolveQueryData(list, probe.stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot, 1,
+                                                   probe.readback, (UINT64)slot * PROBE_STRIDE + PROBE_STATS);
+        probe.slots[slot].mesh = (BYTE)mesh;
+        probe.slots[slot].fate = (BYTE)fate;
+        probe.slots[slot].recorded = 1;
+        l->probe = 0;
+    }
     if (l->rt && targets[l->rt - 1].res == l->rt_res)
     {
         InterlockedIncrement(&targets[l->rt - 1].draws);
@@ -518,6 +786,7 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
     AcquireSRWLockExclusive(&targets_lock);
     now = InterlockedIncrement(&frame);
     i = choose(&why);
+    probe_report(now);
     if (!(now % 60))
         log_candidates(now);
     if (i >= 0)
@@ -530,6 +799,7 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
                       t->draws, t->mesh, t->binds);
         last = t->res;
         log_fates(now, t);
+        probe_arm(now, t);
         pick->desc = t->desc;
         pick->depth = t->depth;
         pick->res = t->res;
