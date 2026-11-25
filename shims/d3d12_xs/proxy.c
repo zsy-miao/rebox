@@ -4368,34 +4368,58 @@ static void memory_views_reap(LONG64 before)
         return;
     last = now;
     AcquireSRWLockExclusive(&memory_view_lock);
+    /* The shadow heaps are asked about a chunk at a time, under one hold of their lock: asked one
+     * by one, a world's thousands of retired views took the lock as often four times a second, each
+     * time behind the compiles reading it, with this lock held and the threads making views at
+     * addresses waiting on it. */
     for (SIZE_T i = 0; i < views_retired_count && n < ARRAYSIZE(stack); )
-        if (views_retired[i].at >= before)
-            i++;
-        else if (!shadow_untrack_unreferenced(views_retired[i].res))
-        {
-            struct own_note *d;
-            BOOL taken = FALSE;
-            /* Past the GPU, but slots hold it: a deferred one's memory goes back meanwhile. */
-            if (InterlockedCompareExchange64(&deferred_given, 0, 0))
+    {
+        enum { CHUNK = 1024 };
+        ID3D12Resource *ask[CHUNK];
+        SIZE_T where[CHUNK];
+        BOOL unreferenced[CHUNK];
+        UINT m = 0, answered;
+
+        for (; i < views_retired_count && m < CHUNK; i++)
+            if (views_retired[i].at < before)
             {
-                AcquireSRWLockExclusive(&deferred_lock);
-                if ((d = deferred_find(views_retired[i].res)))
-                {
-                    deferred_take(d);
-                    taken = !d->heap;
-                }
-                ReleaseSRWLockExclusive(&deferred_lock);
+                ask[m] = views_retired[i].res;
+                where[m++] = i;
             }
-            held++;
-            if (!taken) /* a decommitted one holds no memory */
-                held_bytes += views_retired[i].bytes;
-            i++;
-        }
-        else
-        {
-            stack[n++] = views_retired[i].res;
+        answered = m ? shadow_untrack_unreferenced_many(ask, m, ARRAYSIZE(stack) - n, unreferenced) : 0;
+        for (UINT k = 0; k < answered; k++)
+            if (!unreferenced[k])
+            {
+                struct own_note *d;
+                BOOL taken = FALSE;
+                /* Past the GPU, but slots hold it: a deferred one's memory goes back meanwhile. */
+                if (InterlockedCompareExchange64(&deferred_given, 0, 0))
+                {
+                    AcquireSRWLockExclusive(&deferred_lock);
+                    if ((d = deferred_find(ask[k])))
+                    {
+                        deferred_take(d);
+                        taken = !d->heap;
+                    }
+                    ReleaseSRWLockExclusive(&deferred_lock);
+                }
+                held++;
+                if (!taken) /* a decommitted one holds no memory */
+                    held_bytes += views_retired[where[k]].bytes;
+            }
+            else
+            {
+                stack[n++] = ask[k];
+                views_retired[where[k]].res = NULL; /* taken out below */
+            }
+        if (answered < m)
+            break;
+    }
+    for (SIZE_T i = 0; i < views_retired_count; )
+        if (!views_retired[i].res)
             views_retired[i] = views_retired[--views_retired_count];
-        }
+        else
+            i++;
     views_released_total += n;
     views_held = held;
     views_held_bytes = held_bytes;

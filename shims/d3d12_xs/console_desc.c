@@ -159,6 +159,16 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
     if (rd->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
         return ID3D12Resource_GetGPUVirtualAddress(res);
     bucket = &texture_ids[((ULONG_PTR)res >> 4) & 4095];
+    /* Known already, the usual case (every view written of it asks): looked up shared, so the
+     * compiles reading T#s don't queue behind each view the title writes. */
+    AcquireSRWLockShared(&texture_lock);
+    for (t = *bucket; t && t->res != res; t = t->next)
+        ;
+    if (t)
+        va = t->va;
+    ReleaseSRWLockShared(&texture_lock);
+    if (va)
+        return va;
     AcquireSRWLockExclusive(&texture_lock);
     for (t = *bucket; t && t->res != res; t = t->next)
         ;
