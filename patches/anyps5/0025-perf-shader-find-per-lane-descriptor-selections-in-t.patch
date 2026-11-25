@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 15:00:00 +0000
+Subject: [PATCH 25/25] perf(shader): find per-lane descriptor selections in
+ their block once per web
+
+LaneSelector found the tuple's last instruction in its block by walking
+the whole block and comparing each instruction with every dword of the
+tuple, at every per-lane selection of a descriptor web, and
+SplitDescriptorWeb then put each selection node in place with
+InsertInstructionBefore, which walks the block again to find its place.
+A web is built for every split image access and has up to 512
+selections; in one title's mesh shaders (blocks of tens of thousands of
+instructions) source preparation ran for minutes per shader: five of
+eight background compile threads sat in these two walks from a world's
+start to the end of the run (stack samples: 211 in LaneSelector's walk,
+104 in InsertInstructionBefore's).
+
+A web now indexes a block's instructions the first time a selection is
+looked up in it (the blocks don't change until the web is built) and
+keeps the list position each node goes before, so the nodes are placed
+without searching. The selections, their order and the IR are as
+before.
+
+Offline (sa5_check ms, no guest memory, one thread), the title's 526
+mesh shaders with a clamped VOP3 v_mad_legacy_f32, 29 of which ran past
+30 minutes each: before, the tenth was still running after 13 minutes;
+now all 526 take 796 s, the slowest 60 s, and 178 compile, validate and
+finalize. The results the old build reached are the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../recompiler/Optimization/src/ResourceTracker.cpp | 36 ++++++++++++++------
+ 1 file changed, 26 insertions(+), 10 deletions(-)
+
+diff --git a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+index fda9844..5ed5aa5 100644
+--- a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+@@ -1597,9 +1597,13 @@ private:
+         std::vector<std::vector<IrValue*>> arms;
+         std::map<std::vector<IrValue*>, IrValue*> selectors;
+         std::vector<std::pair<IrBlock*, IrValue*>> phis;
+-        std::vector<std::tuple<IrBlock*, IrValue*, IrValue*>> lanes;
++        // Each per-lane selection node, with where it goes in its block (end: appended).
++        std::vector<std::tuple<IrBlock*, IrInstructionList::iterator, IrValue*>> lanes;
+         std::unordered_map<IrValue*, IrValue*> resolved;
+         std::unordered_map<const IrBlock*, std::size_t> order;
++        // Each instruction's index and place in the blocks a per-lane selection was looked up in,
++        // indexed once per web: the blocks don't change until the web is built.
++        std::unordered_map<const IrBlock*, std::unordered_map<const IrValue*, std::pair<std::size_t, IrInstructionList::iterator>>> positions;
+     };
+ 
+     static bool StrictDescriptorWebs() {
+@@ -1795,17 +1799,30 @@ private:
+                 return GiveUp(web, "a per-lane descriptor selection mixes dwords selected differently");
+             }
+         }
++        // The tuple's last instruction in the block. Scanning the block at every selection made a
++        // mesh shader's descriptor webs take minutes (blocks of tens of thousands of instructions,
++        // hundreds of selections per web, a web per image access).
+         auto& instructions = block->Instructions();
++        auto [positions, fresh] = web.positions.try_emplace(block);
++        if (fresh) {
++            std::size_t index = 0;
++            for (auto it = instructions.begin(); it != instructions.end(); ++it) {
++                positions->second.insert_or_assign(*it, std::make_pair(index++, it));
++            }
++        }
+         auto latest = instructions.end();
+-        for (auto it = instructions.begin(); it != instructions.end(); ++it) {
+-            if (std::ranges::find(tuple, *it) != tuple.end()) {
+-                latest = it;
++        std::size_t latestIndex = 0;
++        for (const IrValue* value : tuple) {
++            const auto found = positions->second.find(value);
++            if (found != positions->second.end() && (latest == instructions.end() || found->second.first > latestIndex)) {
++                latestIndex = found->second.first;
++                latest = found->second.second;
+             }
+         }
+         if (latest == instructions.end()) {
+             return GiveUp(web, "a per-lane descriptor selection is not in its block");
+         }
+-        IrValue* before = std::next(latest) == instructions.end() ? nullptr : *std::next(latest);
++        const auto before = std::next(latest);
+         IrValue* leftSelector = WebSelector(std::move(left), web, position);
+         if (leftSelector == nullptr) {
+             return nullptr;
+@@ -1844,12 +1861,11 @@ private:
+             for (const auto& [block, phi] : web.phis) {
+                 block->InsertInstructionBefore(nullptr, phi);
+             }
++            // At the places found while building (list iterators stay valid across insertions);
++            // InsertInstructionBefore searched the block for each node.
+             for (const auto& [block, before, node] : web.lanes) {
+-                if (before == nullptr) {
+-                    block->AppendInstruction(node);
+-                } else {
+-                    block->InsertInstructionBefore(before, node);
+-                }
++                block->Instructions().insert(before, node);
++                node->SetParent(block);
+             }
+         } else {
+             for (const auto& [block, phi] : web.phis) {
