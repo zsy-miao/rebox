@@ -22,7 +22,8 @@
  *
  * AnyPS5 returns each binding by value (the descriptor words it resolved).
  * ReboxShadowFind maps those words back to the vkd3d-proton descriptor
- * that was written alongside them, through a hash of every shadow slot. */
+ * that was written alongside them, through an index of every shadow slot
+ * by its words (struct group). */
 
 #define COBJMACROS
 #define WIDL_C_INLINE_WRAPPERS
@@ -39,7 +40,6 @@
 
 #define TITLE_BASE 0x10000000ull
 #define TITLE_ALIGN 0x10000ull
-#define BUCKETS (1u << 18)
 #define INDEXES 3 /* exact; loose (T#/S# with rewritable fields masked); loose V# (its first 3 words) */
 
 static volatile LONG placed_heaps; /* heaps with title_cpu: no translation while 0 */
@@ -68,6 +68,10 @@ struct shadow_heap
     ID3D12Resource **res;          /* CBV/SRV/UAV: count entries, the resource each slot's view is of
                                     * (not referenced), made on the first view of one */
     ID3D12Resource **reserved_res; /* the same for the reserved tail (shadow_reserve_srv) */
+    struct link *links[INDEXES];   /* count entries each: the slot's place in its group, made with
+                                    * the first slot indexed */
+    UINT64 *seq;                   /* count entries: when each slot was indexed (index_seq) */
+    BYTE *kinds;                   /* count entries: the view each slot was indexed with */
     struct shadow_heap *next;
 };
 
@@ -81,12 +85,28 @@ struct uav_texture
     BOOL has_desc;
 };
 
-struct entry
+/* The slots of one heap whose words give one key of one index, by view kind, each kind's most
+ * recently indexed first. A lookup wants the newest slot with its words (of a wanted view, if one
+ * is): the heads give it. A chain of entries per key across heaps, walked at every lookup and from
+ * its far end at every overwrite, grew to thousands of entries in a world (a ring heap holds a
+ * common texture's descriptor in a slot per draw), under the lock: compiles at the title threads
+ * took milliseconds each, and the threads writing descriptors and retiring views queued behind. */
+#define VIEW_KINDS (SHADOW_VIEW_SAMPLER + 1)
+struct group
 {
     UINT32 key[8];
     struct shadow_heap *heap;
-    UINT index;
-    struct entry *next;
+    UINT64 hash;
+    UINT which, count;
+    UINT head[VIEW_KINDS];         /* the newest slot of each view kind, ~0u none */
+    struct group *next;            /* in its table bucket */
+};
+
+/* A slot's place in one index: its group and its neighbours in its kind's list (~0u none). */
+struct link
+{
+    struct group *group;
+    UINT prev, next;
 };
 
 static SRWLOCK lock = SRWLOCK_INIT;
@@ -207,6 +227,28 @@ BOOL shadow_untrack_unreferenced(ID3D12Resource *res)
     return done;
 }
 
+UINT shadow_untrack_unreferenced_many(ID3D12Resource *const *res, UINT count, UINT max_done, BOOL *done)
+{
+    UINT i, taken = 0;
+
+    AcquireSRWLockExclusive(&lock);
+    for (i = 0; i < count && taken < max_done; i++)
+    {
+        struct tracked *t = tracked_find(res[i]);
+        done[i] = TRUE;
+        if (t && t->refs > 0)
+            done[i] = FALSE;
+        else if (t)
+        {
+            t->res = TOMBSTONE;
+            tracked_count--;
+        }
+        taken += done[i];
+    }
+    ReleaseSRWLockExclusive(&lock);
+    return i;
+}
+
 LONG shadow_view_refs(ID3D12Resource *res)
 {
     struct tracked *t;
@@ -233,7 +275,10 @@ ID3D12Resource *WINAPI ReboxShadowSlotResource(SIZE_T cpu)
     ReleaseSRWLockShared(&lock);
     return res;
 }
-static struct entry *buckets[INDEXES][BUCKETS];
+/* The groups by heap, index and key: a table of chains, grown to keep about one group a bucket. */
+static struct group **group_table;
+static SIZE_T group_buckets, group_count;
+static UINT64 index_seq; /* bumped as each slot is indexed, under the lock exclusive */
 static UINT64 next_title_va = TITLE_BASE;
 
 /* REBOX_HEAP_VA: title (default), real or virtual; REBOX_REAL_HEAP_VA=0
@@ -295,12 +340,14 @@ static void make_key(const UINT32 *words, UINT word_count, BOOL sampler, UINT32 
     memcpy(key, words, (word_count < 8 ? word_count : 8) * sizeof(*key));
 }
 
-static UINT hash_key(const UINT32 key[8])
+static UINT64 group_hash(const struct shadow_heap *h, UINT which, const UINT32 key[8])
 {
-    UINT32 h = 2166136261u;
+    UINT64 x = ((UINT64)(ULONG_PTR)h >> 4) * 0x9e3779b97f4a7c15ull ^ which;
     for (int i = 0; i < 8; i++)
-        h = (h ^ key[i]) * 16777619u;
-    return h % BUCKETS;
+        x = (x ^ key[i]) * 0x100000001b3ull;
+    x ^= x >> 31;
+    x *= 0xbf58476d1ce4e5b9ull;
+    return x ^ x >> 29;
 }
 
 static void slot_key(const struct shadow_heap *h, UINT index, UINT32 key[8])
@@ -332,49 +379,175 @@ static void index_key(const UINT32 key[8], BOOL sampler, int which, UINT32 out[8
         memset(out + 3, 0, 5 * sizeof(*out));
 }
 
+static int heap_indexes(const struct shadow_heap *h)
+{
+    return h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? 2 : INDEXES;
+}
+
+/* Under the lock: the group of heap h's index which for key, or NULL. */
+static struct group *group_find(const struct shadow_heap *h, UINT which, const UINT32 key[8])
+{
+    UINT64 hash;
+    if (!group_count)
+        return NULL;
+    hash = group_hash(h, which, key);
+    for (struct group *g = group_table[hash & (group_buckets - 1)]; g; g = g->next)
+        if (g->hash == hash && g->heap == h && g->which == which && !memcmp(g->key, key, sizeof(g->key)))
+            return g;
+    return NULL;
+}
+
+/* Under the lock, exclusive: group_find's, or a new empty one; NULL without memory. */
+static struct group *group_get(struct shadow_heap *h, UINT which, const UINT32 key[8])
+{
+    struct group *g;
+    SIZE_T b;
+
+    if ((g = group_find(h, which, key)))
+        return g;
+    if (group_count >= group_buckets)
+    {
+        SIZE_T n = group_buckets ? group_buckets * 2 : 1u << 16;
+        struct group **grown = calloc(n, sizeof(*grown));
+        if (grown)
+        {
+            for (SIZE_T i = 0; i < group_buckets; i++)
+                while (group_table[i])
+                {
+                    struct group *m = group_table[i];
+                    group_table[i] = m->next;
+                    m->next = grown[m->hash & (n - 1)];
+                    grown[m->hash & (n - 1)] = m;
+                }
+            free(group_table);
+            group_table = grown;
+            group_buckets = n;
+        }
+        else if (!group_buckets)
+            return NULL;
+    }
+    if (!(g = malloc(sizeof(*g))))
+        return NULL;
+    memcpy(g->key, key, sizeof(g->key));
+    g->heap = h;
+    g->hash = group_hash(h, which, key);
+    g->which = which;
+    g->count = 0;
+    memset(g->head, 0xff, sizeof(g->head));
+    b = g->hash & (group_buckets - 1);
+    g->next = group_table[b];
+    group_table[b] = g;
+    group_count++;
+    return g;
+}
+
+/* Under the lock, exclusive: g, now empty, goes. */
+static void group_remove(struct group *g)
+{
+    for (struct group **p = &group_table[g->hash & (group_buckets - 1)]; *p; p = &(*p)->next)
+        if (*p == g)
+        {
+            *p = g->next;
+            group_count--;
+            free(g);
+            return;
+        }
+}
+
+/* Under the lock: the newest slot of g whose view is in kinds (a mask of 1 << enum shadow_view)
+ * and, with words, that loose_match finds them in; ~0u for none. */
+static BOOL loose_match(const UINT32 *slot, const UINT32 *words, UINT n, BOOL sampler);
+static UINT group_newest(const struct group *g, UINT kinds, const UINT32 *words, UINT n, BOOL sampler)
+{
+    const struct shadow_heap *h = g->heap;
+    UINT best = ~0u;
+    for (UINT k = 0; k < VIEW_KINDS; k++)
+        if (kinds & (1u << k))
+            /* Each list is newest first: its first match is its newest. Every slot of a group has
+             * the words loose_match compares (its masks are the index's) for 4 or 8 of them. */
+            for (UINT i = g->head[k]; i != ~0u; i = h->links[g->which][i].next)
+                if (!words || loose_match((const UINT32 *)(h->data + (SIZE_T)i * h->stride), words, n, sampler))
+                {
+                    if (best == ~0u || h->seq[i] > h->seq[best])
+                        best = i;
+                    break;
+                }
+    return best;
+}
+
+/* Under the lock, exclusive. */
 static void unindex(struct shadow_heap *h, UINT index)
 {
-    BOOL sampler = h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    UINT32 key[8], k[8];
-    struct entry **p;
-
-    slot_key(h, index, key);
-    if (key_is_null(key))
+    if (!h->kinds)
         return;
-    for (int which = 0; which < (sampler ? 2 : INDEXES); which++)
+    for (int which = 0; which < heap_indexes(h); which++)
     {
-        index_key(key, sampler, which, k);
-        for (p = &buckets[which][hash_key(k)]; *p; p = &(*p)->next)
-            if ((*p)->heap == h && (*p)->index == index)
-            {
-                struct entry *e = *p;
-                *p = e->next;
-                free(e);
-                break;
-            }
+        struct link *links = h->links[which], *l = &links[index];
+        struct group *g = l->group;
+        if (!g)
+            continue;
+        if (l->prev != ~0u)
+            links[l->prev].next = l->next;
+        else
+            g->head[h->kinds[index]] = l->next;
+        if (l->next != ~0u)
+            links[l->next].prev = l->prev;
+        l->group = NULL;
+        if (!--g->count)
+            group_remove(g);
     }
 }
 
+/* Under the lock, exclusive: the slot, its words and view just written, is found by them. */
 static void index_slot(struct shadow_heap *h, UINT index)
 {
     BOOL sampler = h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    UINT32 key[8];
+    UINT32 key[8], k[8];
+    BYTE kind;
 
     slot_key(h, index, key);
     if (key_is_null(key))
         return;
-    for (int which = 0; which < (sampler ? 2 : INDEXES); which++)
+    if (!h->kinds)
     {
-        struct entry *e;
-        UINT b;
-        if (!(e = malloc(sizeof(*e))))
+        BOOL ok = (h->seq = malloc(h->count * sizeof(*h->seq))) && (h->kinds = malloc(h->count));
+        for (int which = 0; ok && which < heap_indexes(h); which++)
+            ok = !!(h->links[which] = calloc(h->count, sizeof(*h->links[which])));
+        if (!ok)
+        {
+            static LONG logged;
+            if (!InterlockedExchange(&logged, 1))
+                rebox_log("d3d12_xs: no memory to index a %u-descriptor shadow heap; its slots aren't found", h->count);
+            for (int which = 0; which < INDEXES; which++)
+            {
+                free(h->links[which]);
+                h->links[which] = NULL;
+            }
+            free(h->seq);
+            free(h->kinds);
+            h->seq = NULL;
+            h->kinds = NULL;
             return;
-        index_key(key, sampler, which, e->key);
-        e->heap = h;
-        e->index = index;
-        b = hash_key(e->key);
-        e->next = buckets[which][b];
-        buckets[which][b] = e;
+        }
+    }
+    unindex(h, index); /* callers unindex it first; if one didn't, it isn't in two places */
+    kind = h->views[index] < VIEW_KINDS ? h->views[index] : SHADOW_VIEW_NONE;
+    h->kinds[index] = kind;
+    h->seq[index] = ++index_seq;
+    for (int which = 0; which < heap_indexes(h); which++)
+    {
+        struct link *links = h->links[which], *l = &links[index];
+        struct group *g;
+        index_key(key, sampler, which, k);
+        if (!(g = group_get(h, which, k)))
+            continue;
+        l->group = g;
+        l->prev = ~0u;
+        l->next = g->head[kind];
+        if (l->next != ~0u)
+            links[l->next].prev = index;
+        g->head[kind] = index;
+        g->count++;
     }
 }
 
@@ -390,8 +563,12 @@ static void heap_free(struct shadow_heap *h)
 {
     InterlockedIncrement(&regions_generation);
     console_bindings_changed(FALSE);
-    for (UINT i = 0; i < h->count; i++)
+    for (UINT i = 0; h->kinds && i < h->count; i++)
         unindex(h, i);
+    for (int which = 0; which < INDEXES; which++)
+        free(h->links[which]);
+    free(h->seq);
+    free(h->kinds);
     for (UINT i = 0; h->res && i < h->count; i++)
         ref_change(h->res[i], NULL);
     for (UINT i = 0; h->reserved_res && i < h->reserved_used; i++)
@@ -1112,47 +1289,70 @@ BOOL shadow_find_index(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sample
     return shadow_find_index_view(heap_cpu, words, n, sampler, loose, 0, index);
 }
 
-/* A slot's view is one of views (a mask of 1 << enum shadow_view; 0 takes any). */
-static BOOL view_wanted(const struct entry *e, UINT views)
+/* Under the lock: the newest slot, in the heaps at heap_cpu, in index which under key k whose view
+ * is in kinds (and, with words, that loose_match finds them in); FALSE for none. */
+static BOOL newest_at(SIZE_T heap_cpu, UINT which, const UINT32 k[8], UINT kinds, const UINT32 *words, UINT n,
+                      BOOL sampler, UINT *index)
 {
-    return !views || (e->index < e->heap->count && (views & (1u << e->heap->views[e->index])));
+    UINT64 best_seq = 0;
+    BOOL found = FALSE;
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+    {
+        const struct group *g;
+        UINT i;
+        if (h->cpu_start != heap_cpu || !(g = group_find(h, which, k))
+                || (i = group_newest(g, kinds, words, n, sampler)) == ~0u)
+            continue;
+        if (!found || h->seq[i] > best_seq)
+        {
+            best_seq = h->seq[i];
+            *index = i;
+            found = TRUE;
+        }
+    }
+    return found;
 }
 
 BOOL shadow_find_index_view(SIZE_T heap_cpu, const UINT32 *words, UINT n, BOOL sampler, BOOL loose, UINT views,
                             UINT *index)
 {
+    const UINT all = (1u << VIEW_KINDS) - 1;
     UINT32 key[8];
     BOOL found = FALSE, wanted = FALSE;
 
     if (!words || !n || n > 8)
         return FALSE;
     make_key(words, n, sampler, key);
+    views &= all;
     AcquireSRWLockShared(&lock);
-    /* The first slot with these words, or one holding a view of the wanted kind: a texture's
-     * single-level SRV and UAV have the same T#, and a storage image bound to the SRV's slot (or a
-     * sampled one to the UAV's) was refused. */
-    for (struct entry *e = buckets[0][hash_key(key)]; e && !wanted; e = e->next)
-        if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, key, sizeof(key)) && (!found || view_wanted(e, views)))
-        {
-            *index = e->index;
-            found = TRUE;
-            wanted = view_wanted(e, views);
-        }
+    /* The newest slot with these words, or the newest holding a view of the wanted kind: a
+     * texture's single-level SRV and UAV have the same T#, and a storage image bound to the SRV's
+     * slot (or a sampled one to the UAV's) was refused. views 0 takes any. */
+    if (views && newest_at(heap_cpu, 0, key, views, NULL, 0, sampler, index))
+        found = wanted = TRUE;
+    else if (newest_at(heap_cpu, 0, key, all, NULL, 0, sampler, index))
+    {
+        found = TRUE;
+        wanted = !views;
+    }
     /* Loose: through the masked index, then loose_match on the candidates (heaps hold up to a
-     * million descriptors; scanning one per binding made compiles slow). */
+     * million descriptors; scanning one per binding made compiles slow). Once something matched
+     * exactly, only a slot of a wanted view replaces it. */
     if (loose && !wanted)
     {
         UINT32 k[8];
-        index_key(key, sampler, !sampler && n == 4 ? 2 : 1, k);
-        for (struct entry *e = buckets[!sampler && n == 4 ? 2 : 1][hash_key(k)]; e && !wanted; e = e->next)
-            if (e->heap->cpu_start == heap_cpu && !memcmp(e->key, k, sizeof(k)) && (!found || view_wanted(e, views))
-                    && loose_match((const UINT32 *)(e->heap->data + (SIZE_T)e->index * e->heap->stride), words, n,
-                                   sampler))
-            {
-                *index = e->index;
-                found = TRUE;
-                wanted = view_wanted(e, views);
-            }
+        UINT which = !sampler && n == 4 ? 2 : 1, i;
+        index_key(key, sampler, which, k);
+        if (views && newest_at(heap_cpu, which, k, views, words, n, sampler, &i))
+        {
+            *index = i;
+            found = TRUE;
+        }
+        else if (!found && newest_at(heap_cpu, which, k, all, words, n, sampler, &i))
+        {
+            *index = i;
+            found = TRUE;
+        }
     }
     ReleaseSRWLockShared(&lock);
     return found;
@@ -1689,20 +1889,31 @@ BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size)
  * view, so any of them will do. */
 BOOL WINAPI ReboxShadowFind(const UINT32 *words, UINT word_count, BOOL sampler, SIZE_T *cpu)
 {
-    struct entry *best = NULL;
+    const struct shadow_heap *best = NULL;
     UINT32 key[8];
+    UINT best_index = 0;
 
     if (!words || !word_count)
         return FALSE;
     make_key(words, word_count, sampler, key);
     AcquireSRWLockShared(&lock);
-    for (struct entry *e = buckets[0][hash_key(key)]; e; e = e->next)
-        if (!memcmp(e->key, key, sizeof(key)) && (sampler == (e->heap->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
-                && (!best || (e->heap->shader_visible && !best->heap->shader_visible)))
-            best = e;
+    /* The newest slot with them in a shader-visible heap, else the newest in any. */
+    for (struct shadow_heap *h = heaps; h; h = h->next)
+    {
+        const struct group *g;
+        UINT i;
+        if (sampler != (h->type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) || !(g = group_find(h, 0, key))
+                || (i = group_newest(g, (1u << VIEW_KINDS) - 1, NULL, 0, sampler)) == ~0u)
+            continue;
+        if (!best || (h->shader_visible && !best->shader_visible)
+                || (h->shader_visible == best->shader_visible && h->seq[i] > best->seq[best_index]))
+        {
+            best = h;
+            best_index = i;
+        }
+    }
     if (best && cpu) /* the title's handle for a heap in its memory, as the API gives it */
-        *cpu = (best->heap->title_cpu ? best->heap->title_cpu : best->heap->cpu_start)
-                + (SIZE_T)best->index * best->heap->stride;
+        *cpu = (best->title_cpu ? best->title_cpu : best->cpu_start) + (SIZE_T)best_index * best->stride;
     ReleaseSRWLockShared(&lock);
     return best != NULL;
 }

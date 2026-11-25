@@ -4010,6 +4010,116 @@ done:
     if (heap) XSLOT(heap, 2, ULONG)(heap);
 }
 
+/* A ring heap as a title fills one, a draw's descriptors copied into fresh slots each time: one
+ * texture's T# in every slot. A lookup finds the newest slot holding it (of the wanted view, if one
+ * is), an overwritten slot stops being found, and lookups and overwrites stay cheap however many
+ * slots hold the same words (each walked them all, under the shadow lock). */
+static void test_shadow_ring(void *dev)
+{
+    enum { RING = 16384 };
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    UINT (WINAPI *find_index)(SIZE_T, const UINT32 *, UINT, UINT) = (void *)GetProcAddress(m, "ReboxShadowFindIndex");
+    HRESULT (WINAPI *shadow_heap)(SIZE_T, UINT64 *, void **, UINT *, UINT *) =
+            (void *)GetProcAddress(m, "ReboxShadowHeap");
+    D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, RING,
+                                      D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0 };
+    D3D12_DESCRIPTOR_HEAP_DESC cd = { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_RESOURCE_DESC td = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 32, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, { 1, 0 },
+                               D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS };
+    void *heap = NULL, *cpu_heap = NULL;
+    ID3D12Resource *tex = NULL;
+    UINT32 *res, *src_words, words[8];
+    UINT64 title_va;
+    UINT inc, stride, count, src_stride, src_count, found;
+    SIZE_T cpu, cpu_only;
+    LARGE_INTEGER a, b, f;
+    double fill_us, lookup_ns, refill_us;
+    HRESULT hr;
+    void (STDMETHODCALLTYPE *copy)(void *, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE);
+
+    if (!find_index || !shadow_heap) return;
+    hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &hd,
+            &IID_ID3D12DescriptorHeap, &heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 14, HRESULT, const D3D12_DESCRIPTOR_HEAP_DESC *, REFIID, void **)(dev, &cd,
+                &IID_ID3D12DescriptorHeap, &cpu_heap);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 27, HRESULT, const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS, const D3D12_RESOURCE_DESC *,
+                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **)(dev, &hp, D3D12_HEAP_FLAG_NONE,
+                &td, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&tex);
+    CHECK(SUCCEEDED(hr), "objects for the shadow ring test (%#lx)", hr);
+    if (FAILED(hr)) goto done;
+    cpu = XSLOT(heap, 9, SIZE_T)(heap);
+    cpu_only = XSLOT(cpu_heap, 9, SIZE_T)(cpu_heap);
+    inc = XSLOT(dev, 15, UINT, D3D12_DESCRIPTOR_HEAP_TYPE)(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    copy = XSLOT(dev, 24, void, UINT, SIZE_T, SIZE_T, D3D12_DESCRIPTOR_HEAP_TYPE);
+    if (FAILED(shadow_heap(cpu, &title_va, (void **)&res, &stride, &count))
+            || FAILED(shadow_heap(cpu_only, &title_va, (void **)&src_words, &src_stride, &src_count)))
+    {
+        printf("skip shadow ring: no shadow for this device\n");
+        goto done;
+    }
+    /* CPU slot 0 an SRV of the texture, 1 a UAV of it, 2 never written. */
+    XSLOT(dev, 18, void, ID3D12Resource *, const D3D12_SHADER_RESOURCE_VIEW_DESC *, SIZE_T)(dev, tex, NULL, cpu_only);
+    XSLOT(dev, 19, void, ID3D12Resource *, ID3D12Resource *, const D3D12_UNORDERED_ACCESS_VIEW_DESC *, SIZE_T)(dev,
+            tex, NULL, NULL, cpu_only + inc);
+    memcpy(words, src_words, sizeof(words));
+    if (memcmp(words, (BYTE *)src_words + src_stride, sizeof(words)))
+    {
+        printf("skip shadow ring: the texture's SRV and UAV have different T#s here\n");
+        goto done;
+    }
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    for (UINT i = 0; i < RING; i++)
+        copy(dev, 1, cpu + (SIZE_T)i * inc, cpu_only, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    QueryPerformanceCounter(&b);
+    fill_us = (double)(b.QuadPart - a.QuadPart) * 1e6 / f.QuadPart / RING;
+    CHECK(!memcmp(res + (RING - 1) * stride / 4, words, sizeof(words)), "the ring's slots hold the texture's T#");
+    found = find_index(cpu, words, 8, 1u << 1 /* SHADOW_VIEW_SRV_TEXTURE */);
+    CHECK(found == RING - 1, "a T# in every slot of a ring finds the newest (%u)", found);
+    /* No slot holds a UAV: the newest slot of any view; every lookup asks, as a storage image's did. */
+    QueryPerformanceCounter(&a);
+    for (UINT i = 0; i < 20000; i++)
+        found = find_index(cpu, words, 8, 1u << 4 /* SHADOW_VIEW_UAV_TEXTURE */);
+    QueryPerformanceCounter(&b);
+    lookup_ns = (double)(b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart / 20000;
+    CHECK(found == RING - 1, "with no slot of the wanted view, the newest slot of any (%u)", found);
+    copy(dev, 1, cpu + 5 * inc, cpu_only + inc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    found = find_index(cpu, words, 8, 1u << 4);
+    CHECK(found == 5, "a storage image's T# finds the one UAV slot among the SRVs (%u)", found);
+    found = find_index(cpu, words, 8, 1u << 1);
+    CHECK(found == RING - 1, "a sampled image's T# still finds the newest SRV (%u)", found);
+    found = find_index(cpu, words, 8, 0);
+    CHECK(found == 5, "with no view asked for, the newest slot (%u)", found);
+    copy(dev, 1, cpu + (RING - 1) * inc, cpu_only + 2 * inc, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    found = find_index(cpu, words, 8, 1u << 1);
+    CHECK(found == RING - 2, "an overwritten slot isn't found: the next newest is (%u)", found);
+    /* Around the ring again, oldest slot first: each overwrite takes its slot out of the T#'s. */
+    QueryPerformanceCounter(&a);
+    for (UINT i = 0; i < RING; i++)
+        copy(dev, 1, cpu + (SIZE_T)i * inc, cpu_only, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    QueryPerformanceCounter(&b);
+    refill_us = (double)(b.QuadPart - a.QuadPart) * 1e6 / f.QuadPart / RING;
+    found = find_index(cpu, words, 8, 1u << 4);
+    CHECK(found == RING - 1, "once the UAV slot is overwritten, a storage image's T# finds the newest SRV (%u)",
+          found);
+    copy(dev, 1, cpu + 7 * inc, cpu_only, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    found = find_index(cpu, words, 8, 1u << 1);
+    CHECK(found == 7, "a slot written again is the newest (%u)", found);
+    printf("info shadow ring of %u slots holding one T#: copies %.2f us each, again around it %.2f us, lookups %.0f ns\n",
+           RING, fill_us, refill_us, lookup_ns);
+    /* Generous bounds, for slow machines: a walk of the slots took ~100 us a lookup at this size. */
+    CHECK(lookup_ns < 20000, "a lookup doesn't walk the slots holding the same T# (%.0f ns)", lookup_ns);
+    CHECK(refill_us < 200, "an overwrite doesn't walk the slots holding the same T# (%.2f us)", refill_us);
+
+done:
+    if (tex) ID3D12Resource_Release(tex);
+    if (cpu_heap) XSLOT(cpu_heap, 2, ULONG)(cpu_heap);
+    if (heap) XSLOT(heap, 2, ULONG)(heap);
+}
+
 /* RDNA2 compute shader for the deferred dispatch test (llvm-mc -mcpu=gfx1030): stores
  * 0x1234abcd through the V# at the start of the descriptor table s[0:1] points at. It opens with
  * the FLAT_SCRATCH setup console shaders have, which d3d12_xs NOPs out.
@@ -7269,6 +7379,7 @@ static void test_xbox(void)
     test_console_graphics(dev, queue);
     test_shadow_heap(dev);
     test_shadow_views(dev);
+    test_shadow_ring(dev);
     test_console_bindings(dev);
     test_console_dispatch(dev, queue);
     test_present(dev, queue);

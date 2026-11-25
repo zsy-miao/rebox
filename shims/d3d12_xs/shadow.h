@@ -87,5 +87,8 @@ BOOL shadow_reserve_srv(SIZE_T heap_cpu, ID3D12Resource *res, UINT *index);
  * reserved tails null ones. */
 void shadow_track(ID3D12Resource *res);
 BOOL shadow_untrack_unreferenced(ID3D12Resource *res);
+/* shadow_untrack_unreferenced of res[0], res[1]... in order under one hold of the lock, its answers in
+ * done[], until max_done of them are TRUE; returns how many were answered. */
+UINT shadow_untrack_unreferenced_many(ID3D12Resource *const *res, UINT count, UINT max_done, BOOL *done);
 LONG shadow_view_refs(ID3D12Resource *res);
 void shadow_forget_reserved(ID3D12Resource *res);
