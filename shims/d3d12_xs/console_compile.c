@@ -39,9 +39,10 @@
 #include "title_textures.h"
 
 #define TITLE_BASE 0x10000000ull
-/* Shadow heaps and GPU memory chunks handed to AnyPS5 and mapped in its BDA page table. A world in
- * the target title passed 64 chunks; those left out made user-data pointers into them unreadable
- * (mesh stages refused by the SRT walk, compute reads of "inaccessible" memory). */
+/* The most shadow heaps handed to AnyPS5 and mapped in its BDA page table. GPU memory chunks have
+ * no limit (all_chunks): a world in the target title passed 64, then 1024, and those left out made
+ * user-data pointers into them unreadable (mesh stages refused by the SRT walk, compute reads of
+ * "inaccessible" memory). */
 #define MAX_REGIONS 1024
 
 /* A region list that came back full may have left regions out: logged once per list. */
@@ -51,6 +52,41 @@ static void note_regions_full(const char *what, UINT n, UINT max)
     LONG *flag = &logged[what[0] == 'G'];
     if (n >= max && !InterlockedExchange(flag, 1))
         rebox_log("AnyPS5 regions: %s filled all %u entries; later ones are left out", what, max);
+}
+
+static int compare_chunks(const void *a, const void *b)
+{
+    const struct gpu_memory_region *x = a, *y = b;
+    return x->gpu < y->gpu ? -1 : x->gpu > y->gpu;
+}
+
+/* Every GPU memory chunk, by GPU VA, in a buffer the caller frees (NULL if out of memory).
+ * gpu_memory_regions lists the newest first, so a list cut at a fixed length left out the oldest:
+ * in run 0014 of the target title (past 1,024 chunks), the title memory made GPU memory at its start,
+ * which holds the per-draw constant buffers its world mesh stages index their tables through. 87
+ * mesh, 14 pixel and 20 compute programs were refused ("descriptor source N reads inaccessible
+ * 0x... at pc 0x9c, which no flat SRT slot records"), skipping 1,432 of a frame's 1,851 G-buffer
+ * draws, and the BDA page table didn't map that memory either. */
+static struct gpu_memory_region *all_chunks(UINT *count)
+{
+    struct gpu_memory_region *chunks = NULL, *grown;
+    UINT n;
+
+    for (UINT cap = 1024;; cap *= 2)
+    {
+        if (!(grown = realloc(chunks, cap * sizeof(*chunks))))
+        {
+            free(chunks);
+            *count = 0;
+            return NULL;
+        }
+        chunks = grown;
+        if ((n = gpu_memory_regions(chunks, cap)) < cap)
+            break;
+    }
+    qsort(chunks, n, sizeof(*chunks), compare_chunks);
+    *count = n;
+    return chunks;
 }
 #define MAX_BINDINGS 64
 /* Guest descriptors a stage binds, all bindings together (each element's heap slot goes in the draw
@@ -644,7 +680,7 @@ static UINT64 page_table(UINT32 *bytes)
     static ULONGLONG table_built;
     static BYTE *table_cpu;
     static struct shadow_region regions[MAX_REGIONS]; /* used only under table_lock, held exclusively */
-    static struct gpu_memory_region chunks[MAX_REGIONS];
+    struct gpu_memory_region *chunks;
     UINT64 (*buffers)[2];
     UINT n, nchunks, nbuffers, count = 0, merged = 0;
     /* What it maps changes only with these (read before what they cover). */
@@ -693,19 +729,19 @@ static UINT64 page_table(UINT32 *bytes)
     }
     table_built = GetTickCount64();
     n = shadow_regions(regions, MAX_REGIONS);
-    nchunks = gpu_memory_regions(chunks, MAX_REGIONS);
     note_regions_full("Shadow heaps", n, MAX_REGIONS);
-    note_regions_full("GPU memory chunks", nchunks, MAX_REGIONS);
     if (!table_cpu && FAILED(ReboxGpuAlloc(*bytes, 256, (void **)&table_cpu, &table_va)))
     {
         table_cpu = NULL;
         ReleaseSRWLockExclusive(&table_lock);
         return 0;
     }
+    chunks = all_chunks(&nchunks);
     buffers = malloc(65536 * sizeof(*buffers));
     nbuffers = buffers ? shadow_buffer_ranges(buffers, 65536) : 0;
     if (!(ranges = malloc((n + nchunks + nbuffers) * sizeof(*ranges))))
     {
+        free(chunks);
         free(buffers);
         ReleaseSRWLockExclusive(&table_lock);
         return 0;
@@ -715,6 +751,7 @@ static UINT64 page_table(UINT32 *bytes)
      * a stray access becomes an AnyPS5 fault record, not a GPU page fault. */
     for (UINT i = 0; i < nchunks; i++)
         ranges[count++] = (struct page_range){ chunks[i].gpu, chunks[i].gpu + chunks[i].size, chunks[i].gpu, 3, 0 };
+    free(chunks);
     for (UINT i = 0; i < nbuffers; i++)
         ranges[count++] = (struct page_range){ buffers[i][0], buffers[i][1], buffers[i][0], 3, 0 };
     free(buffers);
@@ -3693,35 +3730,54 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
 }
 
 /* Guest memory for AnyPS5: the shadow heaps at their title addresses, then the GPU memory chunks
- * (xmem's allocations, at their GPU VAs) that don't overlap them, so the SRT walk can follow
- * user-data pointers into constant data. Title-created resources aren't included. Made again only
- * when the heaps or chunks change: walking the heaps' pages for GPU memory at every draw and
- * dispatch took a share of each. Returns the count, at most MAX_REGIONS. */
-static UINT guest_regions(struct sa5_region *regions)
+ * (xmem's allocations and title memory made GPU memory, at their GPU VAs) that don't overlap them,
+ * so the SRT walk can follow user-data pointers into constant data. Chunks that touch (in GPU VA
+ * and CPU address both) are one region: adopted spans are made next to each other. Title-created
+ * resources aren't included. Made again only when the heaps or chunks change: walking the heaps'
+ * pages for GPU memory at every draw and dispatch took a share of each. *regions is this thread's
+ * copy, good until its next call; returns the count. */
+static UINT guest_regions(struct sa5_region **regions)
 {
     static SRWLOCK cache_lock = SRWLOCK_INIT;
-    static struct sa5_region cached[MAX_REGIONS];
+    static struct sa5_region *cached;
     static UINT cached_count;
     static LONG cached_key[2];
     static BOOL cached_valid;
+    static __thread struct sa5_region *copy;
+    static __thread UINT copy_cap;
     const LONG key[2] = { shadow_regions_generation(), gpu_memory_generation() };
     struct shadow_region *shadows;
     struct gpu_memory_region *chunks;
+    struct sa5_region *made;
     UINT n, count, shadow_count;
 
+    *regions = copy;
     AcquireSRWLockShared(&cache_lock);
     if (cached_valid && !memcmp(key, cached_key, sizeof(key)))
     {
         n = cached_count;
-        memcpy(regions, cached, n * sizeof(*regions));
+        if (n > copy_cap)
+        {
+            struct sa5_region *grown = realloc(copy, n * sizeof(*copy));
+            if (!grown)
+            {
+                ReleaseSRWLockShared(&cache_lock);
+                return 0;
+            }
+            copy = grown;
+            copy_cap = n;
+        }
+        memcpy(copy, cached, n * sizeof(*copy));
         ReleaseSRWLockShared(&cache_lock);
+        *regions = copy;
         return n;
     }
     ReleaseSRWLockShared(&cache_lock);
 
     shadows = malloc(MAX_REGIONS * sizeof(*shadows));
-    chunks = malloc(MAX_REGIONS * sizeof(*chunks));
-    if (!shadows || !chunks)
+    chunks = all_chunks(&count);
+    made = shadows && chunks ? malloc((MAX_REGIONS + count) * sizeof(*made)) : NULL;
+    if (!made)
     {
         free(shadows);
         free(chunks);
@@ -3729,19 +3785,23 @@ static UINT guest_regions(struct sa5_region *regions)
     }
     n = shadow_regions(shadows, MAX_REGIONS);
     for (UINT i = 0; i < n; i++)
-        regions[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
-    count = gpu_memory_regions(chunks, MAX_REGIONS - n);
+        made[i] = (struct sa5_region){ shadows[i].title_va, shadows[i].data, shadows[i].size };
     note_regions_full("Shadow heaps", n, MAX_REGIONS);
-    note_regions_full("GPU memory chunks", n + count, MAX_REGIONS);
     shadow_count = n;
     for (UINT i = 0; i < count; i++)
     {
         BOOL overlaps = FALSE;
+        struct sa5_region *last = n > shadow_count ? &made[n - 1] : NULL;
         for (UINT j = 0; j < shadow_count && !overlaps; j++)
-            overlaps = chunks[i].gpu < regions[j].address + regions[j].size
-                    && regions[j].address < chunks[i].gpu + chunks[i].size;
-        if (!overlaps && chunks[i].size)
-            regions[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
+            overlaps = chunks[i].gpu < made[j].address + made[j].size
+                    && made[j].address < chunks[i].gpu + chunks[i].size;
+        if (overlaps || !chunks[i].size)
+            continue;
+        if (last && last->address + last->size == chunks[i].gpu
+                && (const BYTE *)last->data + last->size == (const BYTE *)chunks[i].cpu)
+            last->size += chunks[i].size;
+        else
+            made[n++] = (struct sa5_region){ chunks[i].gpu, chunks[i].cpu, chunks[i].size };
     }
     free(shadows);
     free(chunks);
@@ -3749,11 +3809,25 @@ static UINT guest_regions(struct sa5_region *regions)
     /* Kept under the generations read before it was made: a change since makes the next call
      * make it again. */
     AcquireSRWLockExclusive(&cache_lock);
-    memcpy(cached, regions, n * sizeof(*regions));
+    free(cached);
+    cached = made;
     cached_count = n;
     memcpy(cached_key, key, sizeof(key));
     cached_valid = TRUE;
+    if (n > copy_cap)
+    {
+        struct sa5_region *grown = realloc(copy, n * sizeof(*copy));
+        if (!grown)
+            n = 0;
+        else
+        {
+            copy = grown;
+            copy_cap = n;
+        }
+    }
+    memcpy(copy, cached, n * sizeof(*copy));
     ReleaseSRWLockExclusive(&cache_lock);
+    *regions = copy;
     return n;
 }
 
@@ -3789,7 +3863,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
     struct rebox_compile_in mesh_in;
     static __thread UINT32 mesh_sgprs[64];
-    static __thread struct sa5_region regions[MAX_REGIONS];
+    struct sa5_region *regions;
     struct sa5_remap remaps[MAX_BINDINGS];
     struct sa5_host_buffer hosts[8];
     UINT64 host_va[8], key[2], pushed_va[GRAPHICS_PUSHED_MAX], identity[2] = { 0 }, bind_hash = 0;
@@ -4032,7 +4106,7 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                          (int)in->bindless[6][0], in->bindless[6][1]);
     }
 
-    n = guest_regions(regions);
+    n = guest_regions(&regions);
     if (!(code = malloc(h->code_dwords * 4u)))
         return E_OUTOFMEMORY;
     memcpy(code, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);

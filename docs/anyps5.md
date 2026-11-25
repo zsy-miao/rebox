@@ -331,8 +331,14 @@ in all (the target title's image tables reach 23,725 T#s). A graphics stage AnyP
 instruction it doesn't handle) is remembered for the run; one refused for what its tables held at
 that call (an SRT walk through memory outside the regions it was given, a descriptor that isn't
 one) is retried at every 64th call instead, as a binding failure is. The regions are the shadow
-heaps and up to 1,024 GPU memory chunks in all: with 64, the target title's world passed the
-limit, and its mesh stages' user-data tables in the chunks left out were unreadable.
+heaps (up to 1,024) and every GPU memory chunk, sorted by GPU VA, chunks that touch joined into
+one; the BDA page table maps every chunk too. Both were once cut at a fixed count (64, then 1,024),
+and since the chunk list is newest first, the cut left out the oldest: in run 0014 of the target
+title, the title memory made GPU memory at its start, which holds the per-draw constant buffers its
+world mesh stages index their tables through. 87 mesh, 14 pixel and 20 compute programs were refused
+("descriptor source N reads inaccessible 0x12a17a328 at pc 0x9c, which no flat SRT slot
+records": an `s_buffer_load_dword` through a CBV's V# from the stage's table, whose result indexes
+another table for a T#), skipping 1,432 of a frame's 1,851 G-buffer draws.
 
 ## AnyPS5 patches
 
