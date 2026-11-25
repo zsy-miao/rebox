@@ -36,6 +36,7 @@
 #include "console_desc.h"
 #include "pacing.h"
 #include "present.h"
+#include "producers.h"
 #include "proxy.h"
 #include "quarantine.h"
 #include "title_textures.h"
@@ -1834,6 +1835,7 @@ static BYTE *signature_kinds; /* what each one's last argument does: SIGNATURE_*
 /* Where in a record that argument's words start: after the root constants and views a signature
  * sets first (the probe read a record's first words as a mesh dispatch's group counts). */
 static USHORT *signature_offsets;
+static UINT *signature_strides; /* ByteStride */
 static UINT signature_count, signature_capacity;
 enum { SIGNATURE_OTHER, SIGNATURE_DRAW, SIGNATURE_MESH };
 
@@ -1860,21 +1862,31 @@ static BOOL is_command_signature(void *object)
     return found;
 }
 
-/* Whether a command signature draws (SIGNATURE_DRAW), dispatches meshes (SIGNATURE_MESH) or neither. */
-static UINT signature_kind(void *object, UINT *offset)
+/* Whether a command signature draws (SIGNATURE_DRAW), dispatches meshes (SIGNATURE_MESH) or neither;
+ * stride, if not NULL, its ByteStride. */
+static UINT signature_kind_stride(void *object, UINT *offset, UINT *stride)
 {
     UINT kind = SIGNATURE_OTHER;
     *offset = 0;
+    if (stride)
+        *stride = 0;
     AcquireSRWLockShared(&signatures_lock);
     for (UINT i = 0; i < signature_count; i++)
         if (signatures[i] == object)
         {
             kind = signature_kinds[i];
             *offset = signature_offsets[i];
+            if (stride)
+                *stride = signature_strides[i];
             break;
         }
     ReleaseSRWLockShared(&signatures_lock);
     return kind;
+}
+
+static UINT signature_kind(void *object, UINT *offset)
+{
+    return signature_kind_stride(object, offset, NULL);
 }
 
 /* The console's own indirect argument types: 104 and 105 (DISPATCHX, DISPATCH_L2) are dispatches
@@ -1971,13 +1983,16 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
             void **grown = realloc(signatures, capacity * sizeof(*signatures));
             BYTE *kinds = grown ? realloc(signature_kinds, capacity) : NULL;
             USHORT *offsets = kinds ? realloc(signature_offsets, capacity * sizeof(*offsets)) : NULL;
+            UINT *strides = offsets ? realloc(signature_strides, capacity * sizeof(*strides)) : NULL;
             if (grown)
                 signatures = grown;
             if (kinds)
                 signature_kinds = kinds;
             if (offsets)
-            {
                 signature_offsets = offsets;
+            if (strides)
+            {
+                signature_strides = strides;
                 signature_capacity = capacity;
             }
         }
@@ -2005,6 +2020,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
             }
             signature_kinds[signature_count] = (BYTE)kind;
             signature_offsets[signature_count] = (USHORT)min(offset, 0xffffu);
+            signature_strides[signature_count] = desc ? desc->ByteStride : 0;
             if (kind == SIGNATURE_MESH)
             {
                 static LONG logged;
@@ -2410,6 +2426,34 @@ static void STDMETHODCALLTYPE list_RSSetScissorRects(struct proxy *p, UINT count
     ID3D12GraphicsCommandList_RSSetScissorRects(INNER(p, ID3D12GraphicsCommandList), count, rects);
 }
 
+/* A mesh ExecuteIndirect: where its records and count are read is noted for matching the compute
+ * calls that write them (producers.c). With REBOX_INDIRECT_FALLBACK, one whose producer was skipped
+ * is replaced here by a mesh dispatch of that many groups (only where its records are the group
+ * counts alone, no root arguments before them); TRUE if it was. */
+static BOOL mesh_indirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
+        void *count_buffer, UINT64 count_offset)
+{
+    UINT kind, arg_at = 0, stride = 0, groups = 0;
+    UINT64 va, count_va = 0;
+    BOOL traced;
+
+    kind = signature_kind_stride(signature, &arg_at, &stride);
+    if (kind != SIGNATURE_MESH || !args || !count || !stride
+            || !(va = ID3D12Resource_GetGPUVirtualAddress((ID3D12Resource *)args)))
+        return FALSE;
+    if (count_buffer && (count_va = ID3D12Resource_GetGPUVirtualAddress((ID3D12Resource *)count_buffer)))
+        count_va += count_offset;
+    producers_mesh_indirect(va + offset, (UINT64)stride * count, count_va, arg_at == 0, &groups);
+    if (!groups)
+        return FALSE;
+    traced = trace_begin(p, TRUE, "mesh-fallback", groups, 1, 1);
+    debug_view_watch_begin(p);
+    ((void (STDMETHODCALLTYPE *)(void *, UINT, UINT, UINT))PC_SLOT(p->inner, 79))(p->inner, groups, 1, 1);
+    debug_view_watch_end(p, TRUE);
+    trace_end(traced);
+    return TRUE;
+}
+
 /* ExecuteIndirect (PC 59): rays with no real pipeline set are skipped (see ray_signatures). */
 static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
         void *count_buffer, UINT64 count_offset)
@@ -2433,6 +2477,8 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
         return;
     }
     indirect_barrier(p);
+    if (mesh_indirect(p, signature, count, args, offset, count_buffer, count_offset))
+        return;
     kind = debug_view_on() ? signature_kind(signature, &arg_at) : SIGNATURE_OTHER;
     if (kind != SIGNATURE_OTHER)
         debug_view_watch_begin_indirect(p, args, offset + arg_at, count_buffer, count_offset);
@@ -2465,6 +2511,8 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
         indirect_barrier(p);
+        if (mesh_indirect(p, a, (UINT)b, c, d, e, f))
+            return;
         UINT arg_at = 0, kind = debug_view_on() ? signature_kind(a, &arg_at) : SIGNATURE_OTHER;
         if (kind != SIGNATURE_OTHER)
             debug_view_watch_begin_indirect(p, c, d + arg_at, e, f);

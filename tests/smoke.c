@@ -4585,6 +4585,39 @@ static void test_console_dispatch(void *dev, void *queue)
     CHECK(out[0] == 0x1234abcd, "the deferred console shader, compiled by AnyPS5 at dispatch, wrote %#x through "
           "its V# (expected 0x1234abcd)", out[0]);
 
+    /* Its output buffer taken as a mesh ExecuteIndirect's arguments: the same dispatch again is an
+     * indirect-argument producer (producers.c), found through its user data or its bindings. */
+    {
+        UINT (WINAPI *producers)(UINT64, UINT64) = (void *)GetProcAddress(m, "ReboxIndirectProducers");
+        UINT before;
+        ID3D12Fence *pf = NULL;
+        CHECK(producers != NULL, "d3d12_xs exports ReboxIndirectProducers");
+        if (producers && SUCCEEDED(XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0,
+                D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&pf)) && SUCCEEDED(ID3D12CommandAllocator_Reset(alloc))
+                && SUCCEEDED(XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL)))
+        {
+            before = producers(ID3D12Resource_GetGPUVirtualAddress(out_buf) + 16, 12);
+            out[0] = 0;
+            XSLOT(list, 32, void, UINT, void *const *)(list, 1, &heap);
+            XSLOT(list, 33, void, void *)(list, rs);
+            XSLOT(list, 25, void, void *)(list, pso);
+            XSLOT(list, 35, void, UINT, UINT64)(list, 0, gpu + inc);
+            XSLOT(list, 14, void, UINT, UINT, UINT)(list, 1, 1, 1);
+            XSLOT(list, 9, HRESULT)(list);
+            XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+            XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, pf, 1);
+            for (int i = 0; i < 6000 && ID3D12Fence_GetCompletedValue(pf) < 1; i++)
+                Sleep(10);
+            CHECK(producers(0, 0) == before + 1 && out[0] == 0x1234abcd, "a dispatch writing a buffer noted as indirect "
+                  "arguments is found as their producer and runs (%u producers, %u before; wrote %#x)", producers(0, 0),
+                  before, out[0]);
+        }
+        if (pf)
+        {
+            ID3D12Fence_Release(pf);
+        }
+    }
+
     /* Same code, but s[0:1] comes from two root constants and points into GPU memory from
      * ReboxGpuAlloc holding a copy of the V#: the recompiler has to read that memory too. */
     {

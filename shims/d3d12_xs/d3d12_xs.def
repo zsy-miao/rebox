@@ -36,6 +36,7 @@ EXPORTS
     ReboxConsoleDrawPipeline
     ReboxConsoleFaults
     ReboxGuestBufferLength
+    ReboxIndirectProducers
     ReboxConsoleFromContainer
     ReboxConsoleFree
     ReboxConsoleGraphicsFromContainer

@@ -33,6 +33,7 @@
 #include "console_desc.h"
 #include "gpu_memory.h"
 #include "proxy.h"
+#include "producers.h"
 #include "quarantine.h"
 #include "shadow.h"
 #include "title_textures.h"
@@ -245,6 +246,16 @@ struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT
 static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes);
 /* This thread's guest buffers with a length read as empty since console_draw_watch_begin. */
 static __thread UINT watch_empty_buffers;
+/* The guest buffers a compute compile's bindings resolved to (address, bytes), for matching the
+ * call against indirect argument ranges (producers.c). A compile on the pool hands them back with
+ * its job. */
+#define CALL_RANGES 32
+struct call_ranges
+{
+    UINT count;
+    UINT64 base[CALL_RANGES], bytes[CALL_RANGES];
+};
+static __thread struct call_ranges call_ranges;
 
 /* A guest buffer table entry ({address, length in dwords, 0, 0}) for a V#: the module reads the
  * buffer at that address directly, in bounds of that length. One in a GPU-only view of title
@@ -1165,25 +1176,48 @@ static BOOL view_fits(UINT32 kind, enum shadow_view view)
 static const char *const view_names[] = { "nothing", "a texture SRV", "a typed buffer SRV", "a raw buffer SRV",
         "a texture UAV", "a typed buffer UAV", "a raw buffer UAV", "a CBV", "a sampler" };
 
-/* Logs a shader's first failure only (keyed by its code). */
+/* Logs a shader's first failure only (keyed by its code). Its text is kept (failure_text): an
+ * indirect-argument producer's is logged again, prominently, once it is known as one. */
+static SRWLOCK failure_lock = SRWLOCK_INIT;
+static UINT64 failure_ids[2048];
+static char *failure_texts[2048];
+static UINT failure_count;
+
 static void log_failure(const struct rebox_deferred_shader *h, const char *what, const char *detail)
 {
-    static SRWLOCK log_lock = SRWLOCK_INIT;
-    static UINT64 logged[256];
-    static UINT logged_count;
     UINT64 id = hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
     BOOL seen = FALSE;
 
     set_last(E_FAIL, what, detail);
-    AcquireSRWLockExclusive(&log_lock);
-    for (UINT i = 0; i < logged_count && !seen; i++)
-        seen = logged[i] == id;
-    if (!seen && logged_count < ARRAYSIZE(logged))
-        logged[logged_count++] = id;
-    ReleaseSRWLockExclusive(&log_lock);
+    AcquireSRWLockExclusive(&failure_lock);
+    for (UINT i = 0; i < failure_count && !seen; i++)
+        seen = failure_ids[i] == id;
+    if (!seen && failure_count < ARRAYSIZE(failure_ids))
+    {
+        char text[600];
+        snprintf(text, sizeof(text), "%s%s%s", what, detail ? ": " : "", detail ? detail : "");
+        failure_texts[failure_count] = _strdup(text);
+        failure_ids[failure_count++] = id;
+    }
+    ReleaseSRWLockExclusive(&failure_lock);
     if (!seen)
         rebox_log("d3d12_xs: console shader %016llx: %s%s%s; its dispatches are skipped",
                      (unsigned long long)id, what, detail ? ": " : "", detail ? detail : "");
+}
+
+/* The first failure log_failure kept for the shader with this id, copied into out; FALSE if none. */
+static BOOL failure_text(UINT64 id, char *out, SIZE_T size)
+{
+    BOOL found = FALSE;
+    AcquireSRWLockShared(&failure_lock);
+    for (UINT i = 0; i < failure_count && !found; i++)
+        if (failure_ids[i] == id && failure_texts[i])
+        {
+            snprintf(out, size, "%s", failure_texts[i]);
+            found = TRUE;
+        }
+    ReleaseSRWLockShared(&failure_lock);
+    return found;
 }
 
 /* Graphics stages AnyPS5 refused for their code (their code and stage): not retried at every draw,
@@ -2381,6 +2415,7 @@ static void outcomes_log(void)
                       "(not GPU memory, and couldn't be made so): %ld", empty);
     }
     proxy_root_views_census_log();
+    producers_census_log();
     gpu_memory_adopt_failures_log();
 }
 
@@ -2478,7 +2513,7 @@ static volatile LONG budget_frame, budget_skips;
 
 void console_frame_presented(void)
 {
-    InterlockedIncrement(&compile_frame);
+    producers_frame(InterlockedIncrement(&compile_frame));
 }
 
 static LONG64 slow_compile_ticks(void)
@@ -2629,6 +2664,7 @@ struct bounded_job
     HANDLE done;
     HRESULT hr;
     UINT64 program; /* a program's first compile (first_call_compile): its state is set when done */
+    struct call_ranges ranges; /* a compute compile's guest buffers, for the caller */
     struct rebox_compile_out out;
     struct rebox_compile_in in;
     UINT32 sgprs[64];
@@ -2787,7 +2823,9 @@ static DWORD WINAPI bounded_worker(void *unused)
             bounded_unlink(job);
         }
         ReleaseSRWLockExclusive(&bounded_lock);
+        call_ranges.count = 0;
         job->hr = compile_now(&job->in, &job->out, FALSE);
+        job->ranges = call_ranges;
         if (job->program)
             program_set(job->program, SUCCEEDED(job->hr) ? PROGRAM_WARM : PROGRAM_FAILED);
         InterlockedExchange(&job->finished, 1);
@@ -2963,7 +3001,10 @@ static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct reb
         if ((hr = job->hr) == E_PENDING)
             set_last(E_PENDING, "dropped from the pool's queue unrun", NULL);
         else
+        {
             *out = job->out;
+            call_ranges = job->ranges;
+        }
     }
     else
     {
@@ -3162,6 +3203,86 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
     return hr;
 }
 
+/* Indirect-argument producers (producers.c): a compute call that writes the argument records of
+ * mesh ExecuteIndirects is essential (call_essential, set by ReboxConsoleCompile). Its compile goes
+ * ahead of every other on the pool and is waited for, at most REBOX_PRODUCER_WAIT_MS a call
+ * (default 5000) and REBOX_PRODUCER_FRAME_MS a frame in all (default 10000: the title's watchdog
+ * fires when its render thread stops presenting for long); a known program's new variant compiles
+ * in the caller, as a display draw's does. Past the frame's waits it is skipped as any other call,
+ * and counted. vkd3d-proton builds its pipeline at once (ReboxConsoleMustDraw). */
+static __thread BOOL call_essential;
+static volatile LONG producer_wait_frame;
+static volatile LONG64 producer_wait_ticks;
+
+static DWORD producer_wait(void)
+{
+    static LONG call_ms = -1, frame_ms = -1;
+    LONG frame = compile_frame;
+
+    if (call_ms < 0)
+    {
+        frame_ms = max(env_count("REBOX_PRODUCER_FRAME_MS", 10000), 0L);
+        call_ms = max(env_count("REBOX_PRODUCER_WAIT_MS", 5000), 0L);
+    }
+    if (InterlockedExchange(&producer_wait_frame, frame) != frame)
+        InterlockedExchange64(&producer_wait_ticks, 0);
+    if (!call_ms || (frame_ms && producer_wait_ticks * 1000.0 >= frame_ms * qpc_frequency()))
+        return 0;
+    return (DWORD)call_ms;
+}
+
+static HRESULT essential_compile(UINT64 key, enum program_state state, const struct rebox_compile_in *in,
+                                 struct rebox_compile_out *out, DWORD wait)
+{
+    LONG64 started = ticks_now(), deadline = started + (LONG64)(wait * qpc_frequency() / 1000);
+    struct bounded_job *running;
+    HRESULT hr;
+
+    /* An earlier call's compile past its wait: waited for, not queued again. */
+    if ((running = overrun_running(key)))
+    {
+        BOOL done = WaitForSingleObject(running->done, wait) == WAIT_OBJECT_0;
+        bounded_release(running);
+        if (!done)
+        {
+            set_last(E_PENDING, "an indirect producer's compile is still running past its wait", NULL);
+            hr = E_PENDING;
+            goto waited;
+        }
+        state = program_claim(key, FALSE, NULL);
+    }
+    if (state == PROGRAM_FAILED)
+    {
+        set_last(E_FAIL, "its background compile failed", NULL);
+        hr = E_FAIL;
+        goto waited;
+    }
+    if (state == PROGRAM_WARM)
+        hr = compile_now(in, out, FALSE);
+    else
+    {
+        /* Cold (claimed here: the job sets its state) or pending (its background compile may be far
+         * back in that queue): compiled now, ahead of the rest. */
+        DWORD left = (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 50.0);
+        hr = bounded_compile_for(in, out, FALSE, left, state == PROGRAM_COLD ? key : 0, key, TRUE);
+        if (SUCCEEDED(hr) && state == PROGRAM_PENDING)
+            program_set(key, PROGRAM_WARM);
+    }
+waited:
+    {
+        static volatile LONG logged;
+        LONG64 ticks = ticks_now() - started;
+        double ms = ticks * 1000.0 / qpc_frequency();
+        LONG n;
+        InterlockedAdd64(&producer_wait_ticks, ticks);
+        if (ms >= 1000.0 && ((n = InterlockedIncrement(&logged)) <= 64 || !(n & (n - 1))))
+            rebox_log("d3d12_xs: indirect producer: a call of compute program %016llx waited %.0f ms for its compile: "
+                      "%s (%ld such waits)", (unsigned long long)key, ms,
+                      SUCCEEDED(hr) ? "compiled" : hr == E_PENDING ? "still compiling, skipped" : "failed", n);
+    }
+    return hr;
+}
+
 static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     enum program_state state;
@@ -3193,6 +3314,15 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
     }
     key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
     state = program_claim(key, TRUE, &uses);
+    /* An indirect-argument producer's call: ahead of the rest, and waited for (see above). */
+    if (call_essential && state != PROGRAM_FAILED && (wait = producer_wait()))
+    {
+        HRESULT hr = essential_compile(key, state, in, out, wait);
+        if (SUCCEEDED(hr))
+            must_draw = TRUE;
+        call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr == E_PENDING ? OUTCOME_WAIT : OUTCOME_FAILED;
+        return hr;
+    }
     /* One of a program's first calls, or a full-screen pass's: waits for its compile. */
     if (state != PROGRAM_FAILED && (wait = first_call_wait(uses, &screen)))
     {
@@ -3334,23 +3464,176 @@ const char *console_draw_fate_name(UINT fate)
 }
 
 
+/* ------------------------------------------------- indirect-argument producers */
+
+/* A title address as the GPU reads it (guest_buffer_mappable's mapping, without making anything GPU
+ * memory): one in a GPU-only view of title memory is the CPU address behind it. */
+static UINT64 guest_gpu_address(UINT64 address)
+{
+    static ULONGLONG (WINAPI *volatile to_cpu)(ULONGLONG);
+    static volatile LONG resolved;
+
+    if (address < 0x100000000ull || address >= 0x400000000000ull
+            || (address >= 0x200000000000ull && address < 0x210000000000ull))
+        return address;
+    if (!resolved)
+    {
+        to_cpu = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "ReboxGpuViewToCpu");
+        resolved = 1;
+    }
+    return to_cpu ? to_cpu(address) : address;
+}
+
+/* Up to size bytes of guest memory at address (gpu: its GPU address), if it is GPU memory the CPU
+ * reads at the same address or a shadow heap; the bytes read, or 0. */
+static UINT guest_read(UINT64 address, UINT64 gpu, void *out, UINT size)
+{
+    BOOL WINAPI ReboxShadowRead(UINT64 address, void *out, SIZE_T size);
+    UINT64 end;
+
+    if (gpu_memory_identity_extent(gpu, &end) && end > gpu)
+    {
+        size = (UINT)min((UINT64)size, end - gpu);
+        memcpy(out, (const void *)(ULONG_PTR)gpu, size);
+        return size;
+    }
+    /* A shadow heap reads only within it: the table may be near its end. */
+    for (; size >= 16; size /= 2)
+        if (ReboxShadowRead(address, out, size))
+            return size;
+    return 0;
+}
+
+/* Whether four dwords look like a buffer descriptor (V#): a base past the first 64 KiB, records,
+ * and a buffer type (dword 3's top two bits 0; an image's type has the top one set). */
+static BOOL looks_like_vsharp(const UINT32 w[4], UINT64 *base, UINT64 *bytes)
+{
+    UINT32 stride = (w[1] >> 16) & 0x3fff;
+    *base = w[0] | (UINT64)(w[1] & 0xffff) << 32;
+    *bytes = stride ? (UINT64)w[2] * stride : w[2];
+    return *base >= 0x10000 && w[2] && !(w[3] >> 30);
+}
+
+/* The argument ranges a compute call's user data reaches, for a call whose bindings aren't known
+ * (not compiled yet, failed, quarantined): each user SGPR as a 32-bit address and each pair as a
+ * 48-bit one, taken as a root view (to the end of the buffer the title knows there, else 4 KiB)
+ * and as a table whose first 256 bytes may hold V#s (a descriptor table, or the constants an SRT
+ * reads its V#s from). */
+static UINT64 user_data_overlap(const struct rebox_compile_in *in)
+{
+    UINT n = in->user_sgprs ? min(in->user_sgpr_count, 32u) : 0;
+    UINT64 mask = 0;
+
+    for (UINT i = 0; i < n; i++)
+    {
+        UINT64 candidates[2];
+        UINT c = 0;
+        if (in->user_sgprs[i] >= 0x10000 && !(in->user_sgprs[i] & 3))
+            candidates[c++] = in->user_sgprs[i];
+        if (i + 1 < n && in->user_sgprs[i + 1] && in->user_sgprs[i + 1] < 0x10000 && !(in->user_sgprs[i] & 3))
+            candidates[c++] = in->user_sgprs[i] | (UINT64)in->user_sgprs[i + 1] << 32;
+        for (UINT k = 0; k < c; k++)
+        {
+            UINT64 a = candidates[k], g = guest_gpu_address(a), end, base, bytes;
+            UINT32 words[64];
+            UINT got;
+            if (!shadow_buffer_range_at(g, NULL, &end) || end <= g)
+                end = g + 0x1000;
+            mask |= producers_overlap(g, min(end - g, 16ull << 20));
+            got = guest_read(a, g, words, sizeof(words));
+            for (UINT j = 0; j + 4 <= got / 4; j += 4)
+                if (looks_like_vsharp(words + j, &base, &bytes))
+                    mask |= producers_overlap(guest_gpu_address(base), min(bytes, 64ull << 20));
+        }
+    }
+    return mask;
+}
+
+/* The argument ranges the guest buffers of this thread's last compute compile touch. */
+static UINT64 bindings_overlap(void)
+{
+    UINT64 mask = 0;
+    for (UINT i = 0; i < call_ranges.count; i++)
+        mask |= producers_overlap(call_ranges.base[i], call_ranges.bytes[i]);
+    return mask;
+}
+
+static const char *program_state_name(UINT64 key, BOOL quarantined)
+{
+    if (quarantined)
+        return "quarantined (REBOX_QUARANTINE)";
+    switch (program_claim(key, FALSE, NULL))
+    {
+    case PROGRAM_COLD: return "not compiled yet";
+    case PROGRAM_PENDING: return "compiling";
+    case PROGRAM_WARM: return "ready";
+    default: return "failed";
+    }
+}
+
+static UINT64 code_id(const struct rebox_deferred_shader *h)
+{
+    return hash_bytes(0xcbf29ce484222325ull, (const BYTE *)h + h->code_offset, h->code_dwords * 4u);
+}
+
 HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct rebox_compile_out *out)
 {
     HRESULT hr;
     const struct rebox_deferred_shader *h = in ? in->shader : NULL;
     void *quarantined;
     LONG64 entered = ticks_now();
+    struct producer *producer = NULL;
+    BOOL compute, scanned = FALSE, held;
+    UINT64 key = 0;
 
     call_outcome = OUTCOME_FAILED;
+    call_ranges.count = 0;
+    /* A compute call that writes mesh ExecuteIndirects' arguments (producers.c) is essential: known
+     * from an earlier call, or found now through its user data (once a frame a program). */
+    compute = h && in->shader_size >= sizeof(*h) && h->magic == REBOX_DEFERRED_MAGIC && h->version == 1
+            && h->code_offset <= in->shader_size && h->code_dwords * 4ull <= in->shader_size - h->code_offset;
+    if (compute && producers_watching())
+    {
+        key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
+        if (!(producer = producers_find(key)) && (scanned = producers_scan_due(key)))
+        {
+            UINT64 mask = user_data_overlap(in);
+            if (mask)
+                producer = producers_add(key, code_id(h), mask, "its user data",
+                                         program_state_name(key, FALSE));
+        }
+    }
+    call_essential = producer != NULL;
     /* REBOX_QUARANTINE (quarantine.c): programs earlier runs lost the device after. A quarantined
-     * pixel stage can still get the stand-in below. */
-    if (quarantine_skips(in, &quarantined))
+     * pixel stage can still get the stand-in below. An indirect-argument producer runs anyway. */
+    held = quarantine_skips(in, &quarantined);
+    if (held && !producer)
     {
         set_last(E_FAIL, "quarantined by REBOX_QUARANTINE", NULL);
         hr = E_FAIL;
     }
     else if (SUCCEEDED(hr = console_compile(in, out)))
         quarantine_ran(quarantined);
+    call_essential = FALSE;
+    /* Its bindings, once compiled: a program the user data didn't show as a producer may be one. */
+    if (compute && !producer && scanned && call_ranges.count)
+    {
+        UINT64 mask = bindings_overlap();
+        if (mask)
+            producer = producers_add(key, code_id(h), mask, "its bindings",
+                                     SUCCEEDED(hr) ? "ready" : program_state_name(key, held));
+    }
+    if (producer)
+    {
+        char error[640] = "";
+        if (call_outcome == OUTCOME_FAILED || call_outcome == OUTCOME_PROGRAM_FAILED)
+        {
+            if (!failure_text(producers_id(producer), error, sizeof(error)))
+                ReboxConsoleLastResult(error, sizeof(error));
+        }
+        producers_call(producer, SUCCEEDED(hr), outcome_names[min(call_outcome, OUTCOMES - 1)], held,
+                       error[0] ? error : NULL);
+    }
     {
         struct title_wait *w = &title_waits[!(h && in->shader_size >= sizeof(*h) && h->version == 2)];
         InterlockedIncrement(&w->calls);
@@ -3541,6 +3824,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
     if (graphics && ((h->stage != 0x1 && h->stage != 0x10 && h->stage != 0x80)
                      || h->code_offset < sizeof(*h) + sizeof(*g)))
         return E_INVALIDARG;
+    if (!graphics)
+        call_ranges.count = 0;
     stage_push = graphics && h->stage == 0x80 ? MESH_PUSH_DATA : GRAPHICS_PUSH_DATA;
     if (graphics && h->stage == 0x80 && !getenv("REBOX_MESH_USER_DATA_S8"))
         in = mesh_user_sgprs(in, &mesh_in, mesh_sgprs);
@@ -4228,6 +4513,11 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                                   (unsigned long long)base, (unsigned long long)bytes);
                 }
                 TIMED(PART_GUEST_ENTRIES, ReboxGuestBufferEntry(w, table + e * 4));
+                if (!graphics && table[e * 4 + 2] && call_ranges.count < CALL_RANGES)
+                {
+                    call_ranges.base[call_ranges.count] = table[e * 4] | (UINT64)table[e * 4 + 1] << 32;
+                    call_ranges.bytes[call_ranges.count++] = (UINT64)table[e * 4 + 2] * 4;
+                }
                 /* An empty V# of a graphics stage: maybe one the title writes before it submits. */
                 if (graphics && !(w[0] | w[1] | w[2] | w[3]) && empty_count < ARRAYSIZE(empty_sources))
                 {

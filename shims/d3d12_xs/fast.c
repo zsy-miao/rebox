@@ -284,6 +284,24 @@ const char *fast_skip_reason(const void *container, SIZE_T size, const char *kin
     }
     if (!reason && extra_skip && list_matches(extra_skip, name))
         reason = "REBOX_SKIP_PROGRAMS", category = "named";
+    /* Compute programs named as writers of indirect arguments (culling, compaction, argument
+     * set-up) are kept: left out, every mesh ExecuteIndirect they feed reads stale records
+     * (producers.c, which makes them essential at runtime; a program left out here never compiles,
+     * so it can't be found there). */
+    if (reason && !strcmp(kind, "cs"))
+    {
+        static const char *const producer_names[] = { "BatchCull", "CullMeshlets", "CulledMeshlet", "VisibleMeshlets",
+                "VisibleCount", "PackInstances", "IndirectArgs", "DispatchArgs", "InitArgs", "IndirectDrawInfo",
+                "DrawBatch" };
+        for (UINT i = 0; i < ARRAYSIZE(producer_names); i++)
+            if (strstr(name, producer_names[i]))
+            {
+                if (first_time(name))
+                    rebox_log("d3d12_xs: REBOX_FAST: cs program %s kept although %s (%s) would leave it out: it writes "
+                              "indirect arguments (named %s)", name, category, reason, producer_names[i]);
+                return NULL;
+            }
+    }
     if (reason && first_time(name))
     {
         LONG n = InterlockedIncrement(&left_out);

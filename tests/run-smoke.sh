@@ -192,8 +192,14 @@ echo "ok   REBOX_DEBUG_VIEW copies the target when its pass ends and shows the c
 echo "== fake.bin, REBOX_QUARANTINE"
 printf '%s\n' '# programs earlier runs lost the device after' 'a7830803eec28b79  # the dispatch test' > "$work/quarantine.txt"
 out=$(REBOX_QUARANTINE="$work/quarantine.txt" "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) || true
+# Its first dispatch is skipped; once its output buffer is taken as indirect arguments, the same
+# program is their producer and runs anyway.
 grep -q "quarantine: 1 console program(s) quarantined by Z:.*quarantine.txt, skipped: a7830803eec28b79" <<<"$out" \
     && grep -q "quarantine: console compute shader a7830803eec28b79 is quarantined" <<<"$out" \
-    && ! grep -q "console shader a7830803eec28b79: compiled a variant" <<<"$out" \
+    && grep -q "FAIL.*the deferred console shader, compiled by AnyPS5 at dispatch, wrote 0 " <<<"$out" \
     || { echo "FAIL REBOX_QUARANTINE did not skip the program it names"; grep -E "quarantine|a7830803eec28b79" <<<"$out" | head; exit 1; }
 echo "ok   REBOX_QUARANTINE skips the dispatches of the programs its file names"
+grep -Eq "indirect producer [0-9a-f]{16} \(.*\) is quarantined \(REBOX_QUARANTINE\) but writes indirect arguments: it runs anyway" <<<"$out" \
+    && grep -q "ok   a dispatch writing a buffer noted as indirect arguments is found as their producer and runs" <<<"$out" \
+    || { echo "FAIL a quarantined indirect-argument producer did not run"; grep -E "producer|quarantine" <<<"$out" | head; exit 1; }
+echo "ok   a quarantined program that writes indirect arguments runs anyway"
