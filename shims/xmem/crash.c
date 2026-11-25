@@ -27,6 +27,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -574,8 +575,72 @@ static LONG CALLBACK skip_fault(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Hex digits to bytes: the count, or -1 if odd or not hex. */
+static int hex_bytes(const char *s, size_t n, BYTE *out, size_t max)
+{
+    size_t count = 0;
+    if (n % 2)
+        return -1;
+    for (size_t i = 0; i < n; i += 2)
+    {
+        unsigned v;
+        char pair[3] = { s[i], s[i + 1], 0 };
+        if (count == max || !isxdigit((unsigned char)pair[0]) || !isxdigit((unsigned char)pair[1])
+                || sscanf(pair, "%x", &v) != 1)
+            return -1;
+        out[count++] = (BYTE)v;
+    }
+    return (int)count;
+}
+
+/* REBOX_PATCH=RVA:EXPECTED:REPLACEMENT[,...] (bring-up, hex): the exe's bytes at RVA are replaced,
+ * only if they are EXPECTED (another build is left alone), logged either way. For a title's own
+ * checks that end it (a watchdog's timeout branch, say), to let it run on. */
+static void apply_patches(void)
+{
+    char list[512];
+    DWORD len = GetEnvironmentVariableA("REBOX_PATCH", list, sizeof(list));
+    BYTE *exe = (BYTE *)GetModuleHandleA(NULL);
+    char *at = list;
+
+    if (!len || len >= sizeof(list))
+        return;
+    while (at && *at)
+    {
+        char *next = strchr(at, ','), *c1, *c2;
+        unsigned long long rva;
+        BYTE expected[64], replacement[64];
+        int ne, nr;
+        if (next)
+            *next++ = 0;
+        c1 = strchr(at, ':');
+        c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c1 || !c2 || sscanf(at, "%llx", &rva) != 1
+                || (ne = hex_bytes(c1 + 1, (size_t)(c2 - c1 - 1), expected, sizeof(expected))) <= 0
+                || (nr = hex_bytes(c2 + 1, strlen(c2 + 1), replacement, sizeof(replacement))) != ne)
+            rebox_log("xmem: REBOX_PATCH entry \"%s\" not understood (RVA:EXPECTED:REPLACEMENT, same lengths)", at);
+        else if (memcmp(exe + rva, expected, ne))
+            rebox_log("xmem: REBOX_PATCH at exe+%#llx: the bytes there aren't the expected ones; left alone", rva);
+        else
+        {
+            DWORD old;
+            if (VirtualProtect(exe + rva, ne, PAGE_EXECUTE_READWRITE, &old))
+            {
+                memcpy(exe + rva, replacement, ne);
+                VirtualProtect(exe + rva, ne, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), exe + rva, ne);
+                rebox_log("xmem: REBOX_PATCH: %d bytes at exe+%#llx replaced", ne, rva);
+            }
+            else
+                rebox_log("xmem: REBOX_PATCH at exe+%#llx: can't make it writable (error %lu)", rva, GetLastError());
+        }
+        at = next;
+    }
+}
+
 void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
 {
+    apply_patches();
     {
         char list[256];
         DWORD len = GetEnvironmentVariableA("REBOX_SKIP_FAULT", list, sizeof(list));
