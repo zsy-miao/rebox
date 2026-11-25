@@ -172,7 +172,9 @@ The `SpirvTarget` lists the capabilities AnyPS5 gates on (MinLod among them:
   bytes, then the address of the stage's **draw block** (`sa5_finalize_draw`): the addresses of
   the host buffers whose contents change per draw (guest buffer table, flattened SRT, shader
   data, image table maps; up to 8), then the heap slot of every element of every remapped
-  descriptor array. Draw blocks come from a 128 MiB GPU ring. Nothing that changes per draw is in
+  descriptor array. Draw blocks come from a 128 MiB GPU ring, which wraps onto its first blocks
+  only once the GPU has finished the submissions made up to 2 s after them (else a fresh ring
+  takes over, and the old one goes once the GPU is past it). Nothing that changes per draw is in
   the module, so a shader keeps one module and one pipeline when the title copies its descriptors
   to new heap slots every draw. The process-wide host buffers (fault buffer, GDS, page table) are
   baked into the modules (`sa5_host_buffer.address`).

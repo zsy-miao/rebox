@@ -400,6 +400,18 @@ void WINAPI ReboxGpuFree(void *cpu)
     ReleaseSRWLockExclusive(&lock);
 }
 
+/* Whether cpu is a live ReboxGpuAlloc allocation (tests: what is freed when). */
+BOOL WINAPI ReboxGpuAllocated(const void *cpu)
+{
+    struct allocation *a;
+
+    AcquireSRWLockShared(&lock);
+    for (a = table[bucket(cpu)]; a && a->cpu != cpu; a = a->next)
+        ;
+    ReleaseSRWLockShared(&lock);
+    return a != NULL;
+}
+
 BOOL WINAPI ReboxGpuQuery(const void *address, void **base, SIZE_T *size)
 {
     const BYTE *p = address;

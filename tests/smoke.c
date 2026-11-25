@@ -6357,6 +6357,168 @@ done:
 
 /* The older SDK's list has PC's query methods at 28-31 (XValkyrie; a UE5 title calls them): a
  * timestamp through EndQuery (29) and ResolveQueryData (30) reaches a readback buffer. */
+static LONG64 ring_progress_none(void)
+{
+    return 0;
+}
+
+static LONG64 ring_progress_all(void)
+{
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&f);
+    return now.QuadPart + 3600 * f.QuadPart;
+}
+
+/* The per-draw ring (draw blocks: a draw's guest buffer table, SRT and heap slots) wraps onto its
+ * first blocks only once the GPU is past them; until then a fresh ring takes over and the old one
+ * stays until the GPU is past it. */
+static void test_draw_ring_reuse(void)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    void (WINAPI *progress)(LONG64 (*)(void)) = (void *)GetProcAddress(m, "ReboxConsoleRingProgress");
+    UINT64 (WINAPI *block)(const void *, SIZE_T, void **) = (void *)GetProcAddress(m, "ReboxConsoleRingBlock");
+    BOOL (WINAPI *allocated)(const void *) = (void *)GetProcAddress(m, "ReboxGpuAllocated");
+    BOOL (WINAPI *query)(const void *, void **, SIZE_T *) = (void *)GetProcAddress(m, "ReboxGpuQuery");
+    enum { BLOCK = 1 << 20, RING_BLOCKS = 128 };
+    static BYTE data[BLOCK];
+    UINT64 va, prev = 0, first_fresh = 0;
+    void *cpu = NULL, *old_cpu = NULL, *old_ring = NULL, *fresh_ring = NULL;
+    BOOL wrapped = FALSE, kept = FALSE, reused = FALSE;
+    int i;
+
+    CHECK(progress && block && allocated && query, "per-draw ring test exports");
+    if (!progress || !block || !allocated || !query)
+        return;
+
+    /* The GPU never gets anywhere: the wrap takes a fresh ring and the old blocks keep their bytes. */
+    progress(ring_progress_none);
+    memset(data, 0xa5, sizeof(data));
+    for (i = 0; i <= RING_BLOCKS + 1 && !wrapped; i++)
+    {
+        va = block(data, BLOCK, &cpu);
+        if (!va)
+            break;
+        if (prev && va != prev + BLOCK)
+        {
+            wrapped = TRUE;
+            first_fresh = va;
+            query(cpu, &fresh_ring, NULL);
+        }
+        else
+        {
+            old_cpu = cpu;
+            prev = va;
+        }
+    }
+    CHECK(wrapped && old_cpu, "per-draw ring: filled to its end (%d blocks)", i);
+    if (!wrapped || !old_cpu)
+    {
+        progress(NULL);
+        return;
+    }
+    query(old_cpu, &old_ring, NULL);
+    memset(data, 0x3c, sizeof(data));
+    for (i = 0; i < 4; i++)
+        block(data, BLOCK, NULL);
+    kept = old_ring && old_ring != fresh_ring && allocated(old_ring) && ((BYTE *)old_cpu)[0] == 0xa5
+            && ((BYTE *)old_cpu)[BLOCK - 1] == 0xa5;
+    CHECK(kept, "per-draw ring: with the GPU not past its first blocks, a wrap takes a fresh ring (%p, was %p) and "
+          "the old one's blocks keep their bytes", fresh_ring, old_ring);
+
+    /* The GPU is past everything: the next wrap reuses the ring from its start, and the old ring goes. */
+    progress(ring_progress_all);
+    prev = 0;
+    for (i = 0; i <= RING_BLOCKS + 1; i++)
+    {
+        va = block(data, BLOCK, &cpu);
+        if (!va)
+            break;
+        if (prev && va != prev + BLOCK)
+        {
+            reused = va == first_fresh;
+            break;
+        }
+        prev = va;
+    }
+    CHECK(reused, "per-draw ring: with the GPU past it, a wrap reuses the ring from its start (%#llx, first %#llx)",
+          (unsigned long long)va, (unsigned long long)first_fresh);
+    CHECK(old_ring && !allocated(old_ring), "per-draw ring: the old ring is freed once the GPU is past it");
+    progress(NULL);
+}
+
+/* Command-list embedded data (slot 148) outlives its list's resets until the GPU has finished the
+ * submissions made before them: a queue held at a fence wait keeps it through five resets. */
+static void test_embedded_lifetime(void *dev, void *queue)
+{
+    HMODULE m = GetModuleHandleA("d3d12_xs.dll");
+    BOOL (WINAPI *allocated)(const void *) = (void *)GetProcAddress(m, "ReboxGpuAllocated");
+    ID3D12CommandAllocator *alloc = NULL;
+    ID3D12Fence *gate = NULL, *done = NULL;
+    void *list = NULL;
+    BYTE *embedded = NULL;
+    BOOL held = FALSE, freed = FALSE;
+    HRESULT hr;
+    int i;
+
+    CHECK(allocated != NULL, "ReboxGpuAllocated exported");
+    if (!allocated)
+        return;
+    hr = XSLOT(dev, 9, HRESULT, D3D12_COMMAND_LIST_TYPE, REFIID, void **)(dev, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &IID_ID3D12CommandAllocator, (void **)&alloc);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 12, HRESULT, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator *, ID3D12PipelineState *,
+                REFIID, void **)(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc, NULL, &IID_ID3D12GraphicsCommandList,
+                &list);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&gate);
+    if (SUCCEEDED(hr))
+        hr = XSLOT(dev, 36, HRESULT, UINT64, D3D12_FENCE_FLAGS, REFIID, void **)(dev, 0, D3D12_FENCE_FLAG_NONE,
+                &IID_ID3D12Fence, (void **)&done);
+    CHECK(SUCCEEDED(hr), "embedded lifetime: list and fences %#lx", hr);
+    if (FAILED(hr))
+        goto out;
+
+    embedded = XSLOT(list, 148, void *, UINT64, UINT64)(list, 4096, 256);
+    if (embedded)
+        memset(embedded, 0x77, 4096);
+    XSLOT(list, 9, HRESULT)(list);
+    /* The queue stands at the gate, so the list stays queued. */
+    XSLOT(queue, 15, HRESULT, ID3D12Fence *, UINT64)(queue, gate, 1);
+    XSLOT(queue, 10, void, UINT, void *const *)(queue, 1, &list);
+    for (i = 0; i < 5; i++)
+    {
+        XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        XSLOT(list, 9, HRESULT)(list);
+        Sleep(30);
+    }
+    held = embedded && allocated(embedded) && embedded[0] == 0x77;
+    CHECK(held, "embedded data outlives five resets while the GPU hasn't run its list (%p)", (void *)embedded);
+
+    ID3D12Fence_Signal(gate, 1);
+    XSLOT(queue, 14, HRESULT, ID3D12Fence *, UINT64)(queue, done, 1);
+    for (i = 0; i < 500 && ID3D12Fence_GetCompletedValue(done) < 1; i++)
+        Sleep(10);
+    /* The latency thread looks every 20 ms. */
+    for (i = 0; i < 50 && embedded && allocated(embedded); i++)
+    {
+        Sleep(20);
+        XSLOT(list, 10, HRESULT, ID3D12CommandAllocator *, void *)(list, alloc, NULL);
+        XSLOT(list, 9, HRESULT)(list);
+    }
+    freed = embedded && !allocated(embedded);
+    CHECK(freed, "embedded data is freed at a reset once the GPU is past its list");
+
+out:
+    if (gate && !held)
+        ID3D12Fence_Signal(gate, 1);
+    if (list) IUnknown_Release((IUnknown *)list);
+    if (alloc) ID3D12CommandAllocator_Release(alloc);
+    if (gate) ID3D12Fence_Release(gate);
+    if (done) ID3D12Fence_Release(done);
+}
+
 static void test_list_queries(void *dev, void *queue)
 {
     D3D12_QUERY_HEAP_DESC qd = { D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2, 0 };
@@ -7100,6 +7262,8 @@ static void test_xbox(void)
     test_placed_texture_tracked(dev, queue);
     test_placed_atlas_behind_hot(dev, queue);
     test_list_queries(dev, queue);
+    test_embedded_lifetime(dev, queue);
+    test_draw_ring_reuse();
     test_mip_major_layout();
     test_console_shader(dev, queue);
     test_console_graphics(dev, queue);

@@ -5,6 +5,7 @@ EXPORTS
     ReboxGpuAlloc
     ReboxGpuFree
     ReboxGpuQuery
+    ReboxGpuAllocated
     ReboxGpuBytesInUse
     ReboxBlit
     ReboxHangReport
@@ -24,6 +25,8 @@ EXPORTS
     ReboxGuestBufferEntry
     ReboxConsoleCompile
     ReboxConsoleDrawBlock
+    ReboxConsoleRingProgress
+    ReboxConsoleRingBlock
     ReboxConsoleBindingStats
     ReboxConsoleRectStages
     ReboxFallbackPso

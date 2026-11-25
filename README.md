@@ -264,6 +264,37 @@ Mesh pipelines get a mesh shader that emits nothing and an amplification shader 
 nothing (DXIL from `dxc`). `REBOX_SHADER_FALLBACK=0` makes a miss fail instead, for hunting
 down missing translations.
 
+### GPU faults
+
+A GPU fault ends a run with `radv: GPUVM fault detected at address ...` and the client (`TCP` for
+vector memory, `SQC (data)` for scalar loads), but not what owned the address or what was running.
+`.#radv-rebox` (`patches/mesa-radv-fault-report.patch`) adds a report for that, cheap enough for
+the world to run at near-normal speed:
+
+```sh
+RADV_DEBUG=faultreport
+RADV_DUMP_DIR=$HOME/code/gta/runs-target/radv-dumps
+```
+
+| Variable | Meaning |
+|---|---|
+| `RADV_DEBUG=faultreport` | Keeps RADV's BO history (every BO made and freed, with its VA range and a timestamp) and the address binding reports (which `VkBuffer`, `VkImage` or memory had each range) in memory, and records the pipeline each queue type last bound (one `WRITE_DATA` per pipeline bind). When a submission finds the device lost, `radv_dumps_<pid>_<time>/` is written once: `fault.log` (the GPUVM fault and its status; every BO history entry covering the address, and the live BOs nearest below and above it, so a read past a BO's end or into a freed one shows as such; the address binding reports covering it; the GFX and COMPUTE rings' last bound pipelines: `VkPipeline` handle, hash, each stage's code range, user SGPR layout and code, `pipeline_<handle>_<stage>.bin`), `bo_history.log`, `addr_binding_report.log`, `app_info.log`, `gpu_info.log` and `dmesg.log`. Timestamps are `CLOCK_MONOTONIC` nanoseconds; `fault.log` gives monotonic and wall time at the report to line them up with the log. The command processor runs ahead of the shaders, so the last bound pipeline is the faulting one or one bound shortly after it (the last barrier before the fault bounds it) |
+| `RADV_DUMP_DIR=DIR` | Where RADV's reports go (made if missing): `faultreport`'s, `hang`'s and the trap handler's `radv_dumps_*` directories, and `RADV_DEBUG=bo_history`'s live log (`radv_bo_history_<pid>.log`, else `/tmp/radv_bo_history.log`). Without it they go to `$HOME`, which the run loop must not change |
+| `REBOX_PIPELINE_HANDLES=1` | vkd3d-proton (patch `0031`) logs each console pipeline's `VkPipeline` handle with its compiles' keys (`rebox: console graphics pipeline 0x...: keys VS PS`, `mesh`, or `compute` with the variant's two keys), which d3d12_xs logs its compiles under (`compiled a variant ... key K`): the handle in `fault.log` names the console shaders. On by itself with `RADV_DEBUG=faultreport` |
+
+What the other modes cost, for comparison: `RADV_DEBUG=hang` waits for the GPU to go idle after
+every draw and dispatch (it turns on `syncshaders`) and after every submission, and submits one
+command buffer at a time, so a world crawls and the title's watchdog fires first (it also writes to
+`$HOME`, now `RADV_DUMP_DIR`). `RADV_DEBUG=bo_history` alone writes and flushes a line per BO made
+or freed, with no report at the fault. `VKD3D_CONFIG=breadcrumbs` slows placed resource creation
+to a crawl. `VK_EXT_device_fault` (vkd3d-proton queries it at device loss) gives only the faulting
+address, and its vendor binary only with `hang`. `faultreport` costs a few list appends per BO, one
+packet per pipeline bind and memory for the history (tens of bytes a BO, a little more a buffer).
+
+A fault report's address and BO history read together with the identity layer's trace
+(`REBOX_GPUVA_TRACE`) for the GPU memory window, and with the log's `compiled a variant` lines
+for the pipeline's console shaders.
+
 ## What the tests cover
 
 - Shims build with mingw. `tests/run-smoke.sh` passes under stock Wine 11.21 + vkd3d-proton 3.0.1
