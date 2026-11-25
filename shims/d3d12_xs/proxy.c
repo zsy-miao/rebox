@@ -1313,14 +1313,20 @@ static HRESULT STDMETHODCALLTYPE device_CreateDescriptorHeap(struct proxy *p, co
     return wrap_result(hr, (IUnknown *)heap, &heap_class, out);
 }
 
+static UINT64 cbv_check(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CONSTANT_BUFFER_VIEW_DESC *checked);
+
 /* Descriptor writes (slots 17-19, 22-24, as on PC) also write the console
- * format into the shadow heaps (shadow.c). */
+ * format into the shadow heaps (shadow.c). A constant buffer view is given to vkd3d-proton only
+ * over memory the GPU can read (cbv_check); the shadow keeps the title's words, so console
+ * bindings still find the slot. */
 static void STDMETHODCALLTYPE device_CreateConstantBufferView(struct proxy *p,
         const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, SIZE_T cpu)
 {
     D3D12_CPU_DESCRIPTOR_HANDLE h = { cpu = shadow_cpu_to_inner(cpu) };
-    ID3D12Device_CreateConstantBufferView(INNER(p, ID3D12Device), desc, h);
-    shadow_write_cbv(cpu, desc);
+    D3D12_CONSTANT_BUFFER_VIEW_DESC checked;
+    UINT64 usable = cbv_check(desc, &checked);
+    ID3D12Device_CreateConstantBufferView(INNER(p, ID3D12Device), desc ? &checked : NULL, h);
+    shadow_write_cbv(cpu, desc, usable);
 }
 
 /* Render target views of display-sized RGBA8 textures (what PresentX shows), and what lists do with
@@ -1985,6 +1991,53 @@ static void log_unknown_buffer(const char *what, int index, UINT64 address, UINT
                   "%#llx): %s", what, index, (unsigned long long)address, (unsigned long long)size,
                   (unsigned long long)gpu_memory_window_end(),
                   unknown_buffers_kept() ? "bound as it is (REBOX_UNKNOWN_BUFFERS=keep)" : "read as empty");
+}
+
+/* A constant buffer view's range (CreateConstantBufferView, 61,000 a world): vkd3d-proton writes its
+ * address into the descriptor as it is, so a shader reading the view reads there. One the GPU can't
+ * read at all (below 4 GiB or in the GPU memory window and in no known buffer or chunk, or title
+ * memory that can't be made GPU memory) becomes a null view, read as zeros; one that runs past its
+ * buffer is cut. REBOX_UNKNOWN_BUFFERS=keep only logs.
+ *
+ * The console sizes views in 16-byte steps; vkd3d-proton ignores a view whose size isn't a multiple
+ * of 256 (its "Size is not 256 bytes aligned", hundreds a second in a world) and the slot keeps
+ * whatever view it held before. Such a size is rounded up to 256 where the memory runs that far,
+ * else down; a view with less than 256 bytes of memory behind it is null.
+ *
+ * *checked is what vkd3d-proton gets; returns the bytes usable from the address in the title's
+ * range (0 for none). */
+static UINT64 cbv_check(const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc, D3D12_CONSTANT_BUFFER_VIEW_DESC *checked)
+{
+    UINT64 usable, size;
+
+    if (!desc)
+        return 0;
+    *checked = *desc;
+    if (!desc->BufferLocation || !desc->SizeInBytes)
+        return 0;
+    size = ((UINT64)desc->SizeInBytes + 255) & ~255ull;
+    usable = shadow_buffer_range_usable(desc->BufferLocation, size);
+    if (!usable)
+    {
+        log_unknown_buffer("a constant buffer view", -1, desc->BufferLocation, desc->SizeInBytes);
+        if (!unknown_buffers_kept())
+            checked->BufferLocation = checked->SizeInBytes = 0;
+        return 0;
+    }
+    if (unknown_buffers_kept())
+        return min(usable, desc->SizeInBytes);
+    if (usable < desc->SizeInBytes)
+    {
+        static LONG logged;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: a constant buffer view at %#llx+%#x runs past its memory at %#llx: cut",
+                      (unsigned long long)desc->BufferLocation, desc->SizeInBytes,
+                      (unsigned long long)(desc->BufferLocation + usable));
+    }
+    checked->SizeInBytes = (UINT)(usable < size ? usable & ~255ull : size);
+    if (!checked->SizeInBytes)
+        checked->BufferLocation = 0;
+    return min(usable, desc->SizeInBytes);
 }
 
 static UINT64 root_view_check(const char *what, BOOL uav, UINT index, UINT64 address)
