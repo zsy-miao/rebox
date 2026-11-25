@@ -1,0 +1,266 @@
+From 387ab7437d10209b5dbf3d1c420c87c13b18518f Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 12:37:13 +0000
+Subject: [PATCH 24/24] test(shader): results served from the disk cache match
+ the compile
+
+disk_cache_hit_tests compiles two compute shaders (a waterfall loop and a
+branch between table slots) through the caches with a fresh disk cache,
+then runs itself again: that process must load every resource plan,
+variant and specialized module from disk, specialize nothing, and give the
+same SPIR-V, bindings and push data, which also match a compile without
+caches. It also checks HashSpirvWords2 against HashSpirvWords under both
+seeds and ContentHash, and that a resource plan decoded from its encoding
+encodes to the same bytes (and a truncated one is refused).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/CMakeLists.txt         |  18 ++
+ .../recompiler/tests/DiskCacheHitTests.cpp    | 206 ++++++++++++++++++
+ 2 files changed, 224 insertions(+)
+ create mode 100644 core/shader/recompiler/tests/DiskCacheHitTests.cpp
+
+diff --git a/core/shader/recompiler/CMakeLists.txt b/core/shader/recompiler/CMakeLists.txt
+index fcf36dcd14..6ee1817a7b 100644
+--- a/core/shader/recompiler/CMakeLists.txt
++++ b/core/shader/recompiler/CMakeLists.txt
+@@ -468,6 +468,24 @@ function(add_shader_recompiler target runtimeTarget)
+                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+         endif()
+     endif()
++    if(BUILD_TESTING AND NOT TARGET disk_cache_hit_tests)
++        add_test_executable(disk_cache_hit_tests
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/DiskCacheHitTests.cpp")
++        target_link_libraries(disk_cache_hit_tests PRIVATE ${target} ${runtimeTarget})
++        target_include_directories(disk_cache_hit_tests PRIVATE
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/include"
++            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/IntermediateRepresentation/include")
++        set_target_properties(disk_cache_hit_tests PROPERTIES CXX_EXTENSIONS OFF)
++        configure_windows_unwind(disk_cache_hit_tests)
++        add_test(NAME disk_cache_hit COMMAND disk_cache_hit_tests)
++        set_tests_properties(disk_cache_hit PROPERTIES TIMEOUT 60)
++        if(MINGW)
++            target_link_libraries(disk_cache_hit_tests PRIVATE libc)
++            set_tests_properties(disk_cache_hit PROPERTIES ENVIRONMENT_MODIFICATION
++                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
++        endif()
++    endif()
+     if(BUILD_TESTING AND ANYPS5_ENABLE_SPIRV_TOOLS AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET gather_lod_tests)
+         add_test_executable(gather_lod_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/GatherLodTests.cpp")
+         target_link_libraries(gather_lod_tests PRIVATE ${target} ${runtimeTarget} SPIRV-Tools-opt SPIRV-Tools-static)
+diff --git a/core/shader/recompiler/tests/DiskCacheHitTests.cpp b/core/shader/recompiler/tests/DiskCacheHitTests.cpp
+new file mode 100644
+index 0000000000..192a32c0d2
+--- /dev/null
++++ b/core/shader/recompiler/tests/DiskCacheHitTests.cpp
+@@ -0,0 +1,206 @@
++#include "BdaAbi.hpp"
++#include "Optimization/ResourceProgram.hpp"
++#include "Recompiler.hpp"
++#include "ShaderDiskCache.hpp"
++#include <spirv/unified1/spirv.hpp>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <random>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++using namespace ShaderRecompiler;
++
++namespace {
++
++void Require(bool condition, const char* message) {
++    if (!condition) {
++        std::fprintf(stderr, "Requirement failed: %s\n", message);
++        std::abort();
++    }
++}
++
++void SetPathEnvironment(const char* name, const std::filesystem::path& value) {
++#ifdef _WIN32
++    _wputenv_s(std::filesystem::path(name).wstring().c_str(), value.wstring().c_str());
++#else
++    setenv(name, value.c_str(), 1);
++#endif
++}
++
++constexpr std::uint32_t TableAddress = 0x20000000u;
++constexpr std::uint32_t OutputAddress = 0x30000000u;
++constexpr std::uint32_t TableEntries = 64u;
++
++constexpr std::array<std::uint32_t, 20> WaterfallShader{
++    0xbe850380u, 0xbe86037eu, 0x7daa0080u, 0xbf88000fu, 0x34020085u, 0xbe87037eu,
++    0x7e100501u, 0x7da40208u, 0xf40c0202u, 0x10000000u, 0xbf8cc07fu, 0xf0001f00u, 0x00020200u, 0xbe874707u, 0xbf89fff7u,
++    0xbefe0306u, 0xbf8c3f70u, 0xe0701000u, 0x80040200u, 0xbf810000u,
++};
++constexpr std::array<std::uint32_t, 14> BranchStoreShader{
++    0xbe850380u, 0x7d840080u, 0xbf870003u, 0xf40c0202u, 0xfa000040u, 0xbf820002u, 0xf40c0202u, 0xfa000060u,
++    0x7e0202f2u, 0x7e040280u, 0xbf8cc07fu, 0xf0201f00u, 0x00020100u, 0xbf810000u,
++};
++
++std::vector<std::uint32_t> Table() {
++    std::vector<std::uint32_t> table(TableEntries * 8u);
++    for (std::uint32_t entry = 0; entry < TableEntries; entry++) {
++        table[entry * 8u + 0u] = (0x40000000u + entry * 0x10000u) >> 8u;
++        table[entry * 8u + 1u] = 56u << 20u;
++        table[entry * 8u + 2u] = 63u;
++        table[entry * 8u + 3u] = 0xfacu | (8u << 28u);
++    }
++    return table;
++}
++
++SpirvTarget Target() {
++    static constexpr std::array<std::uint32_t, 8> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityImageQuery, spv::CapabilitySampled1D,
++                                                               spv::CapabilityImage1D, spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote};
++    static constexpr std::array<std::string_view, 1> extensions{"SPV_KHR_physical_storage_buffer"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++struct Sample {
++    std::vector<std::uint32_t> entries = Table();
++    std::array<std::byte, 64u * 1024u> output{};
++    std::array<std::uint32_t, 20> user{};
++    std::vector<MemoryRegion> regions;
++    ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++
++    RecompileRequest Request(std::span<const std::uint32_t> code, bool useCache) {
++        user = {};
++        user[4] = TableAddress;
++        user[16] = OutputAddress;
++        user[18] = 1024u;
++        user[19] = 0xfacu | (77u << 12u);
++        regions = {{TableAddress, std::as_bytes(std::span<const std::uint32_t>(entries))}, {OutputAddress, std::span<const std::byte>(output)}};
++        RecompileRequest request{
++            {ShaderStage::Compute, 0x10000000u, code, 0, {}},
++            {32u, 0, std::span<const std::uint32_t>(user), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++            Target(),
++            {0, 0, 0, 128},
++        };
++        request.useCache = useCache;
++        return request;
++    }
++};
++
++std::vector<std::uint32_t> Fingerprint(const RecompileResult& result) {
++    const auto words = result.spirv.Words();
++    std::vector<std::uint32_t> out(words.begin(), words.end());
++    out.push_back(0xffffffffu);
++    out.push_back(static_cast<std::uint32_t>(result.bindings.size()));
++    for (const auto& binding : result.bindings) {
++        out.push_back(binding.binding);
++        out.push_back(binding.descriptorSet);
++        out.push_back(static_cast<std::uint32_t>(binding.kind));
++        out.push_back(binding.count);
++        out.insert(out.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
++    }
++    const auto push = std::as_bytes(std::span(result.pushConstants));
++    out.push_back(static_cast<std::uint32_t>(push.size()));
++    for (const auto byte : push) out.push_back(static_cast<std::uint32_t>(byte));
++    return out;
++}
++
++std::vector<std::uint32_t> CompileBoth() {
++    Sample sample;
++    std::vector<std::uint32_t> all;
++    for (const auto code : {std::span<const std::uint32_t>(WaterfallShader), std::span<const std::uint32_t>(BranchStoreShader)}) {
++        const auto fresh = Fingerprint(Recompile(sample.Request(code, false)));
++        const auto cached = Fingerprint(Recompile(sample.Request(code, true)));
++        Require(fresh == cached, "a result through the caches differs from a fresh compile");
++        all.insert(all.end(), cached.begin(), cached.end());
++    }
++    return all;
++}
++
++void VerifyContentHash() {
++    std::mt19937 random(7);
++    for (std::size_t size = 0; size < 67; ++size) {
++        std::vector<std::uint32_t> words(size);
++        for (auto& word : words) word = static_cast<std::uint32_t>(random());
++        const auto both = HashSpirvWords2(words, 0x5eed5a1d00000001ull, 0x5eed5a1d00000002ull);
++        Require(both.low == HashSpirvWords(words, 0x5eed5a1d00000001ull), "the one-pass hash differs from HashSpirvWords (low seed)");
++        Require(both.high == HashSpirvWords(words, 0x5eed5a1d00000002ull), "the one-pass hash differs from HashSpirvWords (high seed)");
++        const auto content = SharedSpirv(words).ContentHash();
++        Require(size == 0 ? content == SpirvContentHash{} : content == both, "ContentHash is not the two seeded HashSpirvWords");
++    }
++}
++
++void VerifyPlanRoundTrip() {
++    Sample sample;
++    for (const auto code : {std::span<const std::uint32_t>(WaterfallShader), std::span<const std::uint32_t>(BranchStoreShader)}) {
++        const auto plan = GetResourcePlan(sample.Request(code, false));
++        Require(plan != nullptr, "no resource plan");
++        std::vector<std::byte> encoded;
++        Require(ShaderDiskCache::EncodePlan(*plan, encoded), "the plan does not encode");
++        IrResourcePlan decoded;
++        Require(ShaderDiskCache::DecodePlan(encoded, decoded), "the encoded plan does not decode");
++        Require(decoded.valueStorage.Size() == plan->valueStorage.Size(), "the decoded plan has another value count");
++        std::vector<std::byte> again;
++        Require(ShaderDiskCache::EncodePlan(decoded, again), "the decoded plan does not encode");
++        Require(again == encoded, "the decoded plan encodes to other bytes");
++        for (std::size_t cut = 1; cut < encoded.size(); cut += 1 + encoded.size() / 64u) {
++            IrResourcePlan truncated;
++            Require(!ShaderDiskCache::DecodePlan(std::span(encoded).first(cut), truncated), "a truncated plan decodes");
++        }
++    }
++}
++
++void Save(const std::filesystem::path& path, const std::vector<std::uint32_t>& words) {
++    std::ofstream out(path, std::ios::binary | std::ios::trunc);
++    out.write(reinterpret_cast<const char*>(words.data()), static_cast<std::streamsize>(words.size() * sizeof(std::uint32_t)));
++}
++
++std::vector<std::uint32_t> LoadWords(const std::filesystem::path& path) {
++    std::ifstream in(path, std::ios::binary);
++    std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++    std::vector<std::uint32_t> words(bytes.size() / sizeof(std::uint32_t));
++    std::memcpy(words.data(), bytes.data(), words.size() * sizeof(std::uint32_t));
++    return words;
++}
++
++int RunWarm(const std::filesystem::path& expected) {
++    const auto words = CompileBoth();
++    const auto totals = ShaderDiskCache::Totals();
++    Require(totals.misses == 0 && totals.planMisses == 0, "the warm process missed the disk cache");
++    Require(totals.hits >= 2 && totals.planHits >= 2, "the warm process did not load the variants and plans");
++    Require(totals.specializedMisses == 0, "the warm process specialized a module again");
++    Require(words == LoadWords(expected), "a result loaded from the disk cache differs from the one compiled");
++    std::puts("warm process: results from the disk cache match");
++    return 0;
++}
++
++}
++
++int main(int argc, char** argv) {
++    if (argc == 3 && std::string_view(argv[1]) == "--warm") return RunWarm(argv[2]);
++    VerifyContentHash();
++    VerifyPlanRoundTrip();
++    const auto directory = std::filesystem::temp_directory_path() / ("aps5-disk-cache-hit-test-" + std::to_string(std::random_device{}()));
++    std::filesystem::remove_all(directory);
++    std::filesystem::create_directories(directory);
++    SetPathEnvironment("ANYPS5_SHADER_CACHE_DIR", directory / "cache");
++    const auto words = CompileBoth();
++    ShaderDiskCache::Flush();
++    Require(ShaderDiskCache::Totals().specializedWrites != 0, "the cold process wrote no specialized module");
++    const auto expected = directory / "expected.bin";
++    Save(expected, words);
++    const std::string command = "\"" + std::string(argv[0]) + "\" --warm \"" + expected.string() + "\"";
++    const int status = std::system(command.c_str());
++    ShaderDiskCache::Shutdown();
++    std::error_code error;
++    std::filesystem::remove_all(directory, error);
++    Require(status == 0, "the warm process failed");
++    std::puts("disk cache hit tests passed");
++    return 0;
++}
+-- 
+2.55.0
+

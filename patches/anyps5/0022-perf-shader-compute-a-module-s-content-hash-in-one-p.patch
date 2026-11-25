@@ -1,0 +1,77 @@
+From 48df128cb1471a72768e8c1a2b9469b88415a725 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 12:37:13 +0000
+Subject: [PATCH 22/24] perf(shader): compute a module's content hash in one
+ pass
+
+SharedSpirv::ContentHash ran HashSpirvWords over the words twice, once per
+seed, and each pass is one serial multiply chain. HashSpirvWords2 runs the
+two chains side by side in one pass and gives the same two values, so names
+taken from the hash (the pipeline journal's, the interned modules') do not
+change. A disk-cache hit hashes the loaded module (attachSubstitutes) and
+its specialized module (InternSpirv); over the 685 variant entries of one
+title's cache (1.8 GiB) the hash went from 575 ms to 290 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/Recompiler.hpp | 37 ++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/core/shader/recompiler/Recompiler.hpp b/core/shader/recompiler/Recompiler.hpp
+index 71856fd5a8..e057b89d5c 100644
+--- a/core/shader/recompiler/Recompiler.hpp
++++ b/core/shader/recompiler/Recompiler.hpp
+@@ -797,6 +797,41 @@ inline std::uint64_t HashSpirvWords(std::span<const std::uint32_t> words, std::u
+     return hash;
+ }
+ 
++inline SpirvContentHash HashSpirvWords2(std::span<const std::uint32_t> words, std::uint64_t lowSeed, std::uint64_t highSeed) {
++    constexpr std::uint64_t multiplier = 0x9e3779b97f4a7c15ull;
++    const auto size = static_cast<std::uint64_t>(words.size()) * multiplier;
++    std::uint64_t low = lowSeed ^ size;
++    std::uint64_t high = highSeed ^ size;
++    const auto mix = [](std::uint64_t& hash, std::uint64_t chunk) {
++        hash = (hash ^ chunk) * multiplier;
++        hash = (hash << 27u) | (hash >> 37u);
++    };
++    const auto spread = [](std::uint64_t chunk) {
++        chunk *= 0xff51afd7ed558ccdull;
++        return chunk ^ (chunk >> 32u);
++    };
++    std::size_t index = 0;
++    for (; index + 2 <= words.size(); index += 2) {
++        const auto chunk = spread(words[index] | (static_cast<std::uint64_t>(words[index + 1]) << 32u));
++        mix(low, chunk);
++        mix(high, chunk);
++    }
++    if (index < words.size()) {
++        const auto chunk = spread(words[index] ^ 0x8000000000000000ull);
++        mix(low, chunk);
++        mix(high, chunk);
++    }
++    const auto finish = [](std::uint64_t hash) {
++        hash ^= hash >> 33u;
++        hash *= 0xff51afd7ed558ccdull;
++        hash ^= hash >> 33u;
++        hash *= 0xc4ceb9fe1a85ec53ull;
++        hash ^= hash >> 33u;
++        return hash;
++    };
++    return {finish(low), finish(high)};
++}
++
+ // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
+ // are copied per dispatch and draw, so the words are reference counted and only duplicated when a
+ // holder writes to them (tests and tools patch modules in place). Reads look like a vector.
+@@ -823,7 +858,7 @@ public:
+         if (holder->hashed.load(std::memory_order_acquire)) return {holder->hashLow.load(std::memory_order_relaxed), holder->hashHigh.load(std::memory_order_relaxed)};
+         const auto words = holder->Words();
+         if (words.empty()) return {};
+-        const SpirvContentHash hash{HashSpirvWords(words, 0x5eed5a1d00000001ull), HashSpirvWords(words, 0x5eed5a1d00000002ull)};
++        const auto hash = HashSpirvWords2(words, 0x5eed5a1d00000001ull, 0x5eed5a1d00000002ull);
+         holder->hashLow.store(hash.low, std::memory_order_relaxed);
+         holder->hashHigh.store(hash.high, std::memory_order_relaxed);
+         holder->hashed.store(true, std::memory_order_release);
+-- 
+2.55.0
+
