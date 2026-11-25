@@ -1430,7 +1430,7 @@ static void graphics_refused(UINT64 stage_id, const char *error)
 /* A graphics stage's name for the log. */
 static const char *stage_name(UINT32 stage)
 {
-    return stage == 0x10 ? "pixel" : stage == 0x80 ? "mesh" : "vertex";
+    return stage == 0x10 ? "pixel" : stage == 0x80 ? "mesh" : stage == 0x20 ? "compute" : "vertex";
 }
 
 static UINT user_sgprs(const struct rebox_deferred_shader *h, BOOL graphics)
@@ -1899,42 +1899,226 @@ static BOOL program_retry(UINT64 key, UINT *retry)
     return due;
 }
 
+/* The background queue, best first (REBOX_COMPILE_PRIORITY, default on; 0: first come, first
+ * served). A world queues hundreds of programs at once, and in arrival order the workers spent the
+ * world's first minutes on compute programs of 1-2M SPIR-V words (run 0526: 99 of them, 60-70 s
+ * each, all eight workers for some ten minutes) while thousands of mesh calls waited for their first
+ * stage. A worker now takes the queued program with the most calls waiting on it per guest code
+ * dword, weighted by stage: mesh and vertex 8, pixel 2 while mesh draws get stand-in pixel stages
+ * (REBOX_STANDIN_PIXEL), else 8, compute 1. A job's score grows with the cube of (1 + seconds
+ * queued / 30), so large programs still come. Display draws and retries go ahead of all, the
+ * latest first, as before. */
 struct compile_job
 {
     struct compile_job *next;
     UINT retry; /* 0, or which retry of a failed program this is (program_retry) */
     UINT64 key;
+    UINT slot;     /* its programs[] entry, where its calls are counted; ~0u if none */
+    double weight; /* the stage's weight over its guest code dwords (+256) */
+    LONG64 queued; /* ticks_now() when queued */
     struct rebox_compile_in in;
     UINT32 user_sgprs[64];
     BYTE shader[];
 };
-static struct compile_job *jobs_head, *jobs_tail;
+static struct compile_job *jobs_front, *jobs_head; /* display draws and retries, last first; the rest */
+static struct compile_job **jobs_tail = &jobs_head;
 static SRWLOCK jobs_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE jobs_ready = CONDITION_VARIABLE_INIT;
 static LONG jobs_queued, jobs_done;
 
 static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL background);
+static int standin_mode(void);
+static LONG env_count(const char *name, LONG fallback);
 
-static DWORD WINAPI compile_worker(void *unused)
+static BOOL compile_priority(void)
 {
+    static LONG on = -1;
+    if (on < 0)
+    {
+        char v[8];
+        DWORD n = GetEnvironmentVariableA("REBOX_COMPILE_PRIORITY", v, sizeof(v));
+        on = !(n && n < sizeof(v) && v[0] == '0');
+        rebox_log("d3d12_xs: console shaders: background compiles %s", on ? "best first (REBOX_COMPILE_PRIORITY)"
+                                                                         : "first come, first served");
+    }
+    return on;
+}
+
+/* The programs[] entry of a program, or ~0u. */
+static UINT program_slot(UINT64 key)
+{
+    UINT slot = (UINT)(key % PROGRAMS), found = ~0u;
+
+    AcquireSRWLockShared(&programs_lock);
+    for (UINT i = 0; i < 64; i++)
+    {
+        UINT at = (slot + i) % PROGRAMS;
+        if (programs[at].state == PROGRAM_COLD)
+            break;
+        if (programs[at].key == key)
+        {
+            found = at;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&programs_lock);
+    return found;
+}
+
+static double job_weight(const struct rebox_compile_in *in)
+{
+    const struct rebox_deferred_shader *h = in->shader;
+    double weight;
+
+    if (in->shader_size < sizeof(*h))
+        return 1.0 / 256.0;
+    if (h->version != 2)
+        weight = 1.0; /* compute */
+    else if (h->stage == 0x10)
+        weight = standin_mode() ? 2.0 : 8.0;
+    else
+        weight = 8.0; /* vertex, mesh */
+    return weight / (h->code_dwords + 256.0);
+}
+
+static double job_score(const struct compile_job *job, LONG64 now, double frequency)
+{
+    UINT uses = job->slot != ~0u ? *(volatile UINT *)&programs[job->slot].uses : 1;
+    double age = 1.0 + (now - job->queued) / frequency / 30.0;
+    return max(uses, 1u) * job->weight * age * age * age;
+}
+
+/* Takes the next job off the queue (jobs_lock held; a job queued). */
+static struct compile_job *take_job(void)
+{
+    struct compile_job **best = &jobs_head, *job;
+
+    if ((job = jobs_front))
+    {
+        jobs_front = job->next;
+        return job;
+    }
+    if (compile_priority())
+    {
+        LONG64 now = ticks_now();
+        double frequency = qpc_frequency(), best_score = -1.0;
+        for (struct compile_job **at = &jobs_head; *at; at = &(*at)->next)
+        {
+            double score = job_score(*at, now, frequency);
+            if (score > best_score)
+            {
+                best_score = score;
+                best = at;
+            }
+        }
+    }
+    job = *best;
+    if (!(*best = job->next))
+        jobs_tail = best;
+    return job;
+}
+
+/* Workers: REBOX_CONSOLE_COMPILE_THREADS (default half the CPUs, at most 8; a world brings a
+ * thousand new shaders at once, and one worker left its draws skipped for minutes), and one more
+ * for each compile running past REBOX_CONSOLE_COMPILE_LONG_MS (default 2000; 0: never), up to
+ * REBOX_CONSOLE_COMPILE_THREADS_MAX (default the CPUs less 4, at most 16). In run 0519 five of the
+ * eight sat in one AnyPS5 pass over large mesh programs from the world's start to the run's end
+ * (minutes each), and the three left took the world's thousands of programs. A worker past what's
+ * needed leaves when its compile ends. */
+#define WORKER_SLOTS 64
+static volatile LONG worker_used[WORKER_SLOTS];
+static volatile LONG64 worker_since[WORKER_SLOTS]; /* when its compile started; 0: none */
+static LONG workers_live, workers_base, workers_max;
+static LONG64 long_ticks;
+
+static LONG long_compiles(LONG64 now)
+{
+    LONG n = 0;
+    for (UINT i = 0; long_ticks && i < WORKER_SLOTS; i++)
+    {
+        LONG64 since = worker_since[i];
+        if (worker_used[i] && since && now - since >= long_ticks)
+            n++;
+    }
+    return n;
+}
+
+static DWORD WINAPI compile_worker(void *arg);
+
+/* Starts a worker (jobs_lock held, or before any job). */
+static BOOL start_worker(void)
+{
+    for (UINT i = 0; i < WORKER_SLOTS; i++)
+    {
+        HANDLE t;
+        if (InterlockedCompareExchange(&worker_used[i], 1, 0))
+            continue;
+        worker_since[i] = 0;
+        if (!(t = CreateThread(NULL, 0, compile_worker, (void *)(ULONG_PTR)i, 0, NULL)))
+        {
+            worker_used[i] = 0;
+            return FALSE;
+        }
+        CloseHandle(t);
+        InterlockedIncrement(&workers_live);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* One more worker for each long compile (jobs_lock held, jobs queued). */
+static void spare_workers(void)
+{
+    static LONG logged;
+    LONG want;
+
+    if (!long_ticks || workers_live >= workers_max)
+        return;
+    want = min(workers_base + long_compiles(ticks_now()), workers_max);
+    while (workers_live < want && start_worker())
+    {
+        LONG n = ++logged;
+        if (n <= 16 || !(n & (n - 1)))
+            rebox_log("d3d12_xs: console shaders: %ld background compiles running long; %ld workers (%ld spare started "
+                      "so far)", want - workers_base, workers_live, n);
+    }
+}
+
+static DWORD WINAPI compile_worker(void *arg)
+{
+    UINT slot = (UINT)(ULONG_PTR)arg;
+
     for (;;)
     {
         struct compile_job *job;
         struct rebox_compile_out out;
         HRESULT hr;
         LONG done;
+        LONG64 started;
+        double seconds;
 
         AcquireSRWLockExclusive(&jobs_lock);
-        while (!jobs_head)
+        while (!jobs_front && !jobs_head)
             SleepConditionVariableSRW(&jobs_ready, &jobs_lock, INFINITE, 0);
-        job = jobs_head;
-        if (!(jobs_head = job->next))
-            jobs_tail = NULL;
+        job = take_job();
+        worker_since[slot] = started = ticks_now();
+        if (jobs_front || jobs_head)
+            spare_workers();
         ReleaseSRWLockExclusive(&jobs_lock);
 
         memset(&out, 0, sizeof(out));
         hr = compile_now(&job->in, &out, TRUE);
         program_set(job->key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        if ((seconds = (ticks_now() - started) / qpc_frequency()) >= 5.0)
+        {
+            const struct rebox_deferred_shader *h = job->in.shader;
+            BOOL header = job->in.shader_size >= sizeof(*h);
+            rebox_log("d3d12_xs: console shaders: background compile of %s program %016llx (%u code dwords, %u calls "
+                      "waiting) took %.1f s: %s", !header ? "a" : h->version != 2 ? "compute" : h->stage == 0x10
+                      ? "pixel" : h->stage == 0x80 ? "mesh" : "vertex", (unsigned long long)job->key,
+                      header ? h->code_dwords : 0, job->slot != ~0u ? programs[job->slot].uses : 0, seconds,
+                      SUCCEEDED(hr) ? "compiled" : "failed");
+        }
         if (job->retry)
         {
             static volatile LONG retried, recovered;
@@ -1948,6 +2132,18 @@ static DWORD WINAPI compile_worker(void *unused)
         if (!(done & (done - 1)))
             rebox_log("d3d12_xs: console shaders: %ld background compiles done of %ld queued", done, jobs_queued);
         free(job);
+
+        /* A spare worker leaves once the compiles it stood in for are done. */
+        AcquireSRWLockExclusive(&jobs_lock);
+        worker_since[slot] = 0;
+        if (workers_live > workers_base && workers_live > workers_base + long_compiles(ticks_now()))
+        {
+            workers_live--;
+            worker_used[slot] = 0;
+            ReleaseSRWLockExclusive(&jobs_lock);
+            return 0;
+        }
+        ReleaseSRWLockExclusive(&jobs_lock);
     }
     return 0;
 }
@@ -1973,41 +2169,42 @@ static void queue_compile(UINT64 key, const struct rebox_compile_in *in, BOOL fr
     if (in->user_sgprs)
         memcpy(job->user_sgprs, in->user_sgprs, job->in.user_sgpr_count * 4u);
     job->in.user_sgprs = job->user_sgprs;
-    /* REBOX_CONSOLE_COMPILE_THREADS workers (default half the CPUs, at most 8): a world brings
-     * a thousand new shaders at once, and one worker left its draws skipped for minutes. */
+    job->slot = program_slot(key);
+    job->weight = job_weight(in);
+    job->queued = ticks_now();
     if (InitOnceBeginInitialize(&started, 0, &pending, NULL) && pending)
     {
         SYSTEM_INFO si;
-        char v[8];
-        DWORD n = GetEnvironmentVariableA("REBOX_CONSOLE_COMPILE_THREADS", v, sizeof(v));
-        UINT workers;
+        LONG ms;
         GetSystemInfo(&si);
-        workers = n && n < sizeof(v) && atoi(v) > 0 ? (UINT)atoi(v) : min(max(si.dwNumberOfProcessors / 2, 1u), 8u);
-        for (UINT w = 0; w < workers; w++)
-        {
-            HANDLE t = CreateThread(NULL, 0, compile_worker, NULL, 0, NULL);
-            if (t)
-                CloseHandle(t);
-        }
-        rebox_log("d3d12_xs: console shaders compile in the background on %u threads", workers);
+        workers_base = env_count("REBOX_CONSOLE_COMPILE_THREADS", 0);
+        if (workers_base <= 0)
+            workers_base = min(max(si.dwNumberOfProcessors / 2, 1u), 8u);
+        workers_base = min(workers_base, (LONG)WORKER_SLOTS);
+        workers_max = env_count("REBOX_CONSOLE_COMPILE_THREADS_MAX", min(max((LONG)si.dwNumberOfProcessors - 4, 1), 16));
+        workers_max = min(max(workers_max, workers_base), (LONG)WORKER_SLOTS);
+        ms = env_count("REBOX_CONSOLE_COMPILE_LONG_MS", 2000);
+        long_ticks = ms > 0 ? (LONG64)(ms * qpc_frequency() / 1000.0) : 0;
+        for (LONG w = 0; w < workers_base; w++)
+            start_worker();
+        rebox_log("d3d12_xs: console shaders compile in the background on %ld threads, up to %ld with compiles past "
+                  "%ld ms", workers_live, long_ticks ? workers_max : workers_live, max(ms, 0L));
+        compile_priority();
         InitOnceComplete(&started, 0, NULL);
     }
     InterlockedIncrement(&jobs_queued);
     AcquireSRWLockExclusive(&jobs_lock);
     if (front)
     {
-        if (!(job->next = jobs_head))
-            jobs_tail = job;
-        jobs_head = job;
+        job->next = jobs_front;
+        jobs_front = job;
     }
     else
     {
-        if (jobs_tail)
-            jobs_tail->next = job;
-        else
-            jobs_head = job;
-        jobs_tail = job;
+        *jobs_tail = job;
+        jobs_tail = &job->next;
     }
+    spare_workers();
     ReleaseSRWLockExclusive(&jobs_lock);
     WakeConditionVariable(&jobs_ready);
 }
