@@ -2595,6 +2595,28 @@ static void test_console_mesh_compile(void)
         CHECK(SUCCEEDED(hr) && out.spirv_words && out.subgroup_size == 64 && (out.push[24] | out.push[25]),
               "a deferred mesh stage compiles through AnyPS5's mesh path and finalizes with its draw block at "
               "push byte 96 (%#lx, %u SPIR-V words, subgroup %u)", hr, out.spirv_words, out.subgroup_size);
+
+        /* Compiled in the background (the run's other tests compile in the caller): its first call
+         * is skipped and queues it (best first, REBOX_COMPILE_PRIORITY), a later one finds it done.
+         * No first call waits (REBOX_FIRST_CALLS_WAIT is read once, at the first such call). */
+        {
+            UINT tries = 0;
+            SetEnvironmentVariableA("REBOX_FIRST_CALLS_WAIT", "0");
+            SetEnvironmentVariableA("REBOX_CONSOLE_ASYNC", "1");
+            memset(&out, 0, sizeof(out));
+            hr = compile(&in, &out);
+            CHECK(FAILED(hr), "a program's first call with background compiles is skipped while it compiles (%#lx)", hr);
+            do
+            {
+                Sleep(20);
+                memset(&out, 0, sizeof(out));
+                hr = compile(&in, &out);
+            } while (FAILED(hr) && ++tries < 1500);
+            CHECK(SUCCEEDED(hr) && out.spirv_words, "its background compile ends and a later call draws (%#lx after %u "
+                  "tries, %u SPIR-V words)", hr, tries, out.spirv_words);
+            SetEnvironmentVariableA("REBOX_CONSOLE_ASYNC", "0");
+            SetEnvironmentVariableA("REBOX_FIRST_CALLS_WAIT", NULL);
+        }
         release((void *)h);
     }
     free(container);
