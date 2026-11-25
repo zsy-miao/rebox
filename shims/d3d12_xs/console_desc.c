@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "console_compile.h"
 #include "console_desc.h"
 #include "proxy.h"
 
@@ -172,6 +173,7 @@ static UINT64 resource_va(ID3D12Resource *res, const D3D12_RESOURCE_DESC *rd)
         *bucket = t;
         t->va_next = texture_vas[texture_va_bucket(t->va)];
         texture_vas[texture_va_bucket(t->va)] = t;
+        console_bindings_changed(TRUE);
     }
     if (t)
         va = t->va;
@@ -198,6 +200,7 @@ void console_texture_forget(ID3D12Resource *res)
                     break;
                 }
             free(t);
+            console_bindings_changed(TRUE);
             break;
         }
     ReleaseSRWLockExclusive(&texture_lock);

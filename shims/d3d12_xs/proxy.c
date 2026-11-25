@@ -584,6 +584,7 @@ static void note_texture_address(void *resource, UINT64 address)
         {
             texture_addresses[i].resource = resource;
             texture_addresses[i].address = address;
+            console_bindings_changed(TRUE);
             break;
         }
     ReleaseSRWLockExclusive(&texture_address_lock);
@@ -681,6 +682,7 @@ static UINT64 STDMETHODCALLTYPE resource_GetGPUVirtualAddress(void *self)
     sc->next = scratch_list;
     scratch_list = sc;
     ReleaseSRWLockExclusive(&scratch_lock);
+    console_bindings_changed(TRUE);
     return (UINT64)(ULONG_PTR)cpu;
 }
 
@@ -699,6 +701,7 @@ static ULONG STDMETHODCALLTYPE resource_Release(void *self)
     ReleaseSRWLockExclusive(&scratch_lock);
     if (sc)
     {
+        console_bindings_changed(TRUE);
         ReboxGpuFree(sc->cpu);
         free(sc);
     }
@@ -3859,6 +3862,7 @@ static void memory_view_unlink(struct memory_view *v)
                 break;
             }
         dormant_view_count--;
+        console_bindings_changed(TRUE);
     }
     memory_view_count--;
 }
@@ -3914,6 +3918,7 @@ static BOOL memory_view_evict(struct memory_view *v, LONG64 now)
     v->dormant_next = *bucket;
     *bucket = v;
     dormant_view_count++;
+    console_bindings_changed(TRUE);
     views_evicted_total++;
     return TRUE;
 }

@@ -743,6 +743,7 @@ static void *virtual_alloc2(void *address, SIZE_T size, DWORD type, DWORD protec
 static struct gpu_view { ULONG_PTR gpu, cpu, size; } gpu_views[16];
 static ULONG_PTR last_cpu_reservation, last_cpu_reservation_size;
 static SRWLOCK gpu_view_lock = SRWLOCK_INIT;
+static volatile LONG gpu_views_generation; /* bumped when gpu_views changes */
 
 static void note_reservation(void *p, SIZE_T size, DWORD type, DWORD protect)
 {
@@ -760,6 +761,7 @@ static void note_reservation(void *p, SIZE_T size, DWORD type, DWORD protect)
                 gpu_views[i].gpu = (ULONG_PTR)p;
                 gpu_views[i].cpu = last_cpu_reservation;
                 gpu_views[i].size = size;
+                InterlockedIncrement(&gpu_views_generation);
                 rebox_log("xmem: %#zx bytes at %p are a GPU view of the reservation at %#llx", size, p,
                           (unsigned long long)last_cpu_reservation);
                 break;
@@ -783,10 +785,19 @@ static void forget_reservation(void *p)
     AcquireSRWLockExclusive(&gpu_view_lock);
     for (UINT i = 0; i < ARRAYSIZE(gpu_views); i++)
         if (gpu_views[i].size && (gpu_views[i].gpu == (ULONG_PTR)p || gpu_views[i].cpu == (ULONG_PTR)p))
+        {
             gpu_views[i].size = 0;
+            InterlockedIncrement(&gpu_views_generation);
+        }
     if (last_cpu_reservation == (ULONG_PTR)p)
         last_cpu_reservation = 0;
     ReleaseSRWLockExclusive(&gpu_view_lock);
+}
+
+/* Changes when ReboxGpuViewToCpu's answers may (d3d12_xs's binding cache). */
+LONG WINAPI ReboxGpuViewsGeneration(void)
+{
+    return gpu_views_generation;
 }
 
 /* The CPU address behind a GPU-view address, or the address itself. */

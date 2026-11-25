@@ -32,6 +32,7 @@
 #include <string.h>
 
 #include "../common/rebox_log.h"
+#include "console_compile.h"
 #include "console_desc.h"
 #include "gpu_memory.h"
 #include "shadow.h"
@@ -388,6 +389,7 @@ LONG shadow_regions_generation(void)
 static void heap_free(struct shadow_heap *h)
 {
     InterlockedIncrement(&regions_generation);
+    console_bindings_changed(FALSE);
     for (UINT i = 0; i < h->count; i++)
         unindex(h, i);
     for (UINT i = 0; h->res && i < h->count; i++)
@@ -499,6 +501,7 @@ void shadow_heap_created(ID3D12DescriptorHeap *inner, const D3D12_DESCRIPTOR_HEA
     heap->next = heaps;
     heaps = heap;
     InterlockedIncrement(&regions_generation);
+    console_bindings_changed(FALSE);
     ReleaseSRWLockExclusive(&lock);
 }
 
@@ -622,6 +625,7 @@ void shadow_place_heap(ID3D12DescriptorHeap *inner, UINT count, UINT increment)
                     h->gpu_va = (UINT64)(ULONG_PTR)memory;
                 }
                 InterlockedIncrement(&regions_generation);
+                console_bindings_changed(FALSE);
                 if (InterlockedIncrement(&logged) <= 8)
                     rebox_log("d3d12_xs: the %u-descriptor heap's console descriptors are its memory at %p%s", count,
                               memory, !h->shader_visible ? "" : adopted ? " (GPU memory there)"
@@ -797,6 +801,8 @@ static void write_slot(SIZE_T cpu, const UINT32 *words, UINT size, enum shadow_v
         slot_set_res(h, index, res);
         index_slot(h, index);
         note_visible_write(h, index, "view");
+        if (h->shader_visible)
+            console_bindings_changed(FALSE);
     }
     ReleaseSRWLockExclusive(&lock);
 }
@@ -898,6 +904,8 @@ void shadow_copy(SIZE_T dst, SIZE_T src, UINT count)
         }
         index_slot(d, di);
         note_visible_write(d, di, "copy");
+        if (d->shader_visible)
+            console_bindings_changed(FALSE);
     }
     ReleaseSRWLockExclusive(&lock);
 }
@@ -1444,6 +1452,7 @@ void shadow_forget_reserved(ID3D12Resource *res)
                 memset(h->reserved_words[i], 0xff, 16);
                 ref_change(res, NULL);
                 h->reserved_res[i] = NULL;
+                console_bindings_changed(FALSE);
             }
     ReleaseSRWLockExclusive(&lock);
 }

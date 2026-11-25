@@ -123,6 +123,11 @@ void console_frame_presented(void);
 BOOL console_trace_active(void);
 void console_trace_op(const char *op, UINT a, UINT b, UINT c, UINT width, UINT height, UINT format);
 
+/* Something a guest descriptor's binding is resolved from changed (console_compile.c's binding
+ * cache): a shader-visible heap's slots or the heaps there are (textures FALSE), or which texture an
+ * address names (TRUE). */
+void console_bindings_changed(BOOL textures);
+
 UINT64 console_stage_id(const void *shader, SIZE_T size);
 BOOL console_stage_watched(UINT64 id);
 UINT64 console_last_draw_vs(void);

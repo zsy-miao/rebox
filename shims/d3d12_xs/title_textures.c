@@ -46,6 +46,7 @@
 #include "detile.h"
 #include "gpu_memory.h"
 #include "title_textures.h"
+#include "console_compile.h"
 #include "proxy.h"
 
 struct title_texture
@@ -105,6 +106,7 @@ static void index_add(struct title_texture *t)
 
     t->rnext = by_resource[b];
     by_resource[b] = t;
+    console_bindings_changed(TRUE); /* title_texture_at finds it */
     if (!t->size || !(t->pages = calloc(n, sizeof(*t->pages))))
     {
         unpaged++;
@@ -136,6 +138,7 @@ static void index_remove(struct title_texture *t)
         }
     if (!t->pages)
         unpaged--;
+    console_bindings_changed(TRUE);
     for (UINT k = 0; k < t->page_count; k++)
     {
         struct page_node **at;

@@ -1099,6 +1099,164 @@ static double qpc_frequency(void)
     return (double)f.QuadPart;
 }
 
+/* ------------------------------------------------------------ binding cache */
+
+/* A guest descriptor binding's heap slots, kept for the next draw or dispatch whose binding has the
+ * same words: at thousands of draws a frame, resolving every descriptor again (heap lookups, T#s
+ * found by their texture's address, views made in the reserved tail) was most of a draw's
+ * bindings. An entry holds while nothing it was resolved from has changed: the shader-visible
+ * heaps (a write or copy to any slot of one, a heap made or gone, a reserved view forgotten), and,
+ * for a binding with a T# looked for by its address, which textures are at which addresses. Empty
+ * T#s noted for a late fill are noted again at every draw, their sources found then. Guest buffer
+ * tables and host buffers are made at every draw as before. REBOX_BINDING_CACHE=0 turns it off. */
+#define BIND_CACHE_SLOTS 4096u
+#define BIND_CACHE_ELEMENTS 4096u /* bindings of more elements aren't kept */
+#define BIND_CACHE_LATE 64u
+static volatile LONG heap_generation, texture_generation;
+static volatile LONG bind_hits, bind_misses, late_notes;
+
+void console_bindings_changed(BOOL textures)
+{
+    InterlockedIncrement(textures ? &texture_generation : &heap_generation);
+}
+
+/* xmem's GPU views (proxy_texture_at translates T# addresses through them). */
+static LONG gpu_views_generation(void)
+{
+    static LONG (WINAPI *volatile get)(void);
+    static volatile LONG resolved;
+    if (!resolved)
+    {
+        get = (void *)GetProcAddress(GetModuleHandleA("xmem.dll"), "ReboxGpuViewsGeneration");
+        resolved = 1;
+    }
+    return get ? get() : 0;
+}
+
+struct bind_entry
+{
+    UINT64 hash;
+    SIZE_T heap;
+    UINT32 role, kind, per, count, graphics;
+    LONG heaps, textures, views;  /* the generations it was resolved under */
+    BOOL by_address;              /* a T# was looked for by its texture's address */
+    UINT late_count;
+    UINT32 late[BIND_CACHE_LATE]; /* its elements that are empty T#s noted for a late fill */
+    UINT32 *indices;              /* count heap slots, then the binding's words (count * per) */
+};
+static struct { SRWLOCK lock; struct bind_entry *entry; } bind_cache[BIND_CACHE_SLOTS];
+
+/* A binding as the cache knows it, and the generations read before it is resolved: a change while
+ * it is makes what it resolves to stale at once. */
+struct bind_query { UINT64 hash; SIZE_T heap; UINT32 per, graphics; LONG heaps, textures, views; };
+
+static BOOL bind_cache_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char *v = getenv("REBOX_BINDING_CACHE");
+        enabled = !v || strcmp(v, "0");
+    }
+    return enabled;
+}
+
+static void bind_query_make(struct bind_query *q, SIZE_T heap, BOOL graphics, const struct sa5_binding *b, UINT32 per)
+{
+    const UINT32 head[5] = { b->role, b->kind, per, b->count, graphics };
+    q->heaps = heap_generation;
+    q->textures = texture_generation;
+    q->views = gpu_views_generation();
+    MemoryBarrier();
+    q->heap = heap;
+    q->per = per;
+    q->graphics = graphics;
+    q->hash = hash_words(hash_words(0x62696e64696e6773ull ^ heap, head, sizeof(head)), b->words,
+                         (SIZE_T)b->count * per * 4);
+}
+
+static struct bind_entry **bind_slot(const struct bind_query *q, SRWLOCK **lock)
+{
+    UINT i = (UINT)(q->hash >> 40) % BIND_CACHE_SLOTS;
+    *lock = &bind_cache[i].lock;
+    return &bind_cache[i].entry;
+}
+
+/* The binding's heap slots and late elements as last resolved, if that still holds. */
+static BOOL bind_cache_get(const struct bind_query *q, const struct sa5_binding *b, UINT32 *indices, UINT32 *late,
+                           UINT *late_count)
+{
+    SRWLOCK *lock;
+    struct bind_entry **slot = bind_slot(q, &lock), *e;
+    BOOL hit = FALSE;
+
+    AcquireSRWLockShared(lock);
+    if ((e = *slot) && e->hash == q->hash && e->heap == q->heap && e->role == b->role && e->kind == b->kind
+            && e->per == q->per && e->count == b->count && e->graphics == q->graphics && e->heaps == q->heaps
+            && (!e->by_address || (e->textures == q->textures && e->views == q->views))
+            && !memcmp(e->indices + e->count, b->words, (SIZE_T)b->count * q->per * 4))
+    {
+        memcpy(indices, e->indices, b->count * sizeof(*indices));
+        memcpy(late, e->late, e->late_count * sizeof(*late));
+        *late_count = e->late_count;
+        hit = TRUE;
+    }
+    ReleaseSRWLockShared(lock);
+    InterlockedIncrement(hit ? &bind_hits : &bind_misses);
+    return hit;
+}
+
+static void bind_cache_put(const struct bind_query *q, const struct sa5_binding *b, const UINT32 *indices,
+                           BOOL by_address, const UINT32 *late, UINT late_count)
+{
+    SIZE_T words = (SIZE_T)b->count * q->per;
+    struct bind_entry *e, *old;
+    SRWLOCK *lock;
+    struct bind_entry **slot;
+
+    if (b->count > BIND_CACHE_ELEMENTS || late_count > BIND_CACHE_LATE || !(e = malloc(sizeof(*e))))
+        return;
+    if (!(e->indices = malloc((b->count + words) * sizeof(UINT32))))
+    {
+        free(e);
+        return;
+    }
+    e->hash = q->hash;
+    e->heap = q->heap;
+    e->role = b->role;
+    e->kind = b->kind;
+    e->per = q->per;
+    e->count = b->count;
+    e->graphics = q->graphics;
+    e->heaps = q->heaps;
+    e->textures = q->textures;
+    e->views = q->views;
+    e->by_address = by_address;
+    e->late_count = late_count;
+    memcpy(e->late, late, late_count * sizeof(*late));
+    memcpy(e->indices, indices, b->count * sizeof(UINT32));
+    memcpy(e->indices + b->count, b->words, words * sizeof(UINT32));
+    slot = bind_slot(q, &lock);
+    AcquireSRWLockExclusive(lock);
+    old = *slot;
+    *slot = e;
+    ReleaseSRWLockExclusive(lock);
+    if (old)
+    {
+        free(old->indices);
+        free(old);
+    }
+}
+
+/* For tests: the binding cache's hits and misses, and the empty T#s noted for a late fill. */
+void WINAPI ReboxConsoleBindingStats(UINT64 out[4])
+{
+    out[0] = bind_hits;
+    out[1] = bind_misses;
+    out[2] = late_notes;
+    out[3] = 0;
+}
+
 /* Shaders whose bindings couldn't be made for a reason their next draw or dispatch meets again
  * (more descriptor elements or host buffers than there is room for, a binding of a kind not
  * handled, a module that can't be fitted): AnyPS5 isn't asked again at each one, only at every
@@ -2370,8 +2528,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
             if (graphics)
                 snprintf(refused, sizeof(refused), "; %ld distinct stages refused so far",
                          min(failed_stage_count, (LONG)ARRAYSIZE(failed_stages)));
-            rebox_log("d3d12_xs: console %s: compiles at title threads %s; at background workers %s%s",
-                      graphics ? "graphics" : "compute", rows[0], rows[1], refused);
+            rebox_log("d3d12_xs: console %s: compiles at title threads %s; at background workers %s%s; descriptor "
+                      "bindings kept from earlier draws %ld, resolved %ld", graphics ? "graphics" : "compute", rows[0],
+                      rows[1], refused, bind_hits, bind_misses);
         }
         QueryPerformanceCounter(&started);
         mark = started;
@@ -3117,7 +3276,38 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 log_failure(h, "a guest binding has no bindless set or heap here", detail);
                 goto done;
             }
-            for (UINT32 e = 0; e < b.count; e++)
+            /* Kept from an earlier draw (not a watched stage's: its notes are wanted at every draw). */
+            struct bind_query query;
+            UINT32 late_elements[BIND_CACHE_LATE];
+            UINT late_element_count = 0;
+            BOOL cacheable = bind_cache_enabled() && b.count <= BIND_CACHE_ELEMENTS && !console_stage_watched(stage_id);
+            BOOL cached = FALSE, by_address = FALSE;
+            if (cacheable)
+            {
+                LONG64 t = ticks_now();
+                bind_query_make(&query, (SIZE_T)in->heap_cpu[sampler], graphics, &b, per);
+                cached = bind_cache_get(&query, &b, &indices[index_count], late_elements, &late_element_count);
+                part_add(PART_LOOKUPS, ticks_now() - t);
+            }
+            for (UINT k = 0; cached && k < late_element_count && pending_count < ARRAYSIZE(pending); k++)
+            {
+                /* As below, in the same order. */
+                const UINT32 *w = b.words + late_elements[k] * per;
+                UINT64 source;
+                static LONG noted;
+                TIMED(PART_LATE, source = late_source(h, in, zero_textures++));
+                if (InterlockedIncrement(&noted) <= 4)
+                    rebox_log("d3d12_xs: console shader %016llx: empty T# (%08x %08x %08x %08x), noted at %#llx (kept "
+                              "bindings)", (unsigned long long)stage_id, w[4], w[5], w[6], w[7], (unsigned long long)source);
+                if (source)
+                {
+                    pending[pending_count].position = index_count + late_elements[k];
+                    pending[pending_count].source = source;
+                    pending[pending_count].heap = (SIZE_T)in->heap_cpu[sampler];
+                    pending_count++;
+                }
+            }
+            for (UINT32 e = 0; !cached && e < b.count; e++)
             {
                 const UINT32 *w = b.words + e * per;
                 SIZE_T heap = (SIZE_T)in->heap_cpu[sampler];
@@ -3220,7 +3410,9 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 /* A T# the title wrote itself: the texture at its address, viewed in the reserved tail. */
                 if (b.kind == 4 && (!found || shadow_slot_view(heap, *index) == SHADOW_VIEW_NONE))
                 {
-                    ID3D12Resource *res = (w[0] || (w[1] & 0xff)) ? console_texture_of(w) : NULL;
+                    ID3D12Resource *res;
+                    by_address |= w[0] || (w[1] & 0xff);
+                    res = (w[0] || (w[1] & 0xff)) ? console_texture_of(w) : NULL;
                     if (res && shadow_reserve_srv(heap, res, index))
                     {
                         static LONG logged;
@@ -3254,6 +3446,12 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
                 /* An empty T# of a graphics stage: maybe one the title writes before it submits. Its
                  * address is the n-th texture slot of the code's tables that is empty now. */
+                if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3]))
+                {
+                    if (late_element_count < ARRAYSIZE(late_elements))
+                        late_elements[late_element_count] = e;
+                    late_element_count++;
+                }
                 if (null_view && graphics && b.kind == 4 && !(w[0] | w[1] | w[2] | w[3])
                         && pending_count < ARRAYSIZE(pending))
                 {
@@ -3361,6 +3559,8 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                 }
                 part_add(PART_SLOTS, ticks_now() - part_start);
             }
+            if (cacheable && !cached)
+                bind_cache_put(&query, &b, &indices[index_count], by_address, late_elements, late_element_count);
             remaps[remap_count++] = (struct sa5_remap){ b.set, b.binding, b.kind, in->bindless[b.kind][0],
                                                         in->bindless[b.kind][1], b.count, &indices[index_count],
                                                         DRAW_INDICES - 2 * SA5_DRAW_ADDRESSES + index_count };
@@ -3554,12 +3754,14 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
         memcpy(&out->push[stage_push / 4], &va, sizeof(UINT64));
         if (pending_count && block_cpu)
         {
+            UINT noted = 0;
             AcquireSRWLockExclusive(&late_lock);
-            for (UINT i = 0; i < pending_count && late_count < ARRAYSIZE(late); i++)
+            for (UINT i = 0; i < pending_count && late_count < ARRAYSIZE(late); i++, noted++)
                 late[late_count++] = (struct late_texture){
                         (UINT32 *)(block_cpu + (DRAW_INDICES + pending[i].position) * sizeof(UINT32)),
                         pending[i].source, pending[i].heap, 0, stage_id };
             ReleaseSRWLockExclusive(&late_lock);
+            InterlockedAdd(&late_notes, noted);
         }
     }
     if (graphics && h->stage == 0x1)

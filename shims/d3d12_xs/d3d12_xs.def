@@ -24,6 +24,7 @@ EXPORTS
     ReboxGuestBufferEntry
     ReboxConsoleCompile
     ReboxConsoleDrawBlock
+    ReboxConsoleBindingStats
     ReboxConsoleRectStages
     ReboxFallbackPso
     ReboxConsoleLastResult
