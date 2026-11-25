@@ -212,6 +212,20 @@ ID3D12Resource *WINAPI ReboxConsoleTextureOf(const UINT32 words[2])
     return console_texture_of(words);
 }
 
+ID3D12Resource *console_texture_by_id(const UINT32 words[2])
+{
+    UINT64 va = ((UINT64)(words[1] & 0xff) << 32 | words[0]) << 8;
+    ID3D12Resource *res = NULL;
+    struct texture_id *t;
+
+    AcquireSRWLockShared(&texture_lock);
+    for (t = texture_vas[texture_va_bucket(va)]; t && !res; t = t->va_next)
+        if (t->va == va)
+            res = t->res;
+    ReleaseSRWLockShared(&texture_lock);
+    return res;
+}
+
 ID3D12Resource *console_texture_of(const UINT32 words[2])
 {
     UINT64 va = ((UINT64)(words[1] & 0xff) << 32 | words[0]) << 8;

@@ -3572,10 +3572,27 @@ static HRESULT compile_now(const struct rebox_compile_in *in, struct rebox_compi
                             const char *v = getenv("REBOX_WATCH_TARGET");
                             target = v ? _strtoui64(v, NULL, 16) : 0;
                         }
-                        if (target)
+                        /* Only a T# of the target's address, or of a view of the texture there: asking
+                         * every texture's title address (title_texture_info) waited on the title
+                         * textures' lock, which their upload pass holds for milliseconds, at every
+                         * texture of every draw (0.8 ms a draw, the bindings' "notes"). */
+                        static ID3D12Resource *target_res;
+                        static volatile LONG target_generation = -1;
+                        LONG generation = texture_generation;
+                        if (target && target_generation != generation)
                         {
-                            ID3D12Resource *res = console_texture_of(w);
-                            UINT64 at = 0;
+                            ID3D12Resource *at_target;
+                            if (title_texture_at_nowait(target, &at_target))
+                            {
+                                target_res = at_target;
+                                target_generation = generation;
+                            }
+                        }
+                        if (target && target_shown < 64)
+                        {
+                            UINT64 address = ((UINT64)(w[1] & 0xff) << 32 | w[0]) << 8, at = 0;
+                            ID3D12Resource *res = address == target ? console_texture_of(w)
+                                    : target_res && console_texture_by_id(w) == target_res ? target_res : NULL;
                             UINT up = 0;
                             if (res && title_texture_info(res, &at, &up) && at == target
                                     && InterlockedIncrement(&target_shown) <= 64)

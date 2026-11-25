@@ -1009,12 +1009,12 @@ void title_texture_unregister(ID3D12Resource *resource)
     ReleaseSRWLockExclusive(&lock);
 }
 
-ID3D12Resource *title_texture_at(UINT64 address)
+/* Under the lock. */
+static ID3D12Resource *texture_at_locked(UINT64 address)
 {
     struct title_texture *t;
     ID3D12Resource *res = NULL;
 
-    AcquireSRWLockShared(&lock);
     /* By the page of its address: every T# a draw binds that isn't in a heap asked, and walking
      * every texture (tens of thousands in a world) took most of a draw's bindings. Pages are
      * indexed newest first, as the list is kept. */
@@ -1028,8 +1028,28 @@ ID3D12Resource *title_texture_at(UINT64 address)
         for (t = textures; t && !res; t = t->next)
             if (t->address == address)
                 res = t->resource;
+    return res;
+}
+
+ID3D12Resource *title_texture_at(UINT64 address)
+{
+    ID3D12Resource *res;
+
+    AcquireSRWLockShared(&lock);
+    res = texture_at_locked(address);
     ReleaseSRWLockShared(&lock);
     return res;
+}
+
+/* title_texture_at without waiting: FALSE if the lock is held (an upload or watch pass holds it
+ * exclusive for milliseconds). */
+BOOL title_texture_at_nowait(UINT64 address, ID3D12Resource **res)
+{
+    if (!TryAcquireSRWLockShared(&lock))
+        return FALSE;
+    *res = texture_at_locked(address);
+    ReleaseSRWLockShared(&lock);
+    return TRUE;
 }
 
 BOOL title_texture_info(ID3D12Resource *resource, UINT64 *address, UINT *uploads)
