@@ -125,7 +125,15 @@ entry 6 the code behind a 0x24-byte header, up to its last `s_endpgm`.
    bound heap's shadow, which gives heap slots. `sa5_finalize_draw` (`anyps5/spirv_remap.cpp`)
    then freezes the specialisation constants, moves each guest descriptor array onto the bindless
    set as a runtime array indexed by slots read from the dispatch's **draw block**, turns host
-   buffers into BDA pointers read from that block (up to 8), and validates the module. The draw
+   buffers into BDA pointers read from that block (up to 8), and validates the module. AnyPS5
+   declares several variables at one binding (an image table per image type, `table_images_N`;
+   views of the guest buffers per element type, `buffers`, `buffers_coherent`, `buffers_u64`,
+   `buffers_u8`), and every one moves. Only the first did once, and the rest stayed at AnyPS5's own
+   set and binding, where vkd3d-proton's layout has nothing: RADV read their descriptors from past
+   set 0 (GPU faults at 0x041e3000 in runs 525 and 529), or from vkd3d-proton's sampler binding,
+   which AnyPS5's guest buffers share (run 519). A module that still uses a variable on a
+   descriptor set after the rewrite now fails ("variable ... is left at set S binding B"), and the
+   dispatch or draw is skipped. The draw
    block's address is at push byte 128. Modules are cached by AnyPS5's pipeline identity, not the
    slots: a world's compute passes take new slots every frame, and with the slots in the module
    each made a module and a pipeline, its dispatches skipped while the pipeline was built.
@@ -289,10 +297,13 @@ dominance, 1 sampler pairs).
 
 `cs PLAN [FIRST [COUNT]]` compiles the compute shaders of a compute plan (`NAME CODE SKIP RSRC1
 RSRC2 X,Y,Z [WAVE]`) with no guest memory and validates them; each line also gives a hash of the
-SPIR-V and the entry point's loops: how many, and how many have no conditional exit (which patch
-0012's guard can't stop). `SA5_DUMP_SPIRV=DIR` writes each module there. With the guard at 2^20,
+SPIR-V and the entry point's loops: how many, and how many have no conditional branch straight to
+their merge block (patch 0012's guard stopped only those exits; with 0026 it also stops exits that
+go through blocks of their own first). `SA5_DUMP_SPIRV=DIR` writes each module there. With the guard at 2^20,
 329 of 353 of the target title's compute shaders (every seventh of its PS09 cache) compile this way
-and all validate; 212 have loops, 8,751 in all, and every one has a conditional exit.
+and all validate; 212 have loops, 8,751 in all, and every one has a conditional branch to its merge
+block. A world compute shader outside that sample (837k words) has four loops with none, which
+counted their iterations but, before 0026, never compared them with the limit.
 
 `memo PLAN NAME [ITERATIONS]` times the path every draw and dispatch takes once a shader is
 compiled: compute shader `NAME` of a compute plan (`NAME CODE SKIP RSRC1 RSRC2 X,Y,Z [WAVE]`),
@@ -332,7 +343,7 @@ reads back and logs. Patch 0012's loop guard is on by default too: `d3d12_xs` se
 `APS5_LOOP_GUARD=0x100000`, so every translated loop leaves after 2^20 iterations per entry
 instead of running as long as data we got wrong says (a GPU hang, then a lost device). A loop
 stopped this way is logged as `console shader <hash> left a loop at its limit`; `APS5_LOOP_GUARD=0`
-turns the guard off and another value sets the limit. With patch 0014, `APS5_LOOP_GUARD=stages`
+turns the guard off and another value sets the limit. Until patch 0026 only a branch straight to a loop's merge block was guarded, and a loop whose exits go through blocks of their own first (four in the world's 837k-word compute shader) was never stopped; every exit of a loop is guarded now. With patch 0014, `APS5_LOOP_GUARD=stages`
 gives each stage its own limit instead (128 iterations in pixel programs, 256 in vertex and mesh
 programs, 4096 in compute programs), and `APS5_LOOP_GUARD_PIXEL`, `_VERTEX`, `_MESH` and `_COMPUTE`
 set one stage's. Patch 0020's null descriptors are on for graphics stages: `d3d12_xs` sets

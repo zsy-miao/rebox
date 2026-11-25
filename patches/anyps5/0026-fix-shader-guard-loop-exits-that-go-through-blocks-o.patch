@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 15:48:00 +0000
+Subject: [PATCH] fix(shader): guard loop exits that go through blocks of their
+ own
+
+APS5_LOOP_GUARD compared a loop's iteration count with the limit only at
+a conditional branch whose target was the loop's merge block. A loop
+whose exits first go through a block of their own (a store, a select
+feeding the merge block's Phi) counted its iterations on every back edge
+and never compared the count: a 837k-word compute shader had four such
+loops, exiting on counts read from the title's data, and no compare with
+the limit at all, so its module was the same whatever the limit.
+
+Each loop now knows its blocks: those the header dominates that can
+still reach a back edge without passing the header, found from the
+structured CFG. A conditional branch from one of them to a block outside
+them leaves the loop, whatever it targets, and the guard can force it
+(a branch that leaves several loops at once checks each of their
+counts). This also covers a loop whose only exits are unconditional
+branches inside an if. Iterations are counted on the back edges
+themselves, and the count is cleared only on entries from outside the
+loop, where a back edge from any block but the continue target used to
+clear it.
+
+Tested: tests/LoopGuardTests.cpp gains a loop whose two data-dependent
+exits each store before the code after the loop. It fails without the
+change ("the exits compare the loop's iteration count with the limit")
+and passes with it under Wine, built against Rebox's MinGW build of the
+recompiler, as does LoopGuardStageTests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../SpirvBackend/SpirvEmitterState.hpp        |  6 ++
+ .../SpirvBackend/src/SpirvFlowEmitter.cpp     | 93 ++++++++++++++++---
+ .../recompiler/tests/LoopGuardTests.cpp       | 66 +++++++++++++
+ 3 files changed, 152 insertions(+), 13 deletions(-)
+
+diff --git a/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp b/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
+index 3493c00c77..bb4cd48782 100644
+--- a/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
++++ b/core/shader/recompiler/SpirvBackend/include/SpirvBackend/SpirvEmitterState.hpp
+@@ -226,6 +226,12 @@ struct SpirvEmitterState {
+         std::uint32_t merge = 0;
+         std::uint32_t continueBlock = 0;
+         std::uint32_t variable = 0;
++        // The blocks that can still reach the loop's back edge (sorted control-flow ids, the header
++        // among them), and the back edges' sources. A branch from one of these blocks to a block
++        // outside them leaves the loop, whether it targets the merge block or goes through blocks
++        // of its own first.
++        std::vector<std::uint32_t> inside;
++        std::vector<std::uint32_t> latches;
+     };
+     std::uint32_t loopGuardLimit = 0;
+     std::vector<LoopGuardCounter> loopGuardCounters;
+diff --git a/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp b/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
+index 70193782af..4a8205ab07 100644
+--- a/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
++++ b/core/shader/recompiler/SpirvBackend/src/SpirvFlowEmitter.cpp
+@@ -132,48 +132,113 @@ void DefineLoopGuard(SpirvEmitterState& state, const IrProgram& program) {
+     if (state.loopGuardPc == 0) state.loopGuardPc = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+     state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
+     state.loopGuardCounters.clear();
+-    for (const auto& info : program.Metadata().blockInfo) {
++    // The structured CFG's edges, by position in the block metadata (the entry block is first).
++    const auto& infos = program.Metadata().blockInfo;
++    const std::size_t count = infos.size();
++    std::unordered_map<std::uint32_t, std::size_t> position;
++    for (std::size_t index = 0; index < count; ++index) position.emplace(infos[index].id, index);
++    std::vector<std::vector<std::size_t>> successors(count), predecessors(count);
++    for (std::size_t index = 0; index < count; ++index) {
++        const Terminator& term = infos[index].terminator;
++        const auto edge = [&](std::uint32_t target) {
++            const auto found = position.find(target);
++            if (found == position.end()) return;
++            if (std::ranges::find(successors[index], found->second) != successors[index].end()) return;
++            successors[index].push_back(found->second);
++            predecessors[found->second].push_back(index);
++        };
++        if (term.kind == TerminatorKind::Branch || term.kind == TerminatorKind::ConditionalBranch) edge(term.trueBlock);
++        if (term.kind == TerminatorKind::ConditionalBranch) edge(term.falseBlock);
++    }
++    for (std::size_t header = 0; header < count; ++header) {
++        const BlockInfo& info = infos[header];
+         const Terminator& term = info.terminator;
+         if (!term.loopHeader || term.mergeBlock == InvalidControlFlowId || term.continueBlock == InvalidControlFlowId) continue;
+         SpirvEmitterState::LoopGuardCounter counter;
+         counter.header = info.id;
+         counter.merge = term.mergeBlock;
+         counter.continueBlock = term.continueBlock;
++        // The header dominates the blocks the entry reaches only through it, and those it reaches
++        // itself; its predecessors among them are the back edges' sources, and the blocks that reach
++        // those without passing the header are the loop.
++        std::vector<char> around(count, 0), after(count, 0), inside(count, 0);
++        std::vector<std::size_t> stack;
++        const auto walk = [&](std::vector<char>& seen, std::size_t from, const std::vector<std::vector<std::size_t>>& edges) {
++            stack.assign(1u, from);
++            seen[from] = 1;
++            while (!stack.empty()) {
++                const auto at = stack.back();
++                stack.pop_back();
++                for (const auto next : edges[at]) {
++                    if (seen[next] || next == header) continue;
++                    seen[next] = 1;
++                    stack.push_back(next);
++                }
++            }
++        };
++        if (header != 0) walk(around, 0, successors);
++        walk(after, header, successors);
++        for (const auto latch : predecessors[header]) {
++            if (!after[latch] || around[latch]) continue;
++            counter.latches.push_back(infos[latch].id);
++            if (latch != header && !inside[latch]) walk(inside, latch, predecessors);
++        }
++        inside[header] = 1;
++        for (std::size_t index = 0; index < count; ++index) {
++            if (inside[index] && after[index] && !around[index]) counter.inside.push_back(infos[index].id);
++        }
++        std::ranges::sort(counter.inside);
+         counter.variable = state.module.DefineGlobalVariable(pointer, spv::StorageClassPrivate);
+         state.module.AddFunction(spv::OpStore, counter.variable, ConstantU32(state, 0u));
+-        state.loopGuardCounters.push_back(counter);
++        state.loopGuardCounters.push_back(std::move(counter));
+     }
+ }
+ 
++bool InsideLoop(const SpirvEmitterState::LoopGuardCounter& counter, std::uint32_t block) {
++    return std::ranges::binary_search(counter.inside, block);
++}
++
++// Counts an iteration on each back edge, and clears the count on each entry from outside the loop.
+ void CountLoopGuardEdges(SpirvEmitterState& state, const BlockInfo& info) {
+     if (state.loopGuardLimit == 0) return;
+     const Terminator& term = info.terminator;
+     for (const auto& counter : state.loopGuardCounters) {
+-        if (counter.continueBlock == info.id) {
++        if (std::ranges::find(counter.latches, info.id) != counter.latches.end()) {
+             const auto count = state.module.AllocateId();
+             state.module.AddFunction(spv::OpLoad, TypeU32(state), count, counter.variable);
+             state.module.AddFunction(spv::OpStore, counter.variable, EmitBinaryU32(state, spv::OpIAdd, count, ConstantU32(state, 1u)));
+-        } else if (counter.header == term.trueBlock || (term.kind == TerminatorKind::ConditionalBranch && counter.header == term.falseBlock)) {
++        } else if (!InsideLoop(counter, info.id) && (counter.header == term.trueBlock || (term.kind == TerminatorKind::ConditionalBranch && counter.header == term.falseBlock))) {
+             state.module.AddFunction(spv::OpStore, counter.variable, ConstantU32(state, 0u));
+         }
+     }
+ }
+ 
+-const SpirvEmitterState::LoopGuardCounter* LoopGuardFor(const SpirvEmitterState& state, std::uint32_t merge) {
++// The loops a conditional branch leaves on one side and stays in on the other: its true side's in
++// `whenTrue`, its false side's in `whenFalse`. The side that leaves may be the loop's merge block,
++// or a block that goes on to it (or to a return) without coming back to the back edge.
++void LoopExitsOf(const SpirvEmitterState& state, const BlockInfo& info, std::vector<const SpirvEmitterState::LoopGuardCounter*>& whenTrue, std::vector<const SpirvEmitterState::LoopGuardCounter*>& whenFalse) {
++    const Terminator& term = info.terminator;
+     for (const auto& counter : state.loopGuardCounters) {
+-        if (counter.merge == merge) return &counter;
++        if (!InsideLoop(counter, info.id)) continue;
++        const bool trueStays = InsideLoop(counter, term.trueBlock);
++        const bool falseStays = InsideLoop(counter, term.falseBlock);
++        if (trueStays && !falseStays) whenFalse.push_back(&counter);
++        else if (!trueStays && falseStays) whenTrue.push_back(&counter);
+     }
+-    return nullptr;
+ }
+ 
+-std::uint32_t GuardLoopExit(SpirvEmitterState& state, const BlockInfo& info, const SpirvEmitterState::LoopGuardCounter& counter, std::uint32_t condition, bool exitWhenTrue) {
++std::uint32_t GuardLoopExit(SpirvEmitterState& state, const BlockInfo& info, std::span<const SpirvEmitterState::LoopGuardCounter* const> counters, std::uint32_t condition, bool exitWhenTrue) {
+     const auto boolType = TypeBool(state);
+-    const auto count = state.module.AllocateId();
+-    state.module.AddFunction(spv::OpLoad, TypeU32(state), count, counter.variable);
++    std::uint32_t exhausted = 0;
++    for (const auto* counter : counters) {
++        const auto count = state.module.AllocateId();
++        state.module.AddFunction(spv::OpLoad, TypeU32(state), count, counter->variable);
++        const auto spent = Binary(state, spv::OpUGreaterThanEqual, boolType, count, ConstantU32(state, state.loopGuardLimit));
++        exhausted = exhausted == 0 ? spent : Binary(state, spv::OpLogicalOr, boolType, exhausted, spent);
++    }
+     const auto previous = state.module.AllocateId();
+     state.module.AddFunction(spv::OpLoad, TypeU32(state), previous, state.loopGuardPc);
+     const auto clear = Binary(state, spv::OpIEqual, boolType, previous, ConstantU32(state, 0u));
+-    const auto exhausted = Binary(state, spv::OpUGreaterThanEqual, boolType, count, ConstantU32(state, state.loopGuardLimit));
+     const auto tripped = Binary(state, spv::OpLogicalOr, boolType, exhausted, Unary(state, spv::OpLogicalNot, boolType, clear));
+     const auto exits = exitWhenTrue ? condition : Unary(state, spv::OpLogicalNot, boolType, condition);
+     const auto forced = Binary(state, spv::OpLogicalAnd, boolType, Binary(state, spv::OpLogicalAnd, boolType, exhausted, clear), Unary(state, spv::OpLogicalNot, boolType, exits));
+@@ -283,8 +348,10 @@ void EmitStructuredTerminator(SpirvValueEmitContext& ctx, const IrProgram& progr
+             }
+             auto condition = EmitBranchCondition(ctx, info);
+             if (state.loopGuardLimit != 0 && term.trueBlock != term.falseBlock) {
+-                if (const auto* counter = LoopGuardFor(state, term.trueBlock)) condition = GuardLoopExit(state, info, *counter, condition, true);
+-                else if (const auto* counter = LoopGuardFor(state, term.falseBlock)) condition = GuardLoopExit(state, info, *counter, condition, false);
++                std::vector<const SpirvEmitterState::LoopGuardCounter*> whenTrue, whenFalse;
++                LoopExitsOf(state, info, whenTrue, whenFalse);
++                if (!whenTrue.empty()) condition = GuardLoopExit(state, info, whenTrue, condition, true);
++                else if (!whenFalse.empty()) condition = GuardLoopExit(state, info, whenFalse, condition, false);
+             }
+             static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
+             if (debug) std::fprintf(stderr, "[spirv] block %u branches on %%%u = %s (kind %d)\n", static_cast<unsigned>(info.id), condition, std::string(IrOpcodeName(info.condition->Resolve()->Opcode())).c_str(), static_cast<int>(info.terminator.condition));
+diff --git a/core/shader/recompiler/tests/LoopGuardTests.cpp b/core/shader/recompiler/tests/LoopGuardTests.cpp
+index e71f963d3e..8bd8a74fd7 100644
+--- a/core/shader/recompiler/tests/LoopGuardTests.cpp
++++ b/core/shader/recompiler/tests/LoopGuardTests.cpp
+@@ -114,6 +114,71 @@ void TestEndlessLoopLeavesAtTheLimit() {
+     }), "a loop the guard stopped records a LoopLimit fault");
+ }
+ 
++// A loop whose two data-dependent exits each go through a block of their own (a store) before the
++// code after the loop: no branch targets the merge block directly, as in a 837k-word compute
++// shader whose four loops counted their iterations but never compared the count with the limit.
++constexpr std::array<std::uint32_t, 15> ExitsThroughBlocks{
++    0xbe880381u,              // s_mov_b32 s8, 1
++    0x80088108u,              // loop: s_add_u32 s8, s8, 1
++    0xbf068008u,              // s_cmp_eq_u32 s8, 0
++    0xbf850003u,              // s_cbranch_scc1 first
++    0xbf06c108u,              // s_cmp_eq_u32 s8, -1
++    0xbf850005u,              // s_cbranch_scc1 second
++    0xbf82fffau,              // s_branch loop
++    0x7e020281u,              // first: v_mov_b32 v1, 1
++    0xe0701000u, 0x80040100u, // buffer_store_dword v1, v0, s[16:19], 0 offen
++    0xbf820003u,              // s_branch end
++    0x7e020282u,              // second: v_mov_b32 v1, 2
++    0xe0701000u, 0x80040100u, // buffer_store_dword v1, v0, s[16:19], 0 offen
++    0xbf810000u,              // end: s_endpgm
++};
++
++void TestExitsThroughBlocksLeaveAtTheLimit() {
++    constexpr std::uint32_t OutputAddress = 0x30000000u;
++    static std::array<std::byte, 4096> output{};
++    std::array<std::uint32_t, 20> user{};
++    user[16] = OutputAddress;
++    user[18] = 1024u;
++    user[19] = 0xfacu | (77u << 12u);
++    const std::vector<MemoryRegion> regions{{OutputAddress, std::span<const std::byte>(output)}};
++    const ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, std::span<const std::uint32_t>(ExitsThroughBlocks), 0, {}},
++        {32u, 0, std::span<const std::uint32_t>(user), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        Target(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    const auto result = Recompile(request);
++    const auto view = result.spirv.Words();
++    const std::vector<std::uint32_t> words(view.begin(), view.end());
++
++    std::string log;
++    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
++    tools.SetMessageConsumer([&](spv_message_level_t, const char*, const spv_position_t&, const char* message) { log += message; });
++    spvtools::ValidatorOptions options;
++    options.SetScalarBlockLayout(true);
++    if (!tools.Validate(words.data(), words.size(), options)) std::fprintf(stderr, "%s\n", log.c_str());
++    Require(tools.Validate(words.data(), words.size(), options), "the loop guarded at its indirect exits validates");
++
++    const auto instructions = Instructions(words);
++    std::vector<std::uint32_t> limitConstants;
++    bool indirectOnly = false;
++    for (const auto& instruction : instructions) {
++        if (instruction.op == spv::OpConstant && instruction.operands.size() == 3u && instruction.operands[2] == Limit) limitConstants.push_back(instruction.operands[1]);
++        if (instruction.op != spv::OpLoopMerge) continue;
++        const auto merge = instruction.operands[0];
++        indirectOnly |= std::ranges::none_of(instructions, [&](const Instruction& branch) {
++            return branch.op == spv::OpBranchConditional && (branch.operands[1] == merge || branch.operands[2] == merge);
++        });
++    }
++    Require(indirectOnly, "the loop's exits reach its merge block only through blocks of their own");
++    const auto compares = std::ranges::count_if(instructions, [&](const Instruction& instruction) {
++        return instruction.op == spv::OpUGreaterThanEqual && std::ranges::find(limitConstants, instruction.operands[3]) != limitConstants.end();
++    });
++    Require(compares != 0, "the exits compare the loop's iteration count with the limit");
++}
++
+ }
+ 
+ int main() {
+@@ -124,6 +189,7 @@ int main() {
+ #endif
+     try {
+         TestEndlessLoopLeavesAtTheLimit();
++        TestExitsThroughBlocksLeaveAtTheLimit();
+     } catch (const std::exception& error) {
+         std::fprintf(stderr, "%s\n", error.what());
+         return 1;

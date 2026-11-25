@@ -210,7 +210,12 @@ struct sa5_host_buffer
     uint64_t address;
 };
 
-/* Returns 0 and the validated module in *out (free with sa5_free_words), or -1 and a message. */
+/* Returns 0 and the validated module in *out (free with sa5_free_words), or -1 and a message.
+ * Every variable at a remap's or host buffer's (set, binding) is rewritten: AnyPS5 declares several
+ * at one binding (views of the guest buffers per element type, an image table per image type).
+ * OpArrayLength on a view of elements other than dwords counts its own elements. A variable the
+ * module uses that is left on a descriptor set fails the call, as vkd3d-proton's layout has none of
+ * AnyPS5's own; SA5_FINALIZE_PARTIAL=1 allows it (offline checks that bind only some). */
 SA5_API int sa5_finalize(const struct sa5_result *result, const struct sa5_remap *remaps, uint32_t remap_count,
                          const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t **out,
                          uint32_t *out_count, char *error, size_t error_size);
@@ -229,6 +234,13 @@ SA5_API void sa5_free_words(uint32_t *words);
 SA5_API int sa5_finalize_draw(const struct sa5_result *result, const struct sa5_remap *remaps, uint32_t remap_count,
                               const struct sa5_host_buffer *buffers, uint32_t buffer_count, uint32_t draw_block_base,
                               uint32_t **out, uint32_t *out_count, char *error, size_t error_size);
+/* For tests: the rewrite of sa5_finalize_draw (sa5_finalize's with draw_block_base
+ * SA5_NO_DRAW_BLOCK) on a SPIR-V module with no specialization constants to freeze. */
+#define SA5_NO_DRAW_BLOCK 0xffffffffu
+SA5_API int sa5_finalize_words(const uint32_t *words, uint32_t word_count, const struct sa5_remap *remaps,
+                               uint32_t remap_count, const struct sa5_host_buffer *buffers, uint32_t buffer_count,
+                               uint32_t draw_block_base, uint32_t **out, uint32_t *out_count, char *error,
+                               size_t error_size);
 /* spirv-val for Vulkan 1.2 (scalar block layout): 0, or -1 and the validator's messages. */
 SA5_API int sa5_validate(const uint32_t *words, uint32_t word_count, char *error, size_t error_size);
 

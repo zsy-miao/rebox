@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -233,7 +234,10 @@ struct Module {
 
     std::uint32_t Pointer(std::uint32_t storageClass, std::uint32_t pointee) { return Type(OpTypePointer, {storageClass, pointee}); }
 
-    std::uint32_t VariableAt(std::uint32_t set, std::uint32_t binding) const
+    // Every variable at a set and binding. AnyPS5 declares several at one binding: a view of the
+    // guest buffers per element type (buffers, buffers_coherent, buffers_u64, buffers_u8) and an
+    // image table per image type (table_images_N). Each one must move, not just the first.
+    std::vector<std::uint32_t> VariablesAt(std::uint32_t set, std::uint32_t binding) const
     {
         std::map<std::uint32_t, std::uint32_t> sets, bindings;
         for (const auto& inst : insts) {
@@ -241,9 +245,27 @@ struct Module {
             if (inst[2] == DecorationDescriptorSet) sets[inst[1]] = inst[3];
             if (inst[2] == DecorationBinding) bindings[inst[1]] = inst[3];
         }
+        std::vector<std::uint32_t> found;
         for (const auto& [id, b] : bindings)
-            if (b == binding && sets.count(id) && sets.at(id) == set) return id;
-        Fail("no variable at set " + std::to_string(set) + " binding " + std::to_string(binding));
+            if (b == binding && sets.count(id) && sets.at(id) == set) found.push_back(id);
+        if (found.empty()) Fail("no variable at set " + std::to_string(set) + " binding " + std::to_string(binding));
+        return found;
+    }
+
+    std::string NameOf(std::uint32_t id) const
+    {
+        for (const auto& inst : insts) {
+            if (Op(inst) != OpName || inst.size() < 3 || inst[1] != id) continue;
+            std::string name;
+            for (std::size_t w = 2; w < inst.size(); w++)
+                for (std::uint32_t b = 0; b < 4; b++) {
+                    const char c = static_cast<char>((inst[w] >> (8u * b)) & 0xffu);
+                    if (!c) return name;
+                    name += c;
+                }
+            return name;
+        }
+        return "%" + std::to_string(id);
     }
 };
 
@@ -335,9 +357,11 @@ std::uint32_t DynamicIndexingCapability(std::uint32_t kind)
     }
 }
 
-void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
+// One variable of a remapped binding. Its heap-index table (made on first dynamic use, without a
+// draw block) is shared with the binding's other variables.
+void RebindVariable(Module& m, const sa5_remap& remap, const DrawBlock* draw, std::uint32_t var, std::uint32_t& table,
+                    std::uint32_t& privateUintPtr)
 {
-    const std::uint32_t var = m.VariableAt(remap.set, remap.binding);
     const Inst varDef = m.Def(var);
     const std::uint32_t storageClass = varDef[3];
     const Inst ptrType = m.Def(varDef[1]);
@@ -364,8 +388,8 @@ void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
         if (Op(inst) == OpDecorate && inst.size() >= 3 && inst[2] == DecorationNonUniform) nonUniform.insert(inst[1]);
 
     // The heap-index table for dynamic indices, made on first use.
-    std::uint32_t table = 0, privateUintPtr = 0;
     const auto makeTable = [&] {
+        if (table) return;
         const std::uint32_t arr = m.Type(OpTypeArray, {uintType, m.Constant(remap.count)});
         Inst composite{OpConstantComposite, arr, m.NewId()};
         for (std::uint32_t i = 0; i < remap.count; i++) composite.push_back(m.Constant(remap.heap_indices[i]));
@@ -456,6 +480,53 @@ void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw)
     if (dynamic) {
         m.AddCapability(DynamicIndexingCapability(remap.kind));
         if (!decorations.empty()) m.AddCapability(CapShaderNonUniform);
+    }
+}
+
+void Rebind(Module& m, const sa5_remap& remap, const DrawBlock* draw, std::set<std::uint32_t>& rebound)
+{
+    std::uint32_t table = 0, privateUintPtr = 0;
+    for (const std::uint32_t var : m.VariablesAt(remap.set, remap.binding)) {
+        RebindVariable(m, remap, draw, var, table, privateUintPtr);
+        rebound.insert(var);
+    }
+}
+
+// Whether a caller binds only some of a module's bindings on purpose (sa5_check's offline sweeps,
+// which have no heap): SA5_FINALIZE_PARTIAL=1.
+bool PartialFinalize()
+{
+    static const bool partial = [] {
+        const char* v = std::getenv("SA5_FINALIZE_PARTIAL");
+        return v && *v == '1';
+    }();
+    return partial;
+}
+
+// After the rewrite, every variable the module uses that still has a descriptor set must be one
+// Rebind moved; host buffers have no variable left. Any other is still at AnyPS5's own set and
+// binding, which vkd3d-proton's layout doesn't have: RADV then reads its descriptor from wherever
+// that set's address points (a GPU page fault at a constant offset past set 0). Failing the compile
+// skips the draw or dispatch instead.
+void CheckBindings(const Module& m, const std::set<std::uint32_t>& rebound)
+{
+    if (PartialFinalize()) return;
+    std::map<std::uint32_t, std::uint32_t> sets, bindings;
+    for (const auto& inst : m.insts) {
+        if (Op(inst) != OpDecorate || inst.size() < 4) continue;
+        if (inst[2] == DecorationDescriptorSet) sets[inst[1]] = inst[3];
+        if (inst[2] == DecorationBinding) bindings[inst[1]] = inst[3];
+    }
+    std::set<std::uint32_t> used;
+    for (const auto& inst : m.insts)
+        for (const auto w : PointerWords(inst)) used.insert(inst[w]);
+    for (const auto& inst : m.insts) {
+        if (Op(inst) != OpVariable || inst.size() < 4) continue;
+        const std::uint32_t id = inst[2];
+        if (rebound.count(id) || !used.count(id) || (!sets.count(id) && !bindings.count(id))) continue;
+        Fail("variable " + m.NameOf(id) + " is left at set " + (sets.count(id) ? std::to_string(sets[id]) : "?") +
+             " binding " + (bindings.count(id) ? std::to_string(bindings[id]) : "?") +
+             ", which vkd3d-proton's layout doesn't have");
     }
 }
 
@@ -591,6 +662,58 @@ std::pair<std::uint32_t, std::uint32_t> PushBlock(Module& m, std::uint32_t base,
     return {var, 1};
 }
 
+// Loads and stores through physical-storage-buffer pointers declare an alignment of at least their
+// largest scalar: the rewrite gives every one 4, which a 64-bit view (buffers_u64, gds_u64) needs
+// to be 8.
+void AlignPhysicalAccesses(Module& m)
+{
+    std::map<std::uint32_t, const Inst*> types;  // type id -> definition
+    for (const auto& inst : m.insts) {
+        const auto op = Op(inst);
+        if (op >= 19 && op <= 39 && inst.size() > 1) types[inst[1]] = &inst;
+    }
+    std::map<std::uint32_t, std::uint32_t> scalarBytes;
+    const std::function<std::uint32_t(std::uint32_t)> bytesOf = [&](std::uint32_t type) -> std::uint32_t {
+        if (scalarBytes.count(type)) return scalarBytes[type];
+        std::uint32_t bytes = 4;
+        if (types.count(type)) {
+            const Inst& t = *types[type];
+            switch (Op(t)) {
+            case OpTypeInt: case 22 /* OpTypeFloat */: bytes = std::max(1u, t[2] / 8u); break;
+            case OpTypeVector: case OpTypeArray: case OpTypeRuntimeArray: bytes = bytesOf(t[2]); break;
+            case OpTypeStruct:
+                bytes = 1;
+                for (std::size_t w = 2; w < t.size(); w++) bytes = std::max(bytes, bytesOf(t[w]));
+                break;
+            case OpTypePointer: bytes = t[2] == StorageClassPhysicalStorageBuffer ? 8u : 4u; break;
+            default: break;
+            }
+        }
+        return scalarBytes[type] = bytes;
+    };
+    // Each pointer value's type, from the instructions that make pointers in functions.
+    std::map<std::uint32_t, std::uint32_t> pointerType;
+    for (const auto& inst : m.insts) {
+        const auto op = Op(inst);
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain || op == OpPtrAccessChain || op == OpCopyObject ||
+             op == OpBitcast) && inst.size() >= 3)
+            pointerType[inst[2]] = inst[1];
+    }
+    const auto pointee = [&](std::uint32_t pointer) -> std::uint32_t {
+        if (!pointerType.count(pointer) || !types.count(pointerType[pointer])) return 0;
+        const Inst& t = *types[pointerType[pointer]];
+        return Op(t) == OpTypePointer && t[2] == StorageClassPhysicalStorageBuffer ? t[3] : 0u;
+    };
+    for (auto& inst : m.insts) {
+        const auto op = Op(inst);
+        std::size_t mask = 0, value = 0;
+        if (op == OpLoad && inst.size() >= 6) mask = 4, value = pointee(inst[3]) ? inst[1] : 0u;
+        else if (op == OpStore && inst.size() >= 5) mask = 3, value = pointee(inst[1]);
+        if (!value || !(inst[mask] & MemoryAccessAligned)) continue;
+        inst[mask + 1] = std::max(inst[mask + 1], bytesOf(static_cast<std::uint32_t>(value)));
+    }
+}
+
 void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count, const DrawBlock* draw)
 {
     if (!count) return;
@@ -613,35 +736,64 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
                                                    : std::pair<std::uint32_t, std::uint32_t>{0u, 0u};
     const std::uint32_t pushUvec2 = m.Pointer(StorageClassPushConstant, uvec2);
 
-    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; std::uint32_t address; };
+    // stride: the byte size of the block's runtime array elements. Lengths are given in dwords;
+    // OpArrayLength on a view of other elements (buffers_u64, buffers_u8, gds_u64) counts those.
+    // tablePtr: for a guest buffer array, the type its address table is read through (a uint array).
+    struct Buffer { std::uint32_t var, block, psbPtr, slot, length; bool table; std::uint32_t address, stride, tablePtr; };
     std::vector<Buffer> list;
     std::set<std::uint32_t> vars;
     const std::uint32_t psbUint = m.Pointer(StorageClassPhysicalStorageBuffer, uintType);
+    std::uint32_t uintTablePtr = 0;
+    const auto elementStride = [&](std::uint32_t block) {
+        const Inst s = m.Def(block);
+        if (Op(s) != OpTypeStruct || s.size() < 3) return 4u;
+        const std::uint32_t last = s.back();
+        if (Op(m.Def(last)) != OpTypeRuntimeArray) return 4u;
+        for (const auto& d : m.insts)
+            if (Op(d) == OpDecorate && d.size() >= 4 && d[1] == last && d[2] == DecorationArrayStride && d[3]) return d[3];
+        return 4u;
+    };
     for (std::uint32_t i = 0; i < count; i++) {
-        const std::uint32_t var = m.VariableAt(buffers[i].set, buffers[i].binding);
-        const Inst varDef = m.Def(var);
-        if (varDef[3] != StorageClassStorageBuffer) Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is not a storage buffer");
-        std::uint32_t block = m.Def(varDef[1])[3];
-        if (buffers[i].guest_array) {
-            // A guest buffer array: element i comes from an address table, {address, u32 count, 0}.
-            const Inst arr = m.Def(block);
-            if (Op(arr) != OpTypeArray) Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not an array");
-            block = arr[2];
-            const Inst s = m.Def(block);
-            if (Op(s) != OpTypeStruct || s.size() != 3 || Op(m.Def(s[2])) != OpTypeRuntimeArray || m.Def(s[2])[2] != uintType)
-                Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not uint arrays");
-        } else if (Op(m.Def(block)) != OpTypeStruct) {
-            Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is an array");
-        }
         std::uint32_t address = 0;
         if (buffers[i].address) {
             address = m.NewId();
             m.AddGlobal(Make(OpConstantComposite, {uvec2, address, m.Constant(static_cast<std::uint32_t>(buffers[i].address)),
                                                    m.Constant(static_cast<std::uint32_t>(buffers[i].address >> 32u))}));
         }
-        list.push_back({var, block, m.Pointer(StorageClassPhysicalStorageBuffer, block), buffers[i].push_slot,
-                        buffers[i].array_length, buffers[i].guest_array != 0, address});
-        vars.insert(var);
+        for (const std::uint32_t var : m.VariablesAt(buffers[i].set, buffers[i].binding)) {
+            const Inst varDef = m.Def(var);
+            if (varDef[3] != StorageClassStorageBuffer) Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is not a storage buffer");
+            std::uint32_t block = m.Def(varDef[1])[3];
+            if (buffers[i].guest_array) {
+                // A guest buffer array: element i comes from an address table, {address, u32 count, 0}.
+                const Inst arr = m.Def(block);
+                if (Op(arr) != OpTypeArray) Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not an array");
+                block = arr[2];
+                const Inst s = m.Def(block);
+                if (Op(s) != OpTypeStruct || s.size() != 3 || Op(m.Def(s[2])) != OpTypeRuntimeArray)
+                    Fail("guest buffers at binding " + std::to_string(buffers[i].binding) + " are not runtime arrays");
+            } else if (Op(m.Def(block)) != OpTypeStruct) {
+                Fail("host buffer at binding " + std::to_string(buffers[i].binding) + " is an array");
+            }
+            const std::uint32_t psbPtr = m.Pointer(StorageClassPhysicalStorageBuffer, block);
+            std::uint32_t tablePtr = psbPtr;
+            if (buffers[i].guest_array && m.Def(m.Def(block)[2])[2] != uintType) {
+                // A view of other elements (buffers_u64, buffers_u8): its table is still read as uints.
+                if (!uintTablePtr) {
+                    const std::uint32_t runtime = m.NewId(), s = m.NewId();
+                    m.AddGlobal(Make(OpTypeRuntimeArray, {runtime, uintType}));
+                    m.AddDecoration(Make(OpDecorate, {runtime, DecorationArrayStride, 4}));
+                    m.AddGlobal(Make(OpTypeStruct, {s, runtime}));
+                    m.AddDecoration(Make(OpDecorate, {s, DecorationBlock}));
+                    m.AddDecoration(Make(OpMemberDecorate, {s, 0, DecorationOffset, 0}));
+                    uintTablePtr = m.Pointer(StorageClassPhysicalStorageBuffer, s);
+                }
+                tablePtr = uintTablePtr;
+            }
+            list.push_back({var, block, psbPtr, buffers[i].push_slot, buffers[i].array_length,
+                            buffers[i].guest_array != 0, address, elementStride(block), tablePtr});
+            vars.insert(var);
+        }
     }
     std::map<std::uint32_t, const Buffer*> tableOf;
     for (const auto& b : list)
@@ -655,9 +807,19 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
     for (const auto& [ptr, pointee] : sbPointers) psbOf[ptr] = m.Pointer(StorageClassPhysicalStorageBuffer, pointee);
     // Each buffer's length: a constant, or (SA5_LENGTH_IN_DRAW_BLOCK) the index of its draw block word.
     std::map<std::uint32_t, std::uint32_t> lengthConstants, lengthWords;
+    // A length in dwords as a count of a view's elements: divided (wider elements) or multiplied
+    // (narrower), by a constant made here, before the walk below.
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> scaleOf;  // var -> opcode (0: none), factor
+    for (const auto& b : list) {
+        if (b.stride == 4) scaleOf[b.var] = {0u, 0u};
+        else if (b.stride % 4 == 0) scaleOf[b.var] = {134u /* OpUDiv */, m.Constant(b.stride / 4)};
+        else if (4 % b.stride == 0) scaleOf[b.var] = {OpIMul, m.Constant(4 / b.stride)};
+        else Fail("host buffer elements of " + std::to_string(b.stride) + " bytes");
+    }
     for (const auto& b : list) {
         if (b.length != SA5_LENGTH_IN_DRAW_BLOCK) {
-            lengthConstants[b.var] = m.Constant(b.length);
+            const std::uint64_t elements = static_cast<std::uint64_t>(b.length) * 4u / b.stride;
+            lengthConstants[b.var] = m.Constant(static_cast<std::uint32_t>(std::min<std::uint64_t>(elements, 0xffffffffu)));
             continue;
         }
         if (!draw) Fail("a host buffer's length is in a draw block, but there is none");
@@ -723,7 +885,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
                     out.push_back(Make(OpAccessChain, {pushUvec2, chain, pushVar, memberConstant, slotConstants[b.slot]}));
                     out.push_back(Make(OpLoad, {uvec2, value, chain}));
                 }
-                out.push_back(Make(OpBitcast, {b.psbPtr, pointer, value}));
+                out.push_back(Make(OpBitcast, {b.table ? b.tablePtr : b.psbPtr, pointer, value}));
                 current[b.var] = pointer;
                 rootOf[pointer] = b.var;
             }
@@ -731,19 +893,28 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
         }
         if (inFunction) {
             const auto derived = [&](std::uint32_t id) { return rootOf.count(id) != 0; };
+            // `dwords` as the result of OpArrayLength `inst` on a view of buffer variable `var`.
+            const auto lengthOf = [&](std::uint32_t var, std::uint32_t dwords) {
+                const auto [scale, factor] = scaleOf[var];
+                if (scale) out.push_back(Make(scale, {inst[1], inst[2], dwords, factor}));
+                else out.push_back(Make(OpCopyObject, {inst[1], inst[2], dwords}));
+            };
             if (op == OpArrayLength && inst.size() >= 5 && vars.count(inst[3])) {
-                std::uint32_t length = lengthConstants.count(inst[3]) ? lengthConstants[inst[3]] : 0u;
-                if (!length) length = draw->Word(m, out, drawPointer, lengthWords[inst[3]]);
-                out.push_back(Make(OpCopyObject, {inst[1], inst[2], length}));
+                if (lengthConstants.count(inst[3])) {
+                    out.push_back(Make(OpCopyObject, {inst[1], inst[2], lengthConstants[inst[3]]}));
+                } else {
+                    lengthOf(inst[3], draw->Word(m, out, drawPointer, lengthWords[inst[3]]));
+                }
                 continue;
             }
             if (op == OpArrayLength && inst.size() >= 5 && elementOf.count(inst[3])) {
                 // A guest buffer's length: the table entry's third word.
                 const auto [table, entry] = elementOf[inst[3]];
-                const std::uint32_t at = m.NewId(), chain = m.NewId();
+                const std::uint32_t at = m.NewId(), chain = m.NewId(), dwords = m.NewId();
                 out.push_back(Make(OpIAdd, {uintType, at, entry, c2}));
                 out.push_back(Make(OpAccessChain, {psbUint, chain, table, c0, at}));
-                out.push_back(Make(OpLoad, {inst[1], inst[2], chain, MemoryAccessAligned, 4}));
+                out.push_back(Make(OpLoad, {uintType, dwords, chain, MemoryAccessAligned, 4}));
+                lengthOf(rootOf[inst[3]], dwords);
                 continue;
             }
             if ((op == OpAccessChain || op == OpInBoundsAccessChain) && inst.size() >= 5 && tableOf.count(inst[3])) {
@@ -808,6 +979,7 @@ void HostBuffers(Module& m, const sa5_host_buffer* buffers, std::uint32_t count,
     m.AddCapability(CapPhysicalStorageBufferAddresses);
     for (auto& inst : m.insts)
         if (Op(inst) == OpMemoryModel) inst[1] = AddressingPhysicalStorageBuffer64;
+    AlignPhysicalAccesses(m);
 }
 
 void Validate(const std::vector<std::uint32_t>& words)
@@ -838,6 +1010,38 @@ bool ShouldValidate()
     return setting == 1 || (setting < 0 && (n < 256 || n % 32 == 0));
 }
 
+// The rewrite after freezing: draw_block_base SA5_NO_DRAW_BLOCK is sa5_finalize's, without a draw
+// block. Writes the module to *out.
+void Finish(Module& m, const sa5_remap* remaps, std::uint32_t remap_count, const sa5_host_buffer* buffers,
+            std::uint32_t buffer_count, std::uint32_t draw_block_base, std::uint32_t** out, std::uint32_t* out_count)
+{
+    if (remap_count && !remaps) Fail("bad arguments");
+    if (draw_block_base != SA5_NO_DRAW_BLOCK && draw_block_base % 8u)
+        Fail("the draw block's address must be 8-byte aligned in the push block");
+    FreezeMeshDraw(m);
+    std::set<std::uint32_t> rebound;
+    if (draw_block_base == SA5_NO_DRAW_BLOCK) {
+        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr, rebound);
+        HostBuffers(m, buffers, buffer_count, nullptr);
+    } else {
+        const DrawBlock draw(m, draw_block_base);
+        for (std::uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw, rebound);
+        HostBuffers(m, buffers, buffer_count, &draw);
+    }
+    CheckBindings(m, rebound);
+    const auto words = m.Words();
+    if (ShouldValidate()) Validate(words);
+    *out = new std::uint32_t[words.size()];
+    std::memcpy(*out, words.data(), words.size() * sizeof(std::uint32_t));
+    *out_count = static_cast<std::uint32_t>(words.size());
+}
+
+int Report(const std::exception& e, char* error, size_t error_size)
+{
+    if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
+    return -1;
+}
+
 }  // namespace
 
 extern "C" {
@@ -849,18 +1053,10 @@ SA5_API int sa5_finalize(const struct sa5_result* result, const struct sa5_remap
     try {
         if (!result || !out || !out_count) Fail("bad arguments");
         Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
-        FreezeMeshDraw(m);
-        for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], nullptr);
-        HostBuffers(m, buffers, buffer_count, nullptr);
-        const auto words = m.Words();
-        if (ShouldValidate()) Validate(words);
-        *out = new uint32_t[words.size()];
-        std::memcpy(*out, words.data(), words.size() * sizeof(uint32_t));
-        *out_count = static_cast<uint32_t>(words.size());
+        Finish(m, remaps, remap_count, buffers, buffer_count, SA5_NO_DRAW_BLOCK, out, out_count);
         return 0;
     } catch (const std::exception& e) {
-        if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
-        return -1;
+        return Report(e, error, error_size);
     }
 }
 
@@ -869,22 +1065,27 @@ SA5_API int sa5_finalize_draw(const struct sa5_result* result, const struct sa5_
                               uint32_t** out, uint32_t* out_count, char* error, size_t error_size)
 {
     try {
-        if (!result || !out || !out_count) Fail("bad arguments");
-        if (draw_block_base % 8u) Fail("the draw block's address must be 8-byte aligned in the push block");
+        if (!result || !out || !out_count || draw_block_base == SA5_NO_DRAW_BLOCK) Fail("bad arguments");
         Module m(Freeze(const_cast<sa5_result*>(result)->Spirv(), result->result.specialization));
-        FreezeMeshDraw(m);
-        const DrawBlock draw(m, draw_block_base);
-        for (uint32_t i = 0; i < remap_count; i++) Rebind(m, remaps[i], &draw);
-        HostBuffers(m, buffers, buffer_count, &draw);
-        const auto words = m.Words();
-        if (ShouldValidate()) Validate(words);
-        *out = new uint32_t[words.size()];
-        std::memcpy(*out, words.data(), words.size() * sizeof(uint32_t));
-        *out_count = static_cast<uint32_t>(words.size());
+        Finish(m, remaps, remap_count, buffers, buffer_count, draw_block_base, out, out_count);
         return 0;
     } catch (const std::exception& e) {
-        if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
-        return -1;
+        return Report(e, error, error_size);
+    }
+}
+
+SA5_API int sa5_finalize_words(const uint32_t* words, uint32_t word_count, const struct sa5_remap* remaps,
+                               uint32_t remap_count, const struct sa5_host_buffer* buffers, uint32_t buffer_count,
+                               uint32_t draw_block_base, uint32_t** out, uint32_t* out_count, char* error,
+                               size_t error_size)
+{
+    try {
+        if (!words || !out || !out_count) Fail("bad arguments");
+        Module m(std::vector<std::uint32_t>(words, words + word_count));
+        Finish(m, remaps, remap_count, buffers, buffer_count, draw_block_base, out, out_count);
+        return 0;
+    } catch (const std::exception& e) {
+        return Report(e, error, error_size);
     }
 }
 

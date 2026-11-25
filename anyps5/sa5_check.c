@@ -1092,7 +1092,7 @@ static int compute_sweep(const char *plan, int first, int count)
                     fclose(dump);
                 }
             }
-            printf("cs %s ok %u words, hash %016llx, %d loops (%d without a conditional exit), %u bindings, %s%.300s\n",
+            printf("cs %s ok %u words, hash %016llx, %d loops (%d without a conditional branch to their merge), %u bindings, %s%.300s\n",
                    name, words, (unsigned long long)hash, loops, no_exit, sa5_result_binding_count(result),
                    valid ? "valid" : "INVALID: ", valid ? "" : error);
             valid_count += valid;
@@ -1106,12 +1106,18 @@ static int compute_sweep(const char *plan, int first, int count)
     }
     fclose(f);
     printf("%s cs-check: %d of %d compute shaders compile, %d of those pass spirv-val; %d loops, %d without a "
-           "conditional exit\n", failed ? "info" : "ok  ", ok, ok + failed, valid_count, all_loops, all_no_exit);
+           "conditional branch to their merge\n", failed ? "info" : "ok  ", ok, ok + failed, valid_count, all_loops, all_no_exit);
     return 0;
 }
 
 int main(int argc, char **argv)
 {
+    /* Mesh modules, and vertex modules without SA5_REMAP=1, are finalized with only their host
+     * buffers bound: their guest descriptors stay where AnyPS5 put them, which sa5_finalize
+     * otherwise refuses (vkd3d-proton's layout has none of them). */
+    if (argc >= 2 && (!strcmp(argv[1], "mesh") || !strcmp(argv[1], "ms") || (!strcmp(argv[1], "vs") && !getenv("SA5_REMAP")))
+            && !getenv("SA5_FINALIZE_PARTIAL"))
+        _putenv("SA5_FINALIZE_PARTIAL=1");
     if (argc == 2 && !strcmp(argv[1], "mesh"))
         return mesh_builtin();
     if (argc > 2 && !strcmp(argv[1], "ms"))

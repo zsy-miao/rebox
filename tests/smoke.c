@@ -2443,6 +2443,182 @@ static void test_guest_buffer_entry(void)
           "a raw V# of 256 bytes at %#x%08x, in no known buffer, is empty (%u dwords)", e[1], e[0], e[2]);
 }
 
+/* A hand-assembled SPIR-V module, word by word. */
+struct spv_words { UINT32 w[512]; UINT32 n; };
+
+static void spv_op(struct spv_words *s, UINT32 op, const UINT32 *operands, UINT32 count)
+{
+    s->w[s->n++] = (count + 1) << 16 | op;
+    memcpy(s->w + s->n, operands, count * sizeof(*operands));
+    s->n += count;
+}
+#define SPV(s, op, ...) do { const UINT32 o_[] = { __VA_ARGS__ }; spv_op(s, op, o_, ARRAYSIZE(o_)); } while (0)
+
+static void spv_name(struct spv_words *s, UINT32 op, UINT32 id, const char *name)
+{
+    UINT32 o[16] = { id }, n = (UINT32)strlen(name) / 4 + 1;
+    memcpy(o + 1, name, strlen(name));
+    spv_op(s, op, o, n + 1);
+}
+
+/* AnyPS5 declares several variables at one binding: an image table per image type
+ * (table_images_N), and views of the guest buffers per element type (buffers, buffers_u64, ...).
+ * sa5_finalize moved only the first it found, and the others stayed at AnyPS5's own set and binding:
+ * RADV read their descriptors from past vkd3d-proton's set 0 (GPU faults at a constant address).
+ * Every one must move, and a variable left on a set fails the compile. */
+static void test_remap_aliases(void)
+{
+    enum { OpName = 5, OpMemoryModel = 14, OpEntryPoint, OpExecutionMode, OpCapability, OpTypeVoid = 19,
+           OpTypeInt = 21, OpTypeFloat, OpTypeImage = 25, OpTypeArray = 28, OpTypeRuntimeArray, OpTypeStruct,
+           OpTypePointer = 32, OpTypeFunction, OpConstant = 43, OpFunction = 54, OpFunctionEnd = 56,
+           OpVariable = 59, OpLoad = 61, OpStore, OpAccessChain = 65, OpArrayLength = 68, OpDecorate = 71,
+           OpMemberDecorate, OpUConvert = 113, OpIAdd = 128, OpUDiv = 134, OpLabel = 248, OpReturn = 253 };
+    enum { Block = 2, ArrayStride = 6, Binding = 33, DescriptorSet = 34, Offset = 35 };
+    enum { main_ = 1, void_, fn, uint_, c0, c1, float_, img2d, img3d, rt2d, rt3d, prt2d, prt3d, pimg2d, pimg3d,
+           tbl2d, tbl3d, u64, rtu, rtu64, sb, sb64, c2, arr, arr64, parr, parr64, bufs, bufs64, psb, psb64, pu,
+           pu64, label, a, ia, b, ib, e, len, pw, w, e64, len64, p64, x, sum, bound };
+    HMODULE sa5 = GetModuleHandleA("rebox_anyps5.dll") ? GetModuleHandleA("rebox_anyps5.dll")
+                                                       : LoadLibraryA("rebox_anyps5.dll");
+    int (*finalize_words)(const UINT32 *, UINT32, const struct sa5_remap *, UINT32, const struct sa5_host_buffer *,
+            UINT32, UINT32, UINT32 **, UINT32 *, char *, size_t);
+    int (*validate)(const UINT32 *, UINT32, char *, size_t);
+    void (*free_words)(UINT32 *);
+    struct spv_words s = { { 0x07230203, 0x00010500, 0, bound, 0 }, 5 };
+    static const UINT32 heap[2] = { 7, 9 };
+    struct sa5_remap remap = { 0, 260, 4 /* SampledImage */, 1, 1, 2, heap, 0 };
+    struct sa5_host_buffer host = { 0, 7, 0, 0, 1, 0, 0 };
+    UINT32 *out = NULL, count = 0;
+    char error[512] = "";
+
+    if (!sa5 || !(finalize_words = (void *)GetProcAddress(sa5, "sa5_finalize_words")))
+    {
+        printf("skip remapped aliases: no rebox_anyps5.dll with sa5_finalize_words\n");
+        return;
+    }
+    validate = (void *)GetProcAddress(sa5, "sa5_validate");
+    free_words = (void *)GetProcAddress(sa5, "sa5_free_words");
+
+    SPV(&s, OpCapability, 1 /* Shader */);
+    SPV(&s, OpCapability, 11 /* Int64 */);
+    SPV(&s, OpCapability, 5302 /* RuntimeDescriptorArray */);
+    SPV(&s, OpMemoryModel, 0, 1);
+    SPV(&s, OpEntryPoint, 5 /* GLCompute */, main_, 0x6e69616d, 0, tbl2d, tbl3d, bufs, bufs64);
+    SPV(&s, OpExecutionMode, main_, 17 /* LocalSize */, 1, 1, 1);
+    spv_name(&s, OpName, tbl2d, "table_images_29");
+    spv_name(&s, OpName, tbl3d, "table_images_31");
+    spv_name(&s, OpName, bufs, "buffers");
+    spv_name(&s, OpName, bufs64, "buffers_u64");
+    SPV(&s, OpDecorate, tbl2d, DescriptorSet, 0);
+    SPV(&s, OpDecorate, tbl2d, Binding, 260);
+    SPV(&s, OpDecorate, tbl3d, DescriptorSet, 0);
+    SPV(&s, OpDecorate, tbl3d, Binding, 260);
+    SPV(&s, OpDecorate, bufs, DescriptorSet, 0);
+    SPV(&s, OpDecorate, bufs, Binding, 7);
+    SPV(&s, OpDecorate, bufs64, DescriptorSet, 0);
+    SPV(&s, OpDecorate, bufs64, Binding, 7);
+    SPV(&s, OpDecorate, rtu, ArrayStride, 4);
+    SPV(&s, OpDecorate, rtu64, ArrayStride, 8);
+    SPV(&s, OpDecorate, sb, Block);
+    SPV(&s, OpMemberDecorate, sb, 0, Offset, 0);
+    SPV(&s, OpDecorate, sb64, Block);
+    SPV(&s, OpMemberDecorate, sb64, 0, Offset, 0);
+    SPV(&s, OpTypeVoid, void_);
+    SPV(&s, OpTypeFunction, fn, void_);
+    SPV(&s, OpTypeInt, uint_, 32, 0);
+    SPV(&s, OpConstant, uint_, c0, 0);
+    SPV(&s, OpConstant, uint_, c1, 1);
+    SPV(&s, OpConstant, uint_, c2, 2);
+    SPV(&s, OpTypeFloat, float_, 32);
+    SPV(&s, OpTypeImage, img2d, float_, 1 /* 2D */, 0, 0, 0, 1, 0);
+    SPV(&s, OpTypeImage, img3d, float_, 2 /* 3D */, 0, 0, 0, 1, 0);
+    SPV(&s, OpTypeRuntimeArray, rt2d, img2d);
+    SPV(&s, OpTypeRuntimeArray, rt3d, img3d);
+    SPV(&s, OpTypePointer, prt2d, 0 /* UniformConstant */, rt2d);
+    SPV(&s, OpTypePointer, prt3d, 0, rt3d);
+    SPV(&s, OpTypePointer, pimg2d, 0, img2d);
+    SPV(&s, OpTypePointer, pimg3d, 0, img3d);
+    SPV(&s, OpVariable, prt2d, tbl2d, 0);
+    SPV(&s, OpVariable, prt3d, tbl3d, 0);
+    SPV(&s, OpTypeInt, u64, 64, 0);
+    SPV(&s, OpTypeRuntimeArray, rtu, uint_);
+    SPV(&s, OpTypeRuntimeArray, rtu64, u64);
+    SPV(&s, OpTypeStruct, sb, rtu);
+    SPV(&s, OpTypeStruct, sb64, rtu64);
+    SPV(&s, OpTypeArray, arr, sb, c2);
+    SPV(&s, OpTypeArray, arr64, sb64, c2);
+    SPV(&s, OpTypePointer, parr, 12 /* StorageBuffer */, arr);
+    SPV(&s, OpTypePointer, parr64, 12, arr64);
+    SPV(&s, OpVariable, parr, bufs, 12);
+    SPV(&s, OpVariable, parr64, bufs64, 12);
+    SPV(&s, OpTypePointer, psb, 12, sb);
+    SPV(&s, OpTypePointer, psb64, 12, sb64);
+    SPV(&s, OpTypePointer, pu, 12, uint_);
+    SPV(&s, OpTypePointer, pu64, 12, u64);
+    SPV(&s, OpFunction, void_, main_, 0, fn);
+    SPV(&s, OpLabel, label);
+    SPV(&s, OpAccessChain, pimg2d, a, tbl2d, c1);
+    SPV(&s, OpLoad, img2d, ia, a);
+    SPV(&s, OpAccessChain, pimg3d, b, tbl3d, c0);
+    SPV(&s, OpLoad, img3d, ib, b);
+    SPV(&s, OpAccessChain, psb, e, bufs, c1);
+    SPV(&s, OpArrayLength, uint_, len, e, 0);
+    SPV(&s, OpAccessChain, pu, pw, bufs, c1, c0, c0);
+    SPV(&s, OpLoad, uint_, w, pw);
+    SPV(&s, OpAccessChain, psb64, e64, bufs64, c0);
+    SPV(&s, OpArrayLength, uint_, len64, e64, 0);
+    SPV(&s, OpAccessChain, pu64, p64, bufs64, c0, c0, c1);
+    SPV(&s, OpUConvert, u64, x, len);
+    SPV(&s, OpStore, p64, x);
+    SPV(&s, OpIAdd, uint_, sum, w, len64);
+    SPV(&s, OpStore, pw, sum);
+    s.w[s.n++] = 1 << 16 | OpReturn;
+    s.w[s.n++] = 1 << 16 | OpFunctionEnd;
+    CHECK(validate && !validate(s.w, s.n, error, sizeof(error)), "the aliased test module validates %s", error);
+
+    for (int draw = 0; draw < 2; draw++)
+    {
+        BOOL moved = TRUE, buffers_gone = TRUE, divides = FALSE, valid;
+        UINT32 sets = 0, at;
+        if (finalize_words(s.w, s.n, &remap, 1, &host, 1, draw ? 128 : SA5_NO_DRAW_BLOCK, &out, &count, error,
+                           sizeof(error)))
+        {
+            CHECK(0, "sa5_finalize_words rebinds aliased variables (%s): %s", draw ? "draw block" : "baked", error);
+            continue;
+        }
+        for (at = 5; at < count && out[at] >> 16; at += out[at] >> 16)
+        {
+            const UINT32 *i = out + at, op = i[0] & 0xffff;
+            if (op == OpDecorate && i[2] == DescriptorSet)
+            {
+                sets++;
+                moved &= i[3] == 1;
+            }
+            if (op == OpDecorate && i[2] == Binding)
+                moved &= i[3] == 1;
+            if (op == OpVariable && i[3] == 12)
+                buffers_gone = FALSE;
+            if (op == OpUDiv)
+                divides = TRUE;
+        }
+        valid = validate && !validate(out, count, error, sizeof(error));
+        CHECK(moved && sets == 2 && buffers_gone && divides && valid,
+              "sa5_finalize_words (%s) moves both image tables at one binding to set 1 binding 1 (%u sets, %s), "
+              "makes both buffer views pointers (%s), counts u64 elements of the second (%s), %s %s",
+              draw ? "draw block" : "baked", sets, moved ? "all moved" : "SOME LEFT", buffers_gone ? "yes" : "NO",
+              divides ? "yes" : "NO", valid ? "valid" : "INVALID:", valid ? "" : error);
+        free_words(out);
+        out = NULL;
+    }
+
+    /* The guest buffers not given as a host buffer: both their variables stay at set 0 binding 7. */
+    error[0] = 0;
+    CHECK(finalize_words(s.w, s.n, &remap, 1, NULL, 0, 128, &out, &count, error, sizeof(error))
+          && strstr(error, "is left at set 0 binding 7"),
+          "a variable left on AnyPS5's set and binding fails the compile (%s)", error);
+    if (out && !error[0])
+        free_words(out);
+}
+
 /* A console mesh shader in its container, as the target title's FSSMs have it (console_fssm.c: the
  * slot table at 0x10, the mesh record and stage data, a 24-byte shader ID before the code), made a
  * deferred mesh stage and compiled through ReboxConsoleCompile as at a mesh dispatch (patch 0013):
@@ -7394,6 +7570,7 @@ static void test_xbox(void)
     test_console_mesh_compile();
     test_program_names();
     test_guest_buffer_entry();
+    test_remap_aliases();
     test_real_heap_va(dev, queue);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_NONE);
     test_placed_texture(dev, queue, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
