@@ -135,6 +135,9 @@ enum
 void WINAPI ReboxConsoleDrawPipeline(BOOL found);
 void console_draw_watch_begin(void);
 UINT console_draw_watch_end(void);
+/* Guest buffers (V#s with a length) the draw last watched had read as empty: not GPU memory, and
+ * couldn't be made so (REBOX_DEBUG_VIEW_PROBE logs them a draw). */
+UINT console_draw_watch_empty_buffers(void);
 const char *console_draw_fate_name(UINT fate);
 /* REBOX_FRAME_TRACE: whether this present is traced, and the draw, ExecuteIndirect or dispatch about
  * to compile its stages (op NULL: none), with its first render target (console_compile.c). */

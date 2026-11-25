@@ -1748,6 +1748,9 @@ static void STDMETHODCALLTYPE device_CopyDescriptorsSimple(struct proxy *p, UINT
 static SRWLOCK signatures_lock = SRWLOCK_INIT;
 static void **signatures;
 static BYTE *signature_kinds; /* what each one's last argument does: SIGNATURE_* */
+/* Where in a record that argument's words start: after the root constants and views a signature
+ * sets first (the probe read a record's first words as a mesh dispatch's group counts). */
+static USHORT *signature_offsets;
 static UINT signature_count, signature_capacity;
 enum { SIGNATURE_OTHER, SIGNATURE_DRAW, SIGNATURE_MESH };
 
@@ -1775,14 +1778,16 @@ static BOOL is_command_signature(void *object)
 }
 
 /* Whether a command signature draws (SIGNATURE_DRAW), dispatches meshes (SIGNATURE_MESH) or neither. */
-static UINT signature_kind(void *object)
+static UINT signature_kind(void *object, UINT *offset)
 {
     UINT kind = SIGNATURE_OTHER;
+    *offset = 0;
     AcquireSRWLockShared(&signatures_lock);
     for (UINT i = 0; i < signature_count; i++)
         if (signatures[i] == object)
         {
             kind = signature_kinds[i];
+            *offset = signature_offsets[i];
             break;
         }
     ReleaseSRWLockShared(&signatures_lock);
@@ -1882,26 +1887,55 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
             UINT capacity = signature_capacity ? signature_capacity * 2 : 64;
             void **grown = realloc(signatures, capacity * sizeof(*signatures));
             BYTE *kinds = grown ? realloc(signature_kinds, capacity) : NULL;
+            USHORT *offsets = kinds ? realloc(signature_offsets, capacity * sizeof(*offsets)) : NULL;
             if (grown)
                 signatures = grown;
             if (kinds)
-            {
                 signature_kinds = kinds;
+            if (offsets)
+            {
+                signature_offsets = offsets;
                 signature_capacity = capacity;
             }
         }
         if (signature_count < signature_capacity)
         {
-            UINT kind = SIGNATURE_OTHER;
+            UINT kind = SIGNATURE_OTHER, at = 0, offset = 0;
             for (UINT i = 0; desc && desc->pArgumentDescs && i < desc->NumArgumentDescs; i++)
             {
-                UINT type = desc->pArgumentDescs[i].Type;
-                if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
-                    kind = SIGNATURE_DRAW;
-                else if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
-                    kind = SIGNATURE_MESH;
+                const D3D12_INDIRECT_ARGUMENT_DESC *a = &desc->pArgumentDescs[i];
+                if (a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW || a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)
+                    kind = SIGNATURE_DRAW, offset = at;
+                else if (a->Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
+                    kind = SIGNATURE_MESH, offset = at;
+                switch (a->Type)
+                {
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: at += 16; break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: at += 20; break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH: at += 12; break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+                    at += 16; break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT: at += a->Constant.Num32BitValuesToSet * 4; break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS: at += 104; break;
+                default: at += 8; break; /* a root view's address */
+                }
             }
             signature_kinds[signature_count] = (BYTE)kind;
+            signature_offsets[signature_count] = (USHORT)min(offset, 0xffffu);
+            if (kind == SIGNATURE_MESH)
+            {
+                static LONG logged;
+                if (InterlockedIncrement(&logged) <= 8)
+                {
+                    char types[128];
+                    int n = 0;
+                    types[0] = 0;
+                    for (UINT i = 0; i < desc->NumArgumentDescs && n < 100; i++)
+                        n += snprintf(types + n, sizeof(types) - n, " %u", (UINT)desc->pArgumentDescs[i].Type);
+                    rebox_log("d3d12_xs: mesh command signature: stride %u, argument types%s; the dispatch's group "
+                              "counts at byte %u of a record", desc->ByteStride, types, offset);
+                }
+            }
             signatures[signature_count++] = *out;
         }
         for (UINT i = 0; desc && desc->pArgumentDescs && i < desc->NumArgumentDescs; i++)
@@ -1927,35 +1961,48 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandSignature(struct proxy *p, 
  * address behind it (xmem gives the view memory of its own, so the title's data is at the CPU
  * address, which is what gets made GPU memory). */
 static D3D12_GPU_VIRTUAL_ADDRESS adopt_bound(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size,
-                                             BOOL guessed)
+                                             BOOL guessed, BOOL *empty)
 {
     static LONG logged;
     UINT64 end;
 
+    *empty = FALSE;
     if (!size || address < 0x100000000ull || address + size > 0x400000000000ull
             || (address + size > 0x200000000000ull && address < 0x210000000000ull))
         return address;
     address = gpu_view_to_cpu(address);
     if (gpu_memory_identity_extent(address, &end) && end >= address + size)
         return address;
-    if (!(guessed ? gpu_memory_adopt_some(address, size) : gpu_memory_adopt(address, size))
-            && InterlockedIncrement(&logged) <= 8)
-        rebox_log("d3d12_xs: %s at %#llx+%#x is not GPU memory and could not be made so: the GPU reads nothing there",
-                  what, (unsigned long long)address, size);
+    if (!(guessed ? gpu_memory_adopt_some(address, size) : gpu_memory_adopt(address, size)))
+    {
+        *empty = TRUE;
+        if (InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: %s at %#llx+%#x is not GPU memory and could not be made so: the GPU reads nothing "
+                      "there", what, (unsigned long long)address, size);
+    }
     return address;
 }
 
 static D3D12_GPU_VIRTUAL_ADDRESS ia_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
 {
-    return adopt_bound(what, address, size, FALSE);
+    BOOL empty;
+    return adopt_bound(what, address, size, FALSE, &empty);
 }
 
 /* A root view's size is a guess (ROOT_VIEW_SIZE, below): as much of it from the address on as can
  * be is made GPU memory, cut at the committed run's end or GPU memory above (a mesh draw's root
  * view whose guessed 64 KiB couldn't all be had stayed out entirely, and its shader read zeros). */
-static D3D12_GPU_VIRTUAL_ADDRESS root_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size)
+static D3D12_GPU_VIRTUAL_ADDRESS root_adopt(const char *what, D3D12_GPU_VIRTUAL_ADDRESS address, UINT size,
+                                            BOOL *empty)
 {
-    return adopt_bound(what, address, size, TRUE);
+    return adopt_bound(what, address, size, TRUE, empty);
+}
+
+/* A graphics root view bound: whether it reads as empty, for the debug view's probe. */
+static void note_root_view(struct proxy *p, UINT index, BOOL empty)
+{
+    if (index < 32)
+        p->debug_view.root_views_empty = (p->debug_view.root_views_empty & ~(1u << index)) | ((UINT)!!empty << index);
 }
 
 /* Slots 41-46: Set{Compute,Graphics}Root{ConstantBuffer,ShaderResource,UnorderedAccess}View (PC
@@ -2103,43 +2150,52 @@ static void ia_buffer_check(const char *what, int slot, D3D12_GPU_VIRTUAL_ADDRES
 
 static void STDMETHODCALLTYPE list_SetComputeRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root constant buffer", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootConstantBufferView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root constant buffer", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root constant buffer", FALSE, index, address);
+    note_root_view(p, index, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root shader resource", FALSE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootShaderResourceView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root shader resource", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root shader resource", FALSE, index, address);
+    note_root_view(p, index, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootShaderResourceView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetComputeRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root unordered access", TRUE, index, address);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
 static void STDMETHODCALLTYPE list_SetGraphicsRootUnorderedAccessView(struct proxy *p, UINT index, UINT64 address)
 {
-    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE);
+    BOOL empty;
+    address = root_adopt("a root unordered access", address, ROOT_VIEW_SIZE, &empty);
     address = root_view_check("a root unordered access", TRUE, index, address);
+    note_root_view(p, index, empty);
     ID3D12GraphicsCommandList_SetGraphicsRootUnorderedAccessView(INNER(p, ID3D12GraphicsCommandList), index, address);
 }
 
@@ -2217,12 +2273,30 @@ static void STDMETHODCALLTYPE list_IASetPrimitiveTopology(struct proxy *p, D3D12
     ID3D12GraphicsCommandList_IASetPrimitiveTopology(INNER(p, ID3D12GraphicsCommandList), topology);
 }
 
+/* Slots 21 and 22: RSSetViewports and RSSetScissorRects, in place. Forwarded; the first of each is
+ * kept for REBOX_DEBUG_VIEW_PROBE, which logs them with a probed draw's results. */
+static void STDMETHODCALLTYPE list_RSSetViewports(struct proxy *p, UINT count, const D3D12_VIEWPORT *viewports)
+{
+    p->debug_view.viewports = viewports ? count : 0;
+    if (viewports && count)
+        p->debug_view.viewport = viewports[0];
+    ID3D12GraphicsCommandList_RSSetViewports(INNER(p, ID3D12GraphicsCommandList), count, viewports);
+}
+
+static void STDMETHODCALLTYPE list_RSSetScissorRects(struct proxy *p, UINT count, const D3D12_RECT *rects)
+{
+    p->debug_view.scissors = rects ? count : 0;
+    if (rects && count)
+        p->debug_view.scissor = rects[0];
+    ID3D12GraphicsCommandList_RSSetScissorRects(INNER(p, ID3D12GraphicsCommandList), count, rects);
+}
+
 /* ExecuteIndirect (PC 59): rays with no real pipeline set are skipped (see ray_signatures). */
 static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signature, UINT count, void *args, UINT64 offset,
         void *count_buffer, UINT64 count_offset)
 {
     BOOL traced;
-    UINT kind;
+    UINT kind, arg_at = 0;
 
     if (!signature || !is_command_signature(signature))
     {
@@ -2240,9 +2314,9 @@ static void STDMETHODCALLTYPE list_ExecuteIndirect(struct proxy *p, void *signat
         return;
     }
     indirect_barrier(p);
-    kind = debug_view_on() ? signature_kind(signature) : SIGNATURE_OTHER;
+    kind = debug_view_on() ? signature_kind(signature, &arg_at) : SIGNATURE_OTHER;
     if (kind != SIGNATURE_OTHER)
-        debug_view_watch_begin_indirect(p, args, offset, count_buffer, count_offset);
+        debug_view_watch_begin_indirect(p, args, offset + arg_at, count_buffer, count_offset);
     traced = trace_begin(p, TRUE, count_buffer ? "indirect-counted" : "indirect", count, 0, 0);
     ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
             p->inner, signature, count, args, offset, count_buffer, count_offset);
@@ -2272,9 +2346,9 @@ static void STDMETHODCALLTYPE list_Slot61(struct proxy *p, void *a, UINT_PTR b, 
         if (!InterlockedExchange(&logged, 1))
             rebox_log("d3d12_xs: command-list slot 61 called as ExecuteIndirect (first seen)");
         indirect_barrier(p);
-        UINT kind = debug_view_on() ? signature_kind(a) : SIGNATURE_OTHER;
+        UINT arg_at = 0, kind = debug_view_on() ? signature_kind(a, &arg_at) : SIGNATURE_OTHER;
         if (kind != SIGNATURE_OTHER)
-            debug_view_watch_begin_indirect(p, c, d, e, f);
+            debug_view_watch_begin_indirect(p, c, d + arg_at, e, f);
         traced = trace_begin(p, TRUE, e ? "indirect-counted" : "indirect", (UINT)b, 0, 0);
         ((void (STDMETHODCALLTYPE *)(void *, void *, UINT, void *, UINT64, void *, UINT64))PC_SLOT(p->inner, 59))(
                 p->inner, a, (UINT)b, c, d, e, f);
@@ -7545,6 +7619,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59, in place (Unreal 5 calls it so) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(21, list_RSSetViewports), FN(22, list_RSSetScissorRects), /* in place, kept for the probe */
         FN(47, list_IASetIndexBuffer), FN(48, list_IASetVertexBuffers), /* PC 43, 44 */
         FN(117, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
         FN(118, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */
@@ -7595,6 +7670,7 @@ static BOOL CALLBACK init_vtables(INIT_ONCE *once, void *param, void **ctx)
         FN(7, child_GetDevice),
         FN(59, list_ExecuteIndirect),                 /* PC 59 in place too (Unreal 5) */
         FN(20, list_IASetPrimitiveTopology),
+        FN(21, list_RSSetViewports), FN(22, list_RSSetScissorRects), /* in place, kept for the probe */
         FN(47, list_IASetIndexBuffer), FN(48, list_IASetVertexBuffers), /* PC 43, 44 */
         FN(119, list_BuildRaytracingAccelerationStructure),            /* PC 72 */
         FN(120, list_EmitRaytracingAccelerationStructurePostbuildInfo), /* PC 73 */

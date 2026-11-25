@@ -243,6 +243,8 @@ static UINT64 hash_words(UINT64 h, const void *data, SIZE_T size)
  * then. Until resolved, it holds the dummy texture. */
 struct late_texture { UINT32 *slot; UINT64 source; SIZE_T heap; UINT tries; UINT64 stage; };
 static BOOL guest_buffer_mappable(UINT64 *base, UINT64 *bytes);
+/* This thread's guest buffers with a length read as empty since console_draw_watch_begin. */
+static __thread UINT watch_empty_buffers;
 
 /* A guest buffer table entry ({address, length in dwords, 0, 0}) for a V#: the module reads the
  * buffer at that address directly, in bounds of that length. One in a GPU-only view of title
@@ -263,10 +265,16 @@ void WINAPI ReboxGuestBufferEntry(const UINT32 w[4], UINT32 entry[4])
         if (bytes && InterlockedIncrement(&logged) <= 8)
             rebox_log("d3d12_xs: V# %08x %08x %08x %08x has %llu bytes at %#llx: read as empty", w[0], w[1], w[2],
                       w[3], (unsigned long long)bytes, (unsigned long long)base);
+        if (bytes && base)
+            watch_empty_buffers++;
         bytes = 0;
     }
     else if (!guest_buffer_mappable(&base, &bytes))
+    {
+        if (bytes)
+            watch_empty_buffers++;
         bytes = 0;
+    }
     entry[0] = (UINT32)base;
     entry[1] = (UINT32)(base >> 32);
     entry[2] = (UINT32)min(bytes / 4, 0xffffffffull);
@@ -2942,6 +2950,12 @@ void console_draw_watch_begin(void)
     draw_watch.standin = FALSE;
     draw_watch.first = draw_watch.pixel = -1;
     draw_watch.pipeline = 0;
+    watch_empty_buffers = 0;
+}
+
+UINT console_draw_watch_empty_buffers(void)
+{
+    return watch_empty_buffers;
 }
 
 UINT console_draw_watch_end(void)

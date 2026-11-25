@@ -553,7 +553,8 @@ static BOOL usable_region(const MEMORY_BASIC_INFORMATION *mbi)
 static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, BOOL reach_back, UINT64 *start, UINT64 *end)
 {
     MEMORY_BASIC_INFORMATION mbi;
-    UINT64 run_start, run_end, reach;
+    UINT64 run_start, run_end, reach, own_lo;
+    BOOL mapped;
 
     if (!VirtualQuery((void *)(ULONG_PTR)address, &mbi, sizeof(mbi)) || !usable_region(&mbi))
         return FALSE;
@@ -564,10 +565,28 @@ static BOOL committed_run(UINT64 address, UINT64 lo, UINT64 hi, BOOL reach_back,
      * allocation: a request near the end of a run of them stopped at its own view, found less than
      * ADOPT_MIN, and the data there (a mesh draw's root view) stayed out of GPU memory for good. */
     reach = address > ADOPT_MIN ? (address - ADOPT_MIN) & ~(ADOPT_ALIGN - 1) : 0;
-    lo = max(lo, reach_back ? min((UINT64)(ULONG_PTR)mbi.AllocationBase, reach) : (UINT64)(ULONG_PTR)mbi.AllocationBase);
+    own_lo = max(lo, reach_back ? min((UINT64)(ULONG_PTR)mbi.AllocationBase, reach) : (UINT64)(ULONG_PTR)mbi.AllocationBase);
+    /* Past that, from a physical page's view on down through the views below it (mapped, each its
+     * own 64 KiB allocation), to lo: a chunk that began at its own view left the views just below
+     * it a hole under 2 MiB between the run's start and GPU memory, and nothing in them could be
+     * made GPU memory again (a world's root views and guest buffers there read as empty, a
+     * thousand times a second). */
+    mapped = mbi.Type == MEM_MAPPED;
     while (run_start > lo && VirtualQuery((void *)(ULONG_PTR)(run_start - 1), &mbi, sizeof(mbi))
            && usable_region(&mbi))
-        run_start = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+    {
+        UINT64 below = (UINT64)(ULONG_PTR)mbi.BaseAddress;
+        BOOL views = mapped && mbi.Type == MEM_MAPPED;
+        if (run_start <= own_lo && !views)
+            break;
+        if (below < own_lo && !views)
+        {
+            run_start = own_lo;
+            break;
+        }
+        mapped = mbi.Type == MEM_MAPPED;
+        run_start = below;
+    }
     while (run_end < hi && VirtualQuery((void *)(ULONG_PTR)run_end, &mbi, sizeof(mbi)) && usable_region(&mbi))
         run_end = (UINT64)(ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
     *start = max(run_start, lo);
@@ -740,6 +759,17 @@ adopt:
         adopt_fail(ADOPT_FAIL_RECENT, address, end);
         return held_head;
     }
+    /* No further than the GPU memory on either side (the walk through physical pages' views is a
+     * VirtualQuery each 64 KiB): the span stops there anyway, below. */
+    AcquireSRWLockShared(&lock);
+    for (c = chunks; c; c = c->next)
+    {
+        if (c->gpu + c->size <= address && c->gpu + c->size > base)
+            base = c->gpu + c->size;
+        if (c->gpu >= end && c->gpu < limit)
+            limit = c->gpu;
+    }
+    ReleaseSRWLockShared(&lock);
     if (!committed_run(address, base, limit, FALSE, &run_start, &run_end))
     {
         adopt_fail(ADOPT_FAIL_UNCOMMITTED, address, end);

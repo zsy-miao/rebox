@@ -342,11 +342,13 @@ void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
 
 /* REBOX_DEBUG_VIEW_PROBE=<n> (default 2, 0 off): in n frames (at least 10 s apart) where the target
  * shown had 64 draws or more in the frame before, each draw into it (up to PROBE_SLOTS) gets an
- * occlusion and a pipeline statistics query, and an ExecuteIndirect's first argument record (and
- * count) is copied as it stands at the draw. The results are logged once the GPU has them: whether
+ * occlusion and a pipeline statistics query, and the draw or mesh dispatch arguments of an
+ * ExecuteIndirect's first record (past the root arguments the signature sets first; and its count)
+ * are copied as they stand at the draw. The results are logged once the GPU has them: whether
  * the draws recorded with a pipeline dispatched any groups, got primitives to the clipper, kept
  * any past it, ran any pixels and passed any samples, which tells where a depth buffer still at its
- * clear value lost them. */
+ * clear value lost them; with each draw's viewport and scissor and the inputs it read as empty
+ * (guest buffers and root views in title memory not made GPU memory). */
 #define PROBE_SLOTS 512
 #define PROBE_STRIDE 128   /* readback bytes a slot: occlusion 8, statistics 88, arguments 20, count 4 */
 #define PROBE_STATS 8
@@ -363,7 +365,17 @@ static struct
     volatile LONG frame;   /* the frame whose draws are probed, or 0 */
     volatile LONG used;    /* slots handed out */
     ULONGLONG last_tick;
-    struct { BYTE recorded, mesh, fate, args_words, has_count; } slots[PROBE_SLOTS];
+    struct
+    {
+        BYTE recorded, mesh, fate, args_words, has_count;
+        /* As the draw was recorded: the list's first viewport and scissor (counts 0: none set
+         * since its reset), its graphics root views read as empty (a bit each), and the guest
+         * buffers its stages had read as empty. */
+        BYTE viewports, scissors;
+        D3D12_VIEWPORT viewport;
+        RECT scissor;
+        UINT root_views_empty, empty_buffers;
+    } slots[PROBE_SLOTS];
 } probe = { .remaining = -1 };
 
 static BOOL probe_setup(void)
@@ -438,11 +450,42 @@ static UINT probe_u32(UINT slot, UINT at)
 
 /* At a present after the probed frame: the results, once every query recorded has landed (or 8
  * presents on: lists never submitted). */
+/* A probed draw's viewport and scissor, as text. */
+static void probe_view_text(UINT i, char *out, size_t size)
+{
+    const D3D12_VIEWPORT *v = &probe.slots[i].viewport;
+    const RECT *r = &probe.slots[i].scissor;
+    int at;
+
+    if (probe.slots[i].viewports)
+        at = snprintf(out, size, "viewport %g,%g %gx%g depth %g-%g", v->TopLeftX, v->TopLeftY, v->Width, v->Height,
+                      v->MinDepth, v->MaxDepth);
+    else
+        at = snprintf(out, size, "no viewport set");
+    if (at < 0 || (size_t)at >= size)
+        return;
+    if (probe.slots[i].scissors)
+        snprintf(out + at, size - at, ", scissor %ld,%ld-%ld,%ld", r->left, r->top, r->right, r->bottom);
+    else
+        snprintf(out + at, size - at, ", no scissor set");
+}
+
+/* Whether a probed draw's viewport or scissor covers no pixel; one not set since the list's reset
+ * counts (D3D12's default is empty). */
+static BOOL probe_view_empty(UINT i)
+{
+    const D3D12_VIEWPORT *v = &probe.slots[i].viewport;
+    const RECT *r = &probe.slots[i].scissor;
+    return !probe.slots[i].viewports || !probe.slots[i].scissors || !(v->Width > 0.0f) || !(v->Height > 0.0f)
+            || r->right <= r->left || r->bottom <= r->top;
+}
+
 static void probe_report(LONG now)
 {
     struct sums
     {
         UINT draws, resolved, with_args, with_groups, with_clipped_in, with_clipped_out, with_pixels, with_samples;
+        UINT with_empty_view, with_empty_inputs;
         UINT64 groups, clip_in, clip_out, pixels, samples;
     } sums[3] = { { 0 } };  /* mesh draws recorded, other draws recorded, draws left out */
     static const char *const names[3] = { "mesh draws recorded", "other draws recorded", "draws left out" };
@@ -495,26 +538,34 @@ static void probe_report(LONG now)
         s->clip_out += st->CPrimitives;
         s->pixels += st->PSInvocations;
         s->samples += samples;
+        s->with_empty_view += probe_view_empty(i);
+        s->with_empty_inputs += probe.slots[i].empty_buffers || probe.slots[i].root_views_empty;
         if (recorded && probe.slots[i].mesh && detailed < 12)
         {
+            char view[160];
             detailed++;
+            probe_view_text(i, view, sizeof(view));
             rebox_log("d3d12_xs:   draw %u (%s): arguments %u %u %u%s%s, clipper %llu in %llu out, pixels %llu, samples "
-                      "%llu", i, console_draw_fate_name(probe.slots[i].fate), args[0], args[1], args[2],
-                      probe.slots[i].args_words ? "" : " (direct)",
+                      "%llu; %s; read as empty: %u guest buffers, root views %#x", i,
+                      console_draw_fate_name(probe.slots[i].fate), args[0], args[1], args[2],
+                      probe.slots[i].args_words ? "" : " (not read)",
                       probe.slots[i].has_count ? (count ? ", counted" : ", count 0") : "",
                       (unsigned long long)st->CInvocations, (unsigned long long)st->CPrimitives,
-                      (unsigned long long)st->PSInvocations, (unsigned long long)samples);
+                      (unsigned long long)st->PSInvocations, (unsigned long long)samples, view,
+                      probe.slots[i].empty_buffers, probe.slots[i].root_views_empty);
         }
     }
     for (UINT k = 0; k < 3; k++)
         if (sums[k].draws)
             rebox_log("d3d12_xs:   %s: %u, %u resolved; arguments read for %u, %u of them with work (%llu groups or "
                       "vertices x instances); primitives into the clipper in %u (%llu), out of it in %u (%llu); pixels "
-                      "in %u (%llu); samples passed in %u (%llu)", names[k], sums[k].draws, sums[k].resolved,
+                      "in %u (%llu); samples passed in %u (%llu); an empty or unset viewport or scissor in %u; inputs "
+                      "read as empty (guest buffers, root views) in %u", names[k], sums[k].draws, sums[k].resolved,
                       sums[k].with_args, sums[k].with_groups, (unsigned long long)sums[k].groups,
                       sums[k].with_clipped_in, (unsigned long long)sums[k].clip_in, sums[k].with_clipped_out,
                       (unsigned long long)sums[k].clip_out, sums[k].with_pixels, (unsigned long long)sums[k].pixels,
-                      sums[k].with_samples, (unsigned long long)sums[k].samples);
+                      sums[k].with_samples, (unsigned long long)sums[k].samples, sums[k].with_empty_view,
+                      sums[k].with_empty_inputs);
     {
         const struct sums *m = &sums[0];
         const char *verdict;
@@ -523,9 +574,14 @@ static void probe_report(LONG now)
         else if (m->with_samples)
             verdict = "mesh draws passed samples: depth was reached (unless depth writes are off), so a view still at "
                       "the clear value points at the read side (a later clear, another resource, HTILE)";
+        else if (m->with_clipped_out && m->with_empty_view == m->resolved)
+            verdict = "primitives left the clipper but every mesh draw's viewport or scissor was empty or unset";
+        else if (m->with_clipped_out && m->with_empty_inputs)
+            verdict = "primitives left the clipper but no sample passed, and mesh draws read inputs as empty (title "
+                      "memory not made GPU memory): positions all alike (zero area), else the depth or stencil test";
         else if (m->with_clipped_out)
-            verdict = "primitives were rasterized but no sample passed: the depth or stencil test, depth bounds, "
-                      "scissor or viewport";
+            verdict = "primitives left the clipper but no sample passed: zero-area primitives (positions all alike), "
+                      "or the depth or stencil test, depth bounds, scissor or viewport";
         else if (m->with_clipped_in)
             verdict = "primitives reached the clipper and all were clipped or culled: positions (w 0, NaN, outside) "
                       "or cull flags";
@@ -574,6 +630,14 @@ void debug_view_draw_begin(ID3D12GraphicsCommandList *list, struct debug_view_li
                                                        args, args_offset, n);
             probe.slots[slot].args_words = (BYTE)(n / 4);
         }
+        else
+        {
+            static LONG logged;
+            if (InterlockedIncrement(&logged) <= 4)
+                rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_PROBE: an ExecuteIndirect's arguments at %#llx aren't read: "
+                          "its argument resource has dimension %u, width %#llx", (unsigned long long)args_offset,
+                          (UINT)d.Dimension, (unsigned long long)d.Width);
+        }
     }
     if (count)
     {
@@ -585,6 +649,11 @@ void debug_view_draw_begin(ID3D12GraphicsCommandList *list, struct debug_view_li
             probe.slots[slot].has_count = 1;
         }
     }
+    probe.slots[slot].viewports = (BYTE)min(l->viewports, 255u);
+    probe.slots[slot].scissors = (BYTE)min(l->scissors, 255u);
+    probe.slots[slot].viewport = l->viewport;
+    probe.slots[slot].scissor = l->scissor;
+    probe.slots[slot].root_views_empty = l->root_views_empty;
     ID3D12GraphicsCommandList_BeginQuery(list, probe.occlusion, D3D12_QUERY_TYPE_OCCLUSION, slot);
     ID3D12GraphicsCommandList_BeginQuery(list, probe.stats, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot);
     l->probe = slot + 1;
@@ -604,6 +673,7 @@ void debug_view_draw(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
                                                    probe.readback, (UINT64)slot * PROBE_STRIDE + PROBE_STATS);
         probe.slots[slot].mesh = (BYTE)mesh;
         probe.slots[slot].fate = (BYTE)fate;
+        probe.slots[slot].empty_buffers = console_draw_watch_empty_buffers();
         probe.slots[slot].recorded = 1;
         l->probe = 0;
     }

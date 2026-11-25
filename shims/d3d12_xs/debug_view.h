@@ -13,6 +13,13 @@ struct debug_view_list
     void *rt_res, *depth_res;    /* what those entries held when bound */
     void *snapshot_res;          /* the chosen target, bound: copied when the pass ends */
     int probe;                   /* 1 + the probe slot of the draw being recorded, or 0 */
+    /* For the probe: the first viewport and scissor rectangle set (RSSetViewports and
+     * RSSetScissorRects; counts 0: none since the list was reset), and the graphics root views
+     * bound to title memory that couldn't be made GPU memory (a bit a root index). */
+    D3D12_VIEWPORT viewport;
+    RECT scissor;
+    UINT viewports, scissors;
+    UINT root_views_empty;
 };
 
 BOOL debug_view_on(void);
