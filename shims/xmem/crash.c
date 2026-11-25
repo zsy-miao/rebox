@@ -20,9 +20,11 @@
  * logged once, with its name, to see what a title is waiting for; after the
  * next present it can happen again (three times at most).
  *
- * Slow frames: REBOX_STACK_SAMPLE=N[,COUNT] logs every thread's stack every
- * N seconds, COUNT times (default 10), to see where a title that presents but
- * slowly spends its time. */
+ * Slow frames: REBOX_STACK_SAMPLE=N[,COUNT[,START]] logs every thread's stack
+ * every N seconds, COUNT times (default 10), to see where a title that presents
+ * but slowly spends its time; with START, from START seconds after the title
+ * starts (run 0549's 150 samples every 2 s ended 12 minutes before its world,
+ * the part that was slow). */
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -510,7 +512,9 @@ static DWORD WINAPI hang_watch(void *param)
 
 static DWORD WINAPI stack_sampler(void *param)
 {
-    DWORD every = LOWORD((ULONG_PTR)param), count = HIWORD((ULONG_PTR)param);
+    DWORD every = LOWORD((ULONG_PTR)param), count = HIWORD((ULONG_PTR)param), start = (DWORD)((ULONG_PTR)param >> 32);
+    if (start)
+        Sleep(start * 1000);
     for (DWORD i = 1; i <= count; i++)
     {
         Sleep(every * 1000);
@@ -685,9 +689,10 @@ void crash_report_install(ULONG_PTR gpu_window_base, ULONG_PTR gpu_window_size)
     {
         char sample[32];
         DWORD len = GetEnvironmentVariableA("REBOX_STACK_SAMPLE", sample, sizeof(sample));
-        unsigned every = 0, count = 10;
-        if (len && len < sizeof(sample) && sscanf(sample, "%u,%u", &every, &count) >= 1 && every && count)
+        unsigned every = 0, count = 10, start = 0;
+        if (len && len < sizeof(sample) && sscanf(sample, "%u,%u,%u", &every, &count, &start) >= 1 && every && count)
             CloseHandle(CreateThread(NULL, 0, stack_sampler,
-                                     (void *)(ULONG_PTR)MAKELONG(min(every, 0xffffu), min(count, 0xffffu)), 0, NULL));
+                                     (void *)((ULONG_PTR)MAKELONG(min(every, 0xffffu), min(count, 0xffffu))
+                                              | (ULONG_PTR)min(start, 0xffffffu) << 32), 0, NULL));
     }
 }

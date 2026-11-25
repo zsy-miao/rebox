@@ -1216,7 +1216,7 @@ static __thread LONG64 call_phase[PHASES];
 static struct title_wait
 {
     volatile LONG calls, overruns;
-    volatile LONG64 ticks;
+    volatile LONG64 ticks, census_ticks; /* in all; since the last census */
 } title_waits[2];
 
 static LONG64 ticks_now(void)
@@ -2320,10 +2320,11 @@ void console_display_draw_end(void)
  * compute state"). The census only names DrawInstanced and DrawIndexedInstanced; these count every
  * draw, mesh draw, ExecuteIndirect and dispatch. */
 enum { OUTCOME_OK, OUTCOME_BUDGET, OUTCOME_QUEUED, OUTCOME_WAIT, OUTCOME_PROGRAM_FAILED, OUTCOME_FAILED,
-       OUTCOME_OVERRUN, OUTCOMES };
+       OUTCOME_OVERRUN, OUTCOME_BEHIND, OUTCOMES };
 static const char *const outcome_names[OUTCOMES] = { "ok", "past the frame's budget", "compiling in the background",
                                                      "past their wait", "program failed before", "failed",
-                                                     "skipped behind a compile past its wait" };
+                                                     "skipped behind a compile past its wait",
+                                                     "not waited for, the pool behind" };
 static volatile LONG outcomes[4][OUTCOMES]; /* [compute, vertex, pixel, mesh] */
 static volatile LONG standins; /* pixel stand-ins given (REBOX_STANDIN_PIXEL) */
 static __thread UINT call_outcome;
@@ -2361,6 +2362,15 @@ static void outcomes_log(void)
         LONG n = InterlockedExchange(&standins, 0);
         if (n && at < (int)sizeof(line) - 64)
             at += snprintf(line + at, sizeof(line) - at, "; pixel stand-ins (REBOX_STANDIN_PIXEL) %ld", n);
+    }
+    /* The time the title's recording threads spent in these calls, waits for compiles above all. */
+    {
+        double f = qpc_frequency();
+        LONG64 graphics = InterlockedExchange64(&title_waits[0].census_ticks, 0);
+        LONG64 compute = InterlockedExchange64(&title_waits[1].census_ticks, 0);
+        if ((graphics || compute) && at < (int)sizeof(line) - 96)
+            at += snprintf(line + at, sizeof(line) - at, "; title threads in these calls %.1f s (compute %.1f, graphics "
+                           "%.1f)", (graphics + compute) / f, compute / f, graphics / f);
     }
     if (total)
         rebox_log("d3d12_xs:   console compiles since the last census: %s", line);
@@ -2597,11 +2607,25 @@ static LONG64 frame_budget_ticks(void)
  * drawn a few times a frame, and each of those calls waited its 50 ms (250 for compute) and queued
  * a compile that only waited for the first one's lock: in run 0543 about 400 such waits a frame,
  * about 20 s of the title's recording threads per present. REBOX_OVERRUN_SKIP=0: every call waits,
- * as before. */
+ * as before.
+ *
+ * When the pool is behind, calls don't wait (REBOX_BOUNDED_BEHIND, default 16: that many compiles
+ * queued and not started; 0: off, every call waits and the queue is first in, first out, as
+ * before). In run 0549's world each present's calls queued about 2,000 compiles (variants of large
+ * programs, seconds of AnyPS5 each) for the pool's 8 threads, which finished about 3 a second: the
+ * queue only grew, no call's compile was done within its wait, and every one of them waited its
+ * full 250 ms (compute) or 50 ms (graphics) and was skipped anyway: 530 compute, 370 vertex and 1,170
+ * mesh calls a present, about 210 s of the recording threads' time in each 93 s present. Behind,
+ * a call queues its compile and is skipped at once, and its program's later calls skip behind it
+ * (overrun_note), as after a wait; its compile goes ahead of the older ones (the title's current
+ * frame first, those it asked for minutes ago after), and past REBOX_BOUNDED_QUEUE_MAX queued
+ * (default 2048) the oldest are dropped: if the title still draws them, their next call queues
+ * them again. A first call's wait (first_call_compile) goes ahead of all of them and still waits. */
 struct bounded_job
 {
-    struct bounded_job *next;
+    struct bounded_job *next, *prev;
     volatile LONG refs, finished;
+    BOOL urgent;
     HANDLE done;
     HRESULT hr;
     UINT64 program; /* a program's first compile (first_call_compile): its state is set when done */
@@ -2610,9 +2634,14 @@ struct bounded_job
     UINT32 sgprs[64];
     BYTE shader[];
 };
-static struct bounded_job *bounded_head, *bounded_tail;
+/* Two queues: first calls' compiles (urgent, first in first out) and the rest (a deque: new jobs at
+ * its tail, or at its head while the pool is behind). bounded_lock guards both and the counts. */
+static struct bounded_job *urgent_head, *urgent_tail, *bounded_head, *bounded_tail;
+static LONG bounded_queued, bounded_normal; /* not started: in all, in the second queue */
+static volatile LONG bounded_skips, bounded_dropped;
 static SRWLOCK bounded_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE bounded_ready = CONDITION_VARIABLE_INIT;
+static __thread BOOL bounded_behind_skip; /* the last bounded_compile_for didn't wait: the pool was behind */
 
 static void bounded_release(struct bounded_job *job)
 {
@@ -2623,17 +2652,140 @@ static void bounded_release(struct bounded_job *job)
     }
 }
 
+static LONG bounded_env(const char *name, LONG fallback)
+{
+    char v[16];
+    DWORD n = GetEnvironmentVariableA(name, v, sizeof(v));
+    return n && n < sizeof(v) ? atol(v) : fallback;
+}
+
+/* Queued compiles past which a call doesn't wait (0: always waits). */
+static LONG bounded_behind(void)
+{
+    static LONG behind = -1;
+    if (behind < 0)
+    {
+        behind = max(bounded_env("REBOX_BOUNDED_BEHIND", 16), 0L);
+        if (behind)
+            rebox_log("d3d12_xs: console shaders: calls don't wait for their compile while %ld or more are queued "
+                      "on the pool (REBOX_BOUNDED_BEHIND)", behind);
+    }
+    return behind;
+}
+
+static LONG bounded_queue_max(void)
+{
+    static LONG most = -1;
+    if (most < 0)
+        most = max(bounded_env("REBOX_BOUNDED_QUEUE_MAX", 2048), 0L);
+    return most;
+}
+
+/* Unlinks job from the second queue (bounded_lock held). */
+static void bounded_unlink(struct bounded_job *job)
+{
+    if (job->prev)
+        job->prev->next = job->next;
+    else
+        bounded_head = job->next;
+    if (job->next)
+        job->next->prev = job->prev;
+    else
+        bounded_tail = job->prev;
+    job->next = job->prev = NULL;
+    bounded_queued--;
+    bounded_normal--;
+}
+
+/* Queues job (bounded_lock held); returns how many compiles were queued and not started before it.
+ * Past the queue's limit while behind, the oldest of the second queue go onto *dropped (linked by
+ * next), to be ended by the caller outside the lock. */
+static LONG bounded_push(struct bounded_job *job, struct bounded_job **dropped)
+{
+    LONG ahead = bounded_queued, behind = bounded_behind(), most = bounded_queue_max();
+
+    job->next = job->prev = NULL;
+    if (!behind)
+        job->urgent = FALSE; /* one queue, in order, as before */
+    if (job->urgent)
+    {
+        if (urgent_tail)
+            urgent_tail->next = job;
+        else
+            urgent_head = job;
+        urgent_tail = job;
+    }
+    else
+    {
+        if (behind && ahead >= behind)
+        {
+            job->next = bounded_head;
+            if (bounded_head)
+                bounded_head->prev = job;
+            else
+                bounded_tail = job;
+            bounded_head = job;
+        }
+        else
+        {
+            job->prev = bounded_tail;
+            if (bounded_tail)
+                bounded_tail->next = job;
+            else
+                bounded_head = job;
+            bounded_tail = job;
+        }
+        bounded_normal++;
+    }
+    bounded_queued++;
+    while (behind && most && bounded_normal > most && bounded_tail && bounded_tail != job)
+    {
+        struct bounded_job *old = bounded_tail;
+        bounded_unlink(old);
+        old->next = *dropped;
+        *dropped = old;
+    }
+    return ahead;
+}
+
+/* Ends jobs dropped from the queue unrun: their callers have long gone on (E_PENDING). */
+static void bounded_drop(struct bounded_job *dropped)
+{
+    while (dropped)
+    {
+        struct bounded_job *job = dropped;
+        LONG n = InterlockedIncrement(&bounded_dropped);
+        dropped = job->next;
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: console shaders: %ld queued compiles dropped unrun, the oldest past "
+                      "REBOX_BOUNDED_QUEUE_MAX (%ld)", n, bounded_queue_max());
+        job->hr = E_PENDING;
+        InterlockedExchange(&job->finished, 1);
+        SetEvent(job->done);
+        bounded_release(job);
+    }
+}
+
 static DWORD WINAPI bounded_worker(void *unused)
 {
     for (;;)
     {
         struct bounded_job *job;
         AcquireSRWLockExclusive(&bounded_lock);
-        while (!bounded_head)
+        while (!urgent_head && !bounded_head)
             SleepConditionVariableSRW(&bounded_ready, &bounded_lock, INFINITE, 0);
-        job = bounded_head;
-        if (!(bounded_head = job->next))
-            bounded_tail = NULL;
+        if ((job = urgent_head))
+        {
+            if (!(urgent_head = job->next))
+                urgent_tail = NULL;
+            job->next = NULL;
+            bounded_queued--;
+        }
+        else
+        {
+            job = bounded_head;
+            bounded_unlink(job);
+        }
         ReleaseSRWLockExclusive(&bounded_lock);
         job->hr = compile_now(&job->in, &job->out, FALSE);
         if (job->program)
@@ -2738,15 +2890,19 @@ static DWORD inline_wait_ms(BOOL graphics)
 
 /* Compiles in on the pool, waiting at most wait ms (0: in the caller); program, if not 0, is a
  * program claimed as pending whose state the compile sets; owner, if not 0, the program whose later
- * calls skip while this compile runs past the wait (overrun_note). */
+ * calls skip while this compile runs past the wait (overrun_note); urgent, a first call's compile,
+ * which goes ahead of the rest and waits even while the pool is behind. */
 static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics,
-                                   DWORD wait, UINT64 program, UINT64 owner)
+                                   DWORD wait, UINT64 program, UINT64 owner, BOOL urgent)
 {
     static INIT_ONCE started = INIT_ONCE_STATIC_INIT;
     static LONG timeouts;
-    struct bounded_job *job;
+    struct bounded_job *job, *dropped = NULL;
     BOOL pending;
+    LONG ahead;
     HRESULT hr;
+
+    bounded_behind_skip = FALSE;
 
     if (!wait || !(job = calloc(1, sizeof(*job) + in->shader_size)))
     {
@@ -2782,18 +2938,32 @@ static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct reb
         }
         InitOnceComplete(&started, 0, NULL);
     }
+    job->urgent = urgent;
+    bounded_behind(); /* read (and logged) outside the lock */
+    bounded_queue_max();
     AcquireSRWLockExclusive(&bounded_lock);
-    if (bounded_tail)
-        bounded_tail->next = job;
-    else
-        bounded_head = job;
-    bounded_tail = job;
+    ahead = bounded_push(job, &dropped);
     ReleaseSRWLockExclusive(&bounded_lock);
     WakeConditionVariable(&bounded_ready);
-    if (WaitForSingleObject(job->done, wait) == WAIT_OBJECT_0)
+    bounded_drop(dropped);
+    if (!urgent && bounded_behind() && ahead >= bounded_behind())
     {
-        hr = job->hr;
-        *out = job->out;
+        /* Behind: no wait (see above); its program's later calls skip until it's done. */
+        LONG n = InterlockedIncrement(&bounded_skips);
+        if (!(n & (n - 1)))
+            rebox_log("d3d12_xs: console shaders: %ld %s calls went on without waiting for their compile, %ld "
+                      "queued ahead of it (REBOX_BOUNDED_BEHIND)", n, graphics ? "graphics" : "compute", ahead);
+        set_last(E_PENDING, "queued behind the pool's backlog, not waited for", NULL);
+        bounded_behind_skip = TRUE;
+        hr = E_PENDING;
+        overrun_note(owner, job);
+    }
+    else if (WaitForSingleObject(job->done, wait) == WAIT_OBJECT_0)
+    {
+        if ((hr = job->hr) == E_PENDING)
+            set_last(E_PENDING, "dropped from the pool's queue unrun", NULL);
+        else
+            *out = job->out;
     }
     else
     {
@@ -2812,7 +2982,7 @@ static HRESULT bounded_compile_for(const struct rebox_compile_in *in, struct reb
 static HRESULT bounded_compile(const struct rebox_compile_in *in, struct rebox_compile_out *out, BOOL graphics,
                                UINT64 key)
 {
-    return bounded_compile_for(in, out, graphics, inline_wait_ms(graphics), 0, key);
+    return bounded_compile_for(in, out, graphics, inline_wait_ms(graphics), 0, key, FALSE);
 }
 
 /* First calls wait. A draw or dispatch skipped because its program is still compiling (its first
@@ -2913,7 +3083,7 @@ static HRESULT first_call_compile(UINT64 key, enum program_state state, const st
     HRESULT hr;
 
     if (state == PROGRAM_COLD)
-        return bounded_compile_for(in, out, graphics, wait, key, key);
+        return bounded_compile_for(in, out, graphics, wait, key, key, TRUE);
     while (state == PROGRAM_PENDING && ticks_now() < deadline)
     {
         Sleep(2);
@@ -2942,7 +3112,7 @@ static HRESULT first_call_compile(UINT64 key, enum program_state state, const st
         }
     }
     hr = bounded_compile_for(in, out, graphics, (DWORD)max((deadline - ticks_now()) * 1000.0 / qpc_frequency(), 50.0), 0,
-                             key);
+                             key, TRUE);
     return hr;
 }
 
@@ -2984,7 +3154,8 @@ static HRESULT compile_within_budget(const struct rebox_compile_in *in, struct r
     }
     else
         hr = bounded_compile(in, out, graphics, key);
-    call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr == E_PENDING ? OUTCOME_WAIT : OUTCOME_FAILED;
+    call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : hr != E_PENDING ? OUTCOME_FAILED
+                 : bounded_behind_skip ? OUTCOME_BEHIND : OUTCOME_WAIT;
     elapsed = ticks_now() - started;
     if (elapsed >= slow_compile_ticks())
         InterlockedAdd64(&frame_compile_ticks, elapsed);
@@ -3183,7 +3354,9 @@ HRESULT WINAPI ReboxConsoleCompile(const struct rebox_compile_in *in, struct reb
     {
         struct title_wait *w = &title_waits[!(h && in->shader_size >= sizeof(*h) && h->version == 2)];
         InterlockedIncrement(&w->calls);
-        InterlockedAdd64(&w->ticks, ticks_now() - entered);
+        LONG64 spent = ticks_now() - entered;
+        InterlockedAdd64(&w->ticks, spent);
+        InterlockedAdd64(&w->census_ticks, spent);
         if (call_outcome == OUTCOME_OVERRUN)
             InterlockedIncrement(&w->overruns);
     }
