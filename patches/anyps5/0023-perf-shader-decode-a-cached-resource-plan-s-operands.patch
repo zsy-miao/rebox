@@ -1,0 +1,100 @@
+From 397138d46f86aefa29da20c8b76de24453e2a311 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 12:37:13 +0000
+Subject: [PATCH 23/24] perf(shader): decode a cached resource plan's operands
+ into one list
+
+DecodePlan read every value's arguments, and a Phi's blocks, into vectors
+of their own (two allocations a value, freed again once the values were
+linked). They now go into one list the records index. The 736 resource
+plans of one title's disk cache decode in 0.63 ms on average instead of
+1.2 ms, and every one of them encodes back to its stored bytes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ core/shader/recompiler/ShaderDiskCache.cpp | 34 +++++++++++++---------
+ 1 file changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/core/shader/recompiler/ShaderDiskCache.cpp b/core/shader/recompiler/ShaderDiskCache.cpp
+index 7046b24402..2a860c4667 100644
+--- a/core/shader/recompiler/ShaderDiskCache.cpp
++++ b/core/shader/recompiler/ShaderDiskCache.cpp
+@@ -1242,8 +1242,8 @@ struct PlanValueRecord {
+     bool hasImmediate = false;
+     std::uint64_t immediate = 0;
+     GuestRegister registerValue{};
+-    std::vector<std::uint32_t> arguments;
+-    std::vector<std::uint32_t> phiBlocks;
++    std::size_t firstOperand = 0;
++    std::uint32_t argumentCount = 0;
+ };
+ 
+ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
+@@ -1256,6 +1256,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
+     std::vector<std::uint32_t> blockIds;
+     reader.Values(blockIds);
+     std::vector<PlanValueRecord> records;
++    std::vector<std::uint32_t> operands;
+     std::uint32_t current = 0;
+     reader.List(records, 6, [&](Reader& in, PlanValueRecord& record) {
+         constexpr std::uint64_t Word = std::numeric_limits<std::uint32_t>::max();
+@@ -1276,11 +1277,12 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
+         record.registerValue = {static_cast<RegisterBank>(registerValue & 0xfu), static_cast<std::uint32_t>(registerValue >> 4u)};
+         record.hasImmediate = (shape & 1u) != 0u;
+         if (record.hasImmediate) record.immediate = in.Compact();
+-        record.arguments.resize(static_cast<std::size_t>(arguments));
+-        for (auto& argument : record.arguments) {
++        record.firstOperand = operands.size();
++        record.argumentCount = static_cast<std::uint32_t>(arguments);
++        for (std::uint64_t operand = 0; operand < arguments; ++operand) {
+             const auto code = in.Compact();
+             if (code == 0u) {
+-                argument = NoPlanIndex;
++                operands.push_back(NoPlanIndex);
+                 continue;
+             }
+             const auto zigzag = code - 1u;
+@@ -1291,14 +1293,16 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
+                 in.Fail();
+                 return;
+             }
+-            argument = static_cast<std::uint32_t>(base + delta);
++            operands.push_back(static_cast<std::uint32_t>(base + delta));
+         }
+         if (record.opcode == IrOpcode::Phi) {
+-            record.phiBlocks.resize(record.arguments.size());
+-            for (auto& block : record.phiBlocks) {
++            for (std::uint64_t operand = 0; operand < arguments; ++operand) {
+                 const auto index = in.Compact();
+-                block = index < blockIds.size() ? static_cast<std::uint32_t>(index) : NoPlanIndex;
+-                if (block == NoPlanIndex) in.Fail();
++                if (index >= blockIds.size()) {
++                    in.Fail();
++                    return;
++                }
++                operands.push_back(static_cast<std::uint32_t>(index));
+             }
+         }
+         ++current;
+@@ -1325,12 +1329,14 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
+     for (std::size_t index = 0; index < records.size(); ++index) {
+         const auto& record = records[index];
+         auto& value = plan.valueStorage[index];
++        const auto* first = operands.data() + record.firstOperand;
+         std::vector<IrValue*> arguments;
+         std::vector<IrBlock*> phiBlocks;
+-        arguments.reserve(record.arguments.size());
+-        for (std::size_t operand = 0; operand < record.arguments.size(); ++operand) {
+-            arguments.push_back(valueAt(record.arguments[operand]));
+-            if (value.IsPhi()) phiBlocks.push_back(plan.blockStorage[record.phiBlocks[operand]].get());
++        arguments.reserve(record.argumentCount);
++        if (value.IsPhi()) phiBlocks.reserve(record.argumentCount);
++        for (std::uint32_t operand = 0; operand < record.argumentCount; ++operand) {
++            arguments.push_back(valueAt(first[operand]));
++            if (value.IsPhi()) phiBlocks.push_back(plan.blockStorage[first[record.argumentCount + operand]].get());
+         }
+         value.SetDetachedOperands(std::move(arguments), std::move(phiBlocks));
+     }
+-- 
+2.55.0
+

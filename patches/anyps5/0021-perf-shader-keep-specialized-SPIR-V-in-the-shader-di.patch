@@ -1,0 +1,410 @@
+From f3ed5c30e37eb3467050a63402b4a1b8353af6f6 Mon Sep 17 00:00:00 2001
+From: GabbeHags <gabbehags@gmail.com>
+Date: Tue, 24 Nov 2026 22:36:50 +0100
+Subject: [PATCH 21/24] perf(shader): keep specialized SPIR-V in the shader
+ disk cache
+
+Every run re-specialized each first-seen shader on the queue worker:
+specializeModule memoizes only in-process, keyed on the per-run variant
+id. In one title's city load that is ~560 shaders at ~4.8 ms each.
+
+Specialized modules are now ordinary shader disk cache entries
+(LoadSpecialized / StoreSpecialized): the wrapEntry header holds the
+full key, so a different key never loads an entry and truncated or
+corrupt files are rejected, and the cache's writer thread writes them
+instead of the queue worker. The key is the artifact's SPIR-V content
+hash, vertex classes, specialization constants and the SpirvTarget
+fields, laid out field by field, followed by the recompiler switch key
+as for the other entries; it also covers target.nonConstantImageOffsets
+and takes the feature digest through the same unsealed fallback as
+RecompileCacheKey. The cache is on whenever the shader disk cache is;
+APS5_NO_SPECIALIZED_CACHE=1 (a neutral switch) turns it off, and
+[shader-disk-cache] counts the entries as specialized modules.
+
+agc_shader_disk_cache_tests gains verifySpecializedStore and
+verifySpecializedSwitch; USAGE.md and ENVIRONMENT.md document the cache
+and the switch.
+
+That title's city load, warm caches, same build, APS5_TRACE_SECONDS=35:20,
+RTX 2070 SUPER: 567 specialized hits; slowest frame 2328.5 ms with
+APS5_NO_SPECIALIZED_CACHE=1, 1639.2 ms with the cache.
+
+From boykopovar/AnyPS5#26800 (open; 4e9f3ab7ed and ac8c6e5678 squashed),
+on top of the failure memo: its jobs and counters sit beside the
+recorded compile failures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../libSceAgcDriver/tests/ShaderDiskCache.cpp | 71 +++++++++++++++++++
+ core/shader/recompiler/CacheKey.hpp           |  6 +-
+ core/shader/recompiler/Recompiler.cpp         | 58 ++++++++++++++-
+ core/shader/recompiler/ShaderDiskCache.cpp    | 49 +++++++++++--
+ core/shader/recompiler/ShaderDiskCache.hpp    |  6 ++
+ docs/dev/ENVIRONMENT.md                       |  1 +
+ docs/user/USAGE.md                            |  2 +-
+ 7 files changed, 186 insertions(+), 7 deletions(-)
+
+diff --git a/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp b/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
+index f750ba15c8..35cc30cc0a 100644
+--- a/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
++++ b/core/libs/prx/libSceAgcDriver/tests/ShaderDiskCache.cpp
+@@ -63,6 +63,14 @@ void setEnvironment(const char* name, const std::string& value) {
+ #endif
+ }
+ 
++void clearEnvironment(const char* name) {
++#ifdef _WIN32
++    _putenv_s(name, "");
++#else
++    unsetenv(name);
++#endif
++}
++
+ void setPathEnvironment(const char* name, const std::filesystem::path& value) {
+ #ifdef _WIN32
+     _wputenv_s(std::filesystem::path(name).wstring().c_str(), value.wstring().c_str());
+@@ -1237,6 +1245,66 @@ void verifyStore() {
+     require(ShaderDiskCache::Load(key, loaded), "a rewritten entry does not load");
+ }
+ 
++void verifySpecializedStore() {
++    require(ShaderDiskCache::Enabled(), "the disk cache is not enabled");
++    const std::vector<std::byte> key{std::byte{0x73}, std::byte{0x70}, std::byte{0x65}, std::byte{0x63}, std::byte{0x01}};
++    auto other = key;
++    other.back() = std::byte{0x02};
++    const std::vector<std::uint32_t> words{0x07230203u, 0x00010600u, 0u, 16u, 0u, 0x00020011u, 1u};
++    const auto before = ShaderDiskCache::Totals();
++    std::vector<std::uint32_t> loaded;
++    require(!ShaderDiskCache::LoadSpecialized(key, loaded), "a specialized module loads before it was stored");
++    ShaderDiskCache::StoreSpecialized(key, words);
++    ShaderDiskCache::Flush();
++    require(ShaderDiskCache::Totals().specializedWrites == before.specializedWrites + 1, "the store did not write the specialized module");
++    require(ShaderDiskCache::LoadSpecialized(key, loaded) && loaded == words, "a stored specialized module does not load back unchanged");
++    require(!ShaderDiskCache::LoadSpecialized(other, loaded), "another key loads the stored specialized module");
++    const auto after = ShaderDiskCache::Totals();
++    require(after.specializedHits == before.specializedHits + 1 && after.specializedMisses == before.specializedMisses + 2, "the specialized loads were not counted");
++    require(after.writes == before.writes && after.planWrites == before.planWrites, "a specialized module was counted as another entry kind");
++
++    const auto path = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
++    std::vector<std::byte> file;
++    require(ReadWholeFile(path, file), "cannot read the specialized entry back");
++#ifdef _WIN32
++    if (PosixReplaceUnsupported(path.parent_path())) return;
++#endif
++    require(WriteFileAtomically(path, std::span(file).first(file.size() - 2)), "cannot truncate the specialized entry");
++    require(!ShaderDiskCache::LoadSpecialized(key, loaded), "a truncated specialized entry loads");
++    auto corrupt = file;
++    corrupt[corrupt.size() - 3] ^= std::byte{0x40};
++    require(WriteFileAtomically(path, corrupt), "cannot damage the specialized entry");
++    require(!ShaderDiskCache::LoadSpecialized(key, loaded), "a corrupt specialized entry loads");
++    require(ShaderDiskCache::Totals().specializedLoadFailures == after.specializedLoadFailures + 2, "the rejected specialized entries were not counted");
++}
++
++const std::vector<std::byte> SwitchedSpecializedKey{std::byte{0x73}, std::byte{0x70}, std::byte{0x65}, std::byte{0x63}, std::byte{0x03}};
++const std::vector<std::uint32_t> SwitchedSpecializedWords{0x07230203u, 0x00010600u, 0u, 16u, 0u, 0x00020011u, 2u};
++
++int runSwitchedSpecialized() {
++    const auto before = ShaderDiskCache::Totals();
++    std::vector<std::uint32_t> loaded;
++    require(!ShaderDiskCache::LoadSpecialized(SwitchedSpecializedKey, loaded), "a specialized module stored without APS5_NO_NAN_PAYLOAD_ELIMINATION loads with it");
++    const auto after = ShaderDiskCache::Totals();
++    require(after.specializedMisses == before.specializedMisses + 1 && after.specializedLoadFailures == before.specializedLoadFailures, "the switched lookup was not a miss");
++    ShaderDiskCache::StoreSpecialized(SwitchedSpecializedKey, std::vector<std::uint32_t>(SwitchedSpecializedWords.begin(), SwitchedSpecializedWords.end() - 1));
++    ShaderDiskCache::Flush();
++    std::cout << "APS5_NO_NAN_PAYLOAD_ELIMINATION=1 keeps its own specialized modules\n";
++    return 0;
++}
++
++void verifySpecializedSwitch(const char* self) {
++    ShaderDiskCache::StoreSpecialized(SwitchedSpecializedKey, SwitchedSpecializedWords);
++    ShaderDiskCache::Flush();
++    setEnvironment("APS5_NO_NAN_PAYLOAD_ELIMINATION", "1");
++    const std::string command = "\"" + std::string(self) + "\" --specialized-switch";
++    const auto status = std::system(command.c_str());
++    clearEnvironment("APS5_NO_NAN_PAYLOAD_ELIMINATION");
++    require(status == 0, "the process with APS5_NO_NAN_PAYLOAD_ELIMINATION=1 failed");
++    std::vector<std::uint32_t> loaded;
++    require(ShaderDiskCache::LoadSpecialized(SwitchedSpecializedKey, loaded) && loaded == SwitchedSpecializedWords, "a run with APS5_NO_NAN_PAYLOAD_ELIMINATION=1 replaced the default specialized module");
++}
++
+ void verifyPersist() {
+     SampleRequest sample;
+     const auto key = sample.Key();
+@@ -3047,6 +3115,7 @@ int main(int argc, char** argv) {
+         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
+         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+         if (argc == 2 && std::string_view(argv[1]) == "--load-failure") return runFailureLoadingProcess();
++        if (argc == 2 && std::string_view(argv[1]) == "--specialized-switch") return runSwitchedSpecialized();
+         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
+         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
+         std::filesystem::remove_all(directory);
+@@ -3067,6 +3136,8 @@ int main(int argc, char** argv) {
+         verifyPlanKey();
+         verifySharedPlans();
+         verifyStore();
++        verifySpecializedStore();
++        verifySpecializedSwitch(argv[0]);
+         verifyPersist();
+         verifyReleaseMapped();
+         verifyAcrossProcesses(argv[0]);
+diff --git a/core/shader/recompiler/CacheKey.hpp b/core/shader/recompiler/CacheKey.hpp
+index d0cf04056b..7307c8a805 100644
+--- a/core/shader/recompiler/CacheKey.hpp
++++ b/core/shader/recompiler/CacheKey.hpp
+@@ -74,6 +74,10 @@ public:
+         target.featureDigestSealed = true;
+     }
+ 
++    static std::array<std::uint64_t, 2> FeatureDigest(const SpirvTarget& target) {
++        return target.featureDigestSealed && target.featureDigestSpans == featureSpans(target) ? target.featureDigest : digestFeatures(target.supportedCapabilities, target.supportedExtensions);
++    }
++
+     // A 64-bit hash of the code, two dwords per step; collisions are resolved by comparing the code.
+     static std::uint64_t HashCode(std::span<const std::uint32_t> code) {
+         std::uint64_t hash = 0x9e3779b97f4a7c15ull ^ (static_cast<std::uint64_t>(code.size()) * 0x100000001b3ull);
+@@ -346,7 +350,7 @@ private:
+     }
+ 
+     static void appendFeatureDigest(std::vector<std::uint64_t>& key, const SpirvTarget& target) {
+-        const auto digest = target.featureDigestSealed && target.featureDigestSpans == featureSpans(target) ? target.featureDigest : digestFeatures(target.supportedCapabilities, target.supportedExtensions);
++        const auto digest = FeatureDigest(target);
+         key.push_back(digest[0]);
+         key.push_back(digest[1]);
+     }
+diff --git a/core/shader/recompiler/Recompiler.cpp b/core/shader/recompiler/Recompiler.cpp
+index 45e4f32701..af24d21034 100644
+--- a/core/shader/recompiler/Recompiler.cpp
++++ b/core/shader/recompiler/Recompiler.cpp
+@@ -1158,8 +1158,64 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
+     return materialized;
+ }
+ 
++std::vector<std::byte> specializedCacheKey(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
++    constexpr std::string_view tag = "specialized-spirv";
++    std::vector<std::byte> key(tag.size());
++    std::memcpy(key.data(), tag.data(), tag.size());
++    const auto put = [&key](std::uint64_t value) {
++        const auto offset = key.size();
++        key.resize(offset + sizeof(value));
++        std::memcpy(key.data() + offset, &value, sizeof(value));
++    };
++    const auto content = artifact.spirv.ContentHash();
++    put(content.low);
++    put(content.high);
++    put(artifact.vertexInputPatches.size());
++    put(artifact.vertexInputs.size());
++    put(artifact.hostSubgroupSize);
++    put(artifact.bdaAbiVersion);
++    put(artifact.runtimeAbiVersion);
++    put(classes.size());
++    for (const auto value : classes) put(value);
++    put(constants.size());
++    for (const auto& constant : constants) put((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
++    put(target.vulkanVersion);
++    put(target.spirvVersion);
++    put(target.subgroupSize);
++    put(target.bdaAbiVersion);
++    put(target.fragmentShaderBarycentricEnabled);
++    for (const auto value : target.maxWorkgroupSize) put(value);
++    put(target.maxWorkgroupInvocations);
++    put(target.maxWorkgroupSharedMemoryBytes);
++    put(target.nonConstantImageOffsets);
++    const auto features = RecompileCacheKey::FeatureDigest(target);
++    put(features[0]);
++    put(features[1]);
++    put(target.mesh.has_value());
++    if (const auto& mesh = target.mesh) {
++        for (const auto value : mesh->maxWorkgroupSize) put(value);
++        for (const auto value : {mesh->maxWorkgroupInvocations, mesh->maxSharedMemoryBytes, mesh->maxOutputVertices, mesh->maxOutputPrimitives, mesh->maxOutputComponents, mesh->maxOutputMemoryBytes, mesh->outputPerVertexGranularity, mesh->outputPerPrimitiveGranularity}) put(value);
++    }
++    put(target.tessellation.has_value());
++    if (const auto& tessellation = target.tessellation) {
++        for (const auto value : {tessellation->maxPatchSize, tessellation->maxControlPerVertexInputComponents, tessellation->maxControlPerVertexOutputComponents, tessellation->maxControlPerPatchOutputComponents, tessellation->maxControlTotalOutputComponents, tessellation->maxEvaluationInputComponents, tessellation->maxEvaluationOutputComponents}) put(value);
++    }
++    return key;
++}
++
++std::vector<std::uint32_t> cachedSpecializeWords(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
++    static const bool enabled = std::getenv("APS5_NO_SPECIALIZED_CACHE") == nullptr && ShaderDiskCache::Enabled();
++    if (!enabled) return specializeWords(artifact, classes, constants, target);
++    auto key = specializedCacheKey(artifact, classes, constants, target);
++    std::vector<std::uint32_t> words;
++    if (ShaderDiskCache::LoadSpecialized(key, words)) return words;
++    words = specializeWords(artifact, classes, constants, target);
++    ShaderDiskCache::StoreSpecialized(std::move(key), words);
++    return words;
++}
++
+ SpecializedSpirv buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+-    auto materialized = specializeWords(artifact, classes, constants, target);
++    auto materialized = cachedSpecializeWords(artifact, classes, constants, target);
+     auto module = std::make_shared<SpecializedModule>();
+     std::map<std::uint32_t, std::uint32_t> supplied;
+     for (const auto& constant : constants) supplied.emplace(constant.id, constant.value);
+diff --git a/core/shader/recompiler/ShaderDiskCache.cpp b/core/shader/recompiler/ShaderDiskCache.cpp
+index 1b8d4df133..7046b24402 100644
+--- a/core/shader/recompiler/ShaderDiskCache.cpp
++++ b/core/shader/recompiler/ShaderDiskCache.cpp
+@@ -1437,6 +1437,7 @@ constexpr std::string_view NeutralSwitches[] = {
+     "APS5_NO_PERF_LAYOUT_PAIR",
+     "APS5_NO_BUFFER_SUBSTITUTES",
+     "APS5_NO_RESULT_MEMO",
++    "APS5_NO_SPECIALIZED_CACHE",
+     "APS5_NO_TABLE_RESOLUTION_REUSE",
+     "APS5_NO_TABLE_SNAPSHOT_REUSE",
+     "APS5_RESOURCE_PLAN_MB",
+@@ -1573,6 +1574,22 @@ public:
+         enqueue({std::move(key), nullptr, nullptr, codeAddress, std::move(message)});
+     }
+ 
++    bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
++        return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
++            std::span<const std::byte> payload;
++            const auto status = unwrapEntry(file, key, payload);
++            if (status != LoadStatus::Loaded) return status;
++            if (payload.size() < 5u * sizeof(std::uint32_t) || payload.size() % sizeof(std::uint32_t) != 0) return LoadStatus::Rejected;
++            words.resize(payload.size() / sizeof(std::uint32_t));
++            std::memcpy(words.data(), payload.data(), payload.size());
++            return LoadStatus::Loaded;
++        }, specializedHits, specializedMisses, specializedLoadFailures);
++    }
++
++    void StoreSpecialized(std::vector<std::byte> key, std::vector<std::uint32_t> words) {
++        enqueue({std::move(key), nullptr, nullptr, 0, std::nullopt, std::move(words)});
++    }
++
+     std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
+         const auto path = directory / EntryName(key);
+         const auto file = EncodeEntry(key, variant);
+@@ -1624,6 +1641,10 @@ public:
+         counters.planLoadFailures = planLoadFailures.load(std::memory_order_relaxed);
+         counters.failureHits = failureHits.load(std::memory_order_relaxed);
+         counters.failureWrites = failureWrites.load(std::memory_order_relaxed);
++        counters.specializedHits = specializedHits.load(std::memory_order_relaxed);
++        counters.specializedMisses = specializedMisses.load(std::memory_order_relaxed);
++        counters.specializedWrites = specializedWrites.load(std::memory_order_relaxed);
++        counters.specializedLoadFailures = specializedLoadFailures.load(std::memory_order_relaxed);
+         counters.prebuiltHits = prebuiltHits.load(std::memory_order_relaxed);
+         counters.prebuiltMisses = prebuiltMisses.load(std::memory_order_relaxed);
+         counters.prebuiltRejected = prebuiltRejected.load(std::memory_order_relaxed);
+@@ -1692,6 +1713,7 @@ private:
+         std::shared_ptr<const IrResourcePlan> plan;
+         std::uint64_t codeAddress = 0;
+         std::optional<std::string> failure;
++        std::vector<std::uint32_t> words;
+     };
+ 
+     bool loadPrebuilt(std::span<const std::byte> key, CompiledVariant& variant) {
+@@ -1827,9 +1849,9 @@ private:
+     }
+ 
+     void write(const Job& job) {
+-        const auto file = job.failure ? EncodeFailureEntry(job.key, job.codeAddress, *job.failure) : job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
++        const auto file = job.failure ? EncodeFailureEntry(job.key, job.codeAddress, *job.failure) : job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : !job.words.empty() ? wrapEntry(job.key, std::as_bytes(std::span(job.words))) : EncodeEntry(job.key, *job.variant);
+         if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
+-            (job.failure ? failureWrites : job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
++            (job.failure ? failureWrites : job.plan != nullptr ? planWrites : !job.words.empty() ? specializedWrites : writes).fetch_add(1, std::memory_order_relaxed);
+             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+         } else {
+             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+@@ -1911,13 +1933,14 @@ private:
+         const auto totals = Totals();
+         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
+         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
+-        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.failureHits != reported.failureHits || totals.failureWrites != reported.failureWrites;
++        const auto baseChanged = totals.hits != reported.hits || totals.misses != reported.misses || totals.writes != reported.writes || totals.loadFailures != reported.loadFailures || totals.writeFailures != reported.writeFailures || totals.planHits != reported.planHits || totals.planMisses != reported.planMisses || totals.planWrites != reported.planWrites || totals.planLoadFailures != reported.planLoadFailures || totals.specializedHits != reported.specializedHits || totals.specializedMisses != reported.specializedMisses || totals.specializedWrites != reported.specializedWrites || totals.specializedLoadFailures != reported.specializedLoadFailures || totals.failureHits != reported.failureHits || totals.failureWrites != reported.failureWrites;
+         const auto prebuiltChanged = totals.prebuiltHits != reported.prebuiltHits || totals.prebuiltMisses != reported.prebuiltMisses || totals.prebuiltRejected != reported.prebuiltRejected;
+         if (!baseChanged && !prebuiltChanged) return;
+-        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; recorded compile failures: %llu hits, %llu writes; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
++        if (baseChanged) std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; resource plans: %llu hits, %llu misses, %llu writes, %llu load failures; specialized modules: %llu hits, %llu misses, %llu writes, %llu load failures; recorded compile failures: %llu hits, %llu writes; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes; plans %llu hits, %llu misses)\n",
+                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
+                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures),
+                      delta(totals.planHits, reported.planHits), delta(totals.planMisses, reported.planMisses), delta(totals.planWrites, reported.planWrites), delta(totals.planLoadFailures, reported.planLoadFailures),
++                     delta(totals.specializedHits, reported.specializedHits), delta(totals.specializedMisses, reported.specializedMisses), delta(totals.specializedWrites, reported.specializedWrites), delta(totals.specializedLoadFailures, reported.specializedLoadFailures),
+                      delta(totals.failureHits, reported.failureHits), delta(totals.failureWrites, reported.failureWrites),
+                      static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
+                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes), static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses));
+@@ -1942,6 +1965,7 @@ private:
+     std::thread writer;
+     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
+     std::atomic<std::uint64_t> planHits{0}, planMisses{0}, planWrites{0}, planLoadFailures{0}, failureHits{0}, failureWrites{0};
++    std::atomic<std::uint64_t> specializedHits{0}, specializedMisses{0}, specializedWrites{0}, specializedLoadFailures{0};
+     std::atomic<std::uint64_t> prebuiltHits{0}, prebuiltMisses{0}, prebuiltRejected{0}, lookupNanoseconds{0}, readNanoseconds{0}, decodeNanoseconds{0}, maxLoadNanoseconds{0}, prebuiltBytesRead{0}, prebuiltLoadNanoseconds{0};
+     std::atomic<std::int64_t> lastReport{0};
+     std::mutex reportMutex;
+@@ -2154,6 +2178,23 @@ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan>
+     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
+ }
+ 
++bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words) {
++    auto& instance = store();
++    if (!instance.Enabled()) return false;
++    const auto& switches = switchKey();
++    std::vector<std::byte> full(key.begin(), key.end());
++    full.insert(full.end(), switches.begin(), switches.end());
++    return instance.LoadSpecialized(full, words);
++}
++
++void StoreSpecialized(std::vector<std::byte> key, std::vector<std::uint32_t> words) {
++    auto& instance = store();
++    if (!instance.Enabled() || words.empty()) return;
++    const auto& switches = switchKey();
++    key.insert(key.end(), switches.begin(), switches.end());
++    instance.StoreSpecialized(std::move(key), std::move(words));
++}
++
+ std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, const CompiledVariant& variant) {
+     auto& instance = store();
+     return instance.Enabled() ? instance.Persist(key, variant) : nullptr;
+diff --git a/core/shader/recompiler/ShaderDiskCache.hpp b/core/shader/recompiler/ShaderDiskCache.hpp
+index 9339c1c6c6..29ef49e47e 100644
+--- a/core/shader/recompiler/ShaderDiskCache.hpp
++++ b/core/shader/recompiler/ShaderDiskCache.hpp
+@@ -40,6 +40,10 @@ struct Counters {
+     std::uint64_t planLoadFailures = 0;
+     std::uint64_t failureHits = 0;
+     std::uint64_t failureWrites = 0;
++    std::uint64_t specializedHits = 0;
++    std::uint64_t specializedMisses = 0;
++    std::uint64_t specializedWrites = 0;
++    std::uint64_t specializedLoadFailures = 0;
+     std::uint64_t prebuiltHits = 0;
+     std::uint64_t prebuiltMisses = 0;
+     std::uint64_t prebuiltRejected = 0;
+@@ -82,6 +86,8 @@ void StoreFailure(std::vector<std::byte> key, std::uint64_t codeAddress, std::ex
+ [[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
+ [[nodiscard]] std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash, std::optional<std::string>* failure = nullptr);
+ void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
++[[nodiscard]] bool LoadSpecialized(std::span<const std::byte> key, std::vector<std::uint32_t>& words);
++void StoreSpecialized(std::vector<std::byte> key, std::vector<std::uint32_t> words);
+ void Flush();
+ void ReleaseMapped(const SharedSpirv& spirv) noexcept;
+ void Shutdown();
+diff --git a/docs/dev/ENVIRONMENT.md b/docs/dev/ENVIRONMENT.md
+index f8167cb7c7..34fd3f7ba6 100644
+--- a/docs/dev/ENVIRONMENT.md
++++ b/docs/dev/ENVIRONMENT.md
+@@ -65,6 +65,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
+ | `APS5_NO_PERF_ITERATION_SELECTION` | presence | `core/shader/recompiler/ControlFlow/src/Structurizer.cpp` |  | recomputes the post-dominator sets when finding a loop's iteration-selection merge instead of reusing them |
+ | `APS5_NO_RESULT_MEMO` | presence | `core/shader/recompiler/Recompiler.cpp` |  | materializes a fresh result for every recompile instead of reusing the result memo |
+ | `APS5_NO_SCOPED_VECTOR_WINDOW` | presence | `core/shader/recompiler/Translation/src/InstructionTranslator.cpp` |  | keeps a program's vector registers in its relative-addressing window in every block instead of only in the blocks between relative accesses |
++| `APS5_NO_SPECIALIZED_CACHE` | presence | `core/shader/recompiler/Recompiler.cpp` |  | specializes every shader again on each run instead of loading the specialized SPIR-V from the shader disk cache; the cache is also off while the shader disk cache is disabled |
+ | `APS5_NO_SRT_TAPE` | presence | `core/shader/recompiler/Optimization/src/SrtWalker/SrtTape.cpp` |  | runs the runtime-source walk of a plan in the IR evaluator instead of the compiled tape |
+ | `APS5_NO_TABLE_RESOLUTION_REUSE` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | stops a result memo miss from reusing an unchanged image table's resolution, so the table is resolved again |
+ | `APS5_NO_TABLE_SNAPSHOT_REUSE` | presence | `core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp` |  | turns off the image table snapshot reuse, so every capture reads and compares each table column |
+diff --git a/docs/user/USAGE.md b/docs/user/USAGE.md
+index b025b3abb1..adcfd58ebc 100644
+--- a/docs/user/USAGE.md
++++ b/docs/user/USAGE.md
+@@ -581,7 +581,7 @@ HDR output is available on Windows only. Titles see it when the monitor showing
+ 
+ ### Shader cache
+ 
+-Recompiled shaders and the Vulkan pipeline cache are kept in a `shader_cache/` directory beside the output executable, so later runs skip recompilation. Set `ANYPS5_SHADER_CACHE_DIR` to use another directory, or set `ANYPS5_NO_SHADER_CACHE` to any non-empty value other than `0` to disable both caches. Shaders are stored in a subdirectory named after the recompiler's source version; subdirectories of other versions unused for 14 days are removed the first time a run looks up a shader. The pipeline cache is one `vk-pipelines-*.bin` file per GPU and driver version in the same subdirectory, so it goes with the shaders it was built from. Entries of the current version are never removed and the directory has no size limit, so a title that compiles many shaders can add several GB within minutes. Deleting the directory is safe: it is rebuilt on the next run.
++Recompiled shaders and the Vulkan pipeline cache are kept in a `shader_cache/` directory beside the output executable, so later runs skip recompilation. Set `ANYPS5_SHADER_CACHE_DIR` to use another directory, or set `ANYPS5_NO_SHADER_CACHE` to any non-empty value other than `0` to disable both caches. Shaders are stored in a subdirectory named after the recompiler's source version; subdirectories of other versions unused for 14 days are removed the first time a run looks up a shader. The pipeline cache is one `vk-pipelines-*.bin` file per GPU and driver version in the same subdirectory, so it goes with the shaders it was built from. The same subdirectory also keeps each shader specialized for the resources and GPU it was first used with, so a later run does not specialize it again while it records the draw or dispatch; `APS5_NO_SPECIALIZED_CACHE=1` specializes every shader again instead. The `[shader-disk-cache]` line counts these entries as `specialized modules`. Entries of the current version are never removed and the directory has no size limit, so a title that compiles many shaders can add several GB within minutes. Deleting the directory is safe: it is rebuilt on the next run.
+ 
+ A first run can stop at one very large compute shader while the GPU driver compiles its pipeline: no new frames are shown and the driver's compiler keeps several CPU threads busy, which can last from minutes to hours for shaders of several million SPIR-V words. With `APS5_PROFILE_DRAW=1` the log names such a compile before it starts (`[dispatch] creating a pipeline for N SPIR-V words`, printed above 100000 words) and its time when it ends (`[dispatch] created a pipeline for N SPIR-V words in N ms`). The title's committed memory can keep growing during the compile, so the system commit limit (see Runtime layout) needs room for it; on Windows, enlarge the page file before such a run. Later runs can reuse the driver's pipeline cache, and the pipeline journal rebuilds recorded pipelines on background threads, which can avoid the wait when they are first reached; neither guarantees the driver skips the compile, and a driver update or another GPU starts a separate cache.
+ 
+-- 
+2.55.0
+
