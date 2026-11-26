@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brian McKenna <brian@brianmckenna.org>
+Date: Wed, 25 Nov 2026 23:15:00 +0000
+Subject: [PATCH] feat(shader): rebuild T# table loads at runtime indices in
+ descriptor webs
+
+An image read's T# can reach the read along several paths: loaded on
+each from a table in memory at an index the shader read from a constant
+buffer, and holding unrelated words on a path where the read does not
+happen (the register's earlier contents, through the structurizer's
+merges). The descriptor web rebuilds each path's T# before the read, but
+only from registers, the SRT and uniform operations. A load at an index
+read from a constant buffer was not rebuilt, so every path was folded
+and the read failed with "GetImageResource dword 0 is not a valid
+runtime value; ... descriptor web: no path's descriptor can be rebuilt
+from supported runtime values". GPU culling compute shaders that test
+bounds against a depth pyramid taken from a bindless table stop so.
+
+A load through an address is now rebuilt when its offset is made of
+user data, SRT reads, uniform operations and raw scalar reads done
+before the image read (those are used as they are, not read again).
+Such a path's T# then becomes an image table column keyed by the index,
+as a single load at a runtime index already did, and a key read from a
+buffer the shader doesn't write still narrows the table to the slots
+the dispatch reads. A path whose words mix a table slot with other
+words is folded as before. The web's check of the selected T#'s words
+is left out when a path reads a table slot: the shader never holds those
+words, and the table access checks the slot it reads.
+
+Tested: tests/DescriptorSelectionTests.cpp gains a shader that loads a
+T# from a table at one of two indices read at a lane-dependent address,
+on two paths, with a third path that holds no T#. It fails without the
+change ("GetImageResource dword 0 is not a valid runtime value") and
+passes with it under Wine, built against Rebox's MinGW build of the
+recompiler, as do the file's other tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Optimization/src/ResourceTracker.cpp      | 80 ++++++++++++++++++-
+ .../tests/DescriptorSelectionTests.cpp        | 54 +++++++++++++
+ 2 files changed, 130 insertions(+), 4 deletions(-)
+
+diff --git a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+--- a/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
++++ b/core/shader/recompiler/Optimization/src/ResourceTracker.cpp
+@@ -1324,6 +1324,53 @@
+         return true;
+     }
+ 
++    // A scalar read through an address at an offset that is not made of registers only: a table
++    // slot picked at runtime.
++    bool KeyedAddressRead(IrValue* value) const {
++        value = value->Resolve();
++        std::uint32_t memoryIndex = 0u;
++        return value->Opcode() == IrOpcode::LoadAddressU32 && value->ArgumentCount() > 1u && ScalarAddressMemory(*value, memoryIndex) != nullptr &&
++            !RegisterOnlyOffset(value->Argument(1), phiSearchDepth);
++    }
++
++    // A descriptor's dwords, rebuilt on one path, that a table column can read if any is a table
++    // slot picked at runtime: then all are, consecutive words of one slot (an image's last four
++    // may be zero instead). Other mixes are left to the descriptor web's folded path.
++    bool KeyedDescriptorConsistent(std::span<IrValue* const> words) const {
++        if (std::ranges::none_of(words, [&](IrValue* word) { return KeyedAddressRead(word); })) return true;
++        const IrValue* first = words.front()->Resolve();
++        std::uint32_t memoryIndex = 0u;
++        if (!KeyedAddressRead(words.front())) return false;
++        const auto base = ScalarAddressMemory(*first, memoryIndex)->offset;
++        for (std::size_t dword = 0; dword < words.size(); dword++) {
++            IrValue* word = words[dword]->Resolve();
++            std::uint32_t immediate = 0u;
++            if (dword >= 4u && immediateU32(word, immediate) && immediate == 0u) continue;
++            const MemoryInfo* memory = KeyedAddressRead(word) ? ScalarAddressMemory(*word, memoryIndex) : nullptr;
++            if (memory == nullptr || memory->offset != base + static_cast<std::uint32_t>(dword * sizeof(std::uint32_t)) ||
++                !EquivalentValue(m_program.Resources(), first->Argument(0), word->Argument(0)) || !EquivalentValue(m_program.Resources(), first->Argument(1), word->Argument(1))) return false;
++        }
++        return true;
++    }
++
++    // An offset made of immediates, user data, uniform operations and raw scalar reads already done
++    // before position (a table index read from constants, for a T# loaded from a table in memory
++    // on one path of a descriptor web): the read is reused, not done again.
++    bool AvailableOffset(IrValue* value, const IrValue& position, std::uint32_t depth) const {
++        value = value->Resolve();
++        if (value->HasImmediate()) return true;
++        if (Detail::IsRawRead(m_program.Resources(), *value) || value->IsPhi()) return AvailableBefore(*value, position);
++        if (value->Opcode() == IrOpcode::GetUserData) return value->ArgumentCount() == 1u;
++        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2u) {
++            return value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
++        }
++        if (depth == 0u || !Detail::IsRuntimeUniformOp(value->Opcode())) return false;
++        for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
++            if (!AvailableOffset(value->Argument(index), position, depth - 1u)) return false;
++        }
++        return true;
++    }
++
+     IrValue* Rematerialize(IrValue* value, IrValue& position, bool emit, std::uint32_t depth, bool pointerOperand = false) {
+         value = value->Resolve();
+         if (value->HasImmediate()) {
+@@ -1344,14 +1391,14 @@
+         const bool srtRead = op == IrOpcode::ReadConst && value->ArgumentCount() == 2u && value->Argument(0)->Resolve()->Opcode() == IrOpcode::GetSrtResource && value->Argument(1)->Resolve()->HasImmediate();
+         std::uint32_t memoryIndex = 0u;
+         const bool rawRead = op == IrOpcode::LoadAddressU32 && ScalarAddressMemory(*value, memoryIndex) != nullptr &&
+-            RegisterOnlyOffset(value->Argument(1), phiSearchDepth);
++            (RegisterOnlyOffset(value->Argument(1), phiSearchDepth) || AvailableOffset(value->Argument(1), position, phiSearchDepth));
+         const bool sourceHandle = op == IrOpcode::GetAddressResource && value->ArgumentCount() == 2u;
+         if (!register_ && !argumentless && !srtRead && !rawRead && !sourceHandle && !Detail::IsRuntimeUniformOp(op)) {
+             return nullptr;
+         }
+         std::vector<IrValue*> arguments;
+         for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+-            IrValue* argument = register_ ? value->Argument(index) : Rematerialize(value->Argument(index), position, emit, depth - 1u, pointerOperand || (rawRead && index == 0u));
++            IrValue* argument = register_ ? value->Argument(index) : Rematerialize(value->Argument(index), position, emit, depth - 1u, pointerOperand || rawRead);
+             if (argument == nullptr) {
+                 return nullptr;
+             }
+@@ -1472,10 +1519,16 @@
+         }
+         for (const IrBlock* arm : arms) {
+             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
++                std::vector<IrValue*> words;
+                 for (std::size_t dword = 0; split[slot] && dword < handles[slot]->ArgumentCount(); dword++) {
+-                    if (SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth) == nullptr) {
++                    IrValue* word = SubstituteEdge(handles[slot]->Argument(dword), arm, inst, false, phiSearchDepth);
++                    if (word == nullptr) {
+                         return false;
+                     }
++                    words.push_back(word);
++                }
++                if (!KeyedDescriptorConsistent(words)) {
++                    return false;
+                 }
+             }
+         }
+@@ -1550,7 +1603,12 @@
+             copies.push_back(EmitBefore(inst, inst.Opcode(), inst.Type(), arguments, rawFlags));
+         }
+ 
+-        if (optional) {
++        // An arm whose T# is read from a table at a runtime index becomes a table column, whose words
++        // the shader never holds (the table access checks the slot it reads): no check of the words.
++        const bool keyed = std::ranges::any_of(armWords, [&](const std::array<IrValue*, 3>& words) {
++            return std::ranges::any_of(words, [&](IrValue* word) { return KeyedAddressRead(word); });
++        });
++        if (optional && !keyed) {
+             std::array<IrValue*, 3> selected = armWords.back();
+             for (std::uint32_t arm = static_cast<std::uint32_t>(armWords.size()) - 1u; arm-- > 0u;) {
+                 for (std::size_t word = 0; word < selected.size(); word++) {
+@@ -1594,6 +1652,8 @@
+         static constexpr std::uint32_t foldedArm = 0xffffffffu;
+         std::string failure;
+         bool foldedValue = false;
++        // Each split handle's dwords in a tuple: first and count.
++        std::vector<std::pair<std::size_t, std::size_t>> slots;
+         std::vector<std::vector<IrValue*>> arms;
+         std::map<std::vector<IrValue*>, IrValue*> selectors;
+         std::vector<std::pair<IrBlock*, IrValue*>> phis;
+@@ -1708,6 +1768,15 @@
+                     return &m_builder.Constant(DescriptorWeb::foldedArm);
+                 }
+             }
++            for (const auto& [begin, count] : web.slots) {
++                if (!KeyedDescriptorConsistent(std::span<IrValue* const>(tuple).subspan(begin, count))) {
++                    if (StrictDescriptorWebs()) {
++                        return GiveUp(web, "a descriptor mixes words of a table slot picked at runtime with other words");
++                    }
++                    web.foldedValue = true;
++                    return &m_builder.Constant(DescriptorWeb::foldedArm);
++                }
++            }
+             const auto same = std::ranges::find_if(web.arms, [&](const std::vector<IrValue*>& arm) {
+                 return std::ranges::equal(tuple, arm, [&](IrValue* left, IrValue* right) { return EquivalentValue(m_program.Resources(), left, right); });
+             });
+@@ -1855,6 +1924,9 @@
+             }
+         }
+         DescriptorWeb web;
++        for (std::uint32_t slot = 0; slot < handleCount; slot++) {
++            if (split[slot]) web.slots.emplace_back(offsets[slot], handles[slot]->ArgumentCount());
++        }
+         IrValue* selector = WebSelector(tuple, web, inst);
+         const bool select = selector != nullptr && !web.arms.empty() && (web.arms.size() > 1u || web.foldedValue);
+         if (select) {
+diff --git a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+--- a/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
++++ b/core/shader/recompiler/tests/DescriptorSelectionTests.cpp
+@@ -135,6 +135,59 @@
+     Require(CountOps(words, spv::OpImageWrite) == 2u, "a store through a branch-selected T# becomes one store per T#");
+ }
+ 
++// s[8:9] = two table indices, read at user s4 plus eight times the first lane's v0 (so not known
++// when the plan is made), s[10:11] = a path choice and a skip flag (user s4 plus 0x40), and s12 a
++// word read at an index too: s[12:19] holds no T#. Unless the skip flag is 1, s[12:19] is loaded
++// from the T# table at user s2, at the index the choice picks, on one of two paths; image_load then
++// reads through s[12:19] whichever way it came, and buffer_store writes the texel through the V#
++// in s[24:27].
++constexpr std::array<std::uint32_t, 30> TableIndexPathsShader{
++    0xbe850380u, 0x7e0c0500u, 0x8f068306u, 0xf4040202u, 0x0c000000u, 0xf4040282u, 0xfa000040u, 0xbf8cc07fu,
++    0xf4000302u, 0x10000000u, 0x8f148508u, 0x8f158509u, 0xbe830380u, 0xbf06810bu, 0xbf850007u, 0xbf06800au,
++    0xbf850003u, 0xf40c0301u, 0x28000000u, 0xbf820002u, 0xf40c0301u, 0x2a000000u, 0xbf8cc07fu, 0xf0001100u,
++    0x00030100u, 0xbf8c3f70u, 0x34040082u, 0xe0701000u, 0x80060102u, 0xbf810000u,
++};
++
++constexpr std::uint32_t IndexAddress = 0x28000000u;
++
++// Target() with 8-bit storage, which reads at runtime addresses need.
++SpirvTarget ByteTarget() {
++    static constexpr std::array<std::uint32_t, 9> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityImageQuery, spv::CapabilitySampled1D,
++                                                               spv::CapabilityImage1D, spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote,
++                                                               spv::CapabilityStorageBuffer8BitAccess};
++    static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
++    return {0x00402000u, 0x00010500u, 32u, BdaAbi::Version, capabilities, extensions, false, {1024, 1024, 64}, 1024, 65536, {}, {}};
++}
++
++RecompileResult CompileTableIndexPaths() {
++    static const auto entries = Table();
++    static std::array<std::byte, 64u * 1024u> output{};
++    const std::array<std::uint32_t, 18> indices{4u, 9u};
++    std::array<std::uint32_t, 28> user{};
++    user[2] = TableAddress;
++    user[4] = IndexAddress;
++    user[24] = OutputAddress;
++    user[26] = 1024u;
++    user[27] = 0xfacu | (77u << 12u);
++    const std::vector<MemoryRegion> regions{{TableAddress, std::as_bytes(std::span<const std::uint32_t>(entries))}, {IndexAddress, std::as_bytes(std::span<const std::uint32_t>(indices))}, {OutputAddress, std::span<const std::byte>(output)}};
++    const ShaderComputeStageInfo compute{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
++    RecompileRequest request{
++        {ShaderStage::Compute, 0x10000000u, TableIndexPathsShader, 0, {}},
++        {32u, 0, std::span<const std::uint32_t>(user), compute, std::nullopt, std::nullopt, MemoryRegionView(std::span<const MemoryRegion>(regions)), ShaderFloatMode{}},
++        ByteTarget(),
++        {0, 0, 0, 128},
++    };
++    request.useCache = false;
++    return Recompile(request);
++}
++
++void TestTableIndexPathsReadAnImageTable() {
++    const auto result = CompileTableIndexPaths();
++    ValidWords(result, "the module whose T# is loaded at an index read from memory validates");
++    Require(std::ranges::any_of(result.bindings, [](const auto& binding) { return binding.role == DescriptorRole::ImageTable; }),
++            "a T# loaded from a table at an index read from memory, on either of two paths, is read through an image table");
++}
++
+ void TestUnreadableUserDataRootIsNamed() {
+     try {
+         static_cast<void>(Compile(TableBufferShader, UnmappedAddress));
+@@ -153,6 +206,7 @@
+     try {
+         TestWaterfallReadsAnImageTable();
+         TestBranchSelectedStoreIsSplit();
++        TestTableIndexPathsReadAnImageTable();
+         TestUnreadableUserDataRootIsNamed();
+     } catch (const std::exception& error) {
+         std::fprintf(stderr, "%s\n", error.what());

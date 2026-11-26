@@ -11,8 +11,8 @@
  *                                              memory unless a line gives a draw's (u=, m=:
  *                                              pixel_parse); one "ps NAME ok|FAIL ..." line each
  *   sa5_check cs PLAN [FIRST [COUNT]]          the compute shaders in PLAN (format: compute_sweep),
- *                                              compile only, no guest memory, validated, loops
- *                                              counted
+ *                                              compile only, validated, loops counted; no guest
+ *                                              memory unless SA5_USER, SA5_MEMORY give some (as for vs)
  *   sa5_check mesh                             a built-in console mesh program (one triangle),
  *                                              compiled and finalized as d3d12_xs does
  *   sa5_check ms PLAN [FIRST [COUNT]]          the mesh shaders in PLAN (format: mesh_sweep), the
@@ -1056,10 +1056,13 @@ static int compute_sweep(const char *plan, int first, int count)
         req.code = (const uint32_t *)(data + skip);
         req.code_dwords = (uint32_t)((size - skip) / 4);
         req.code_address = 0x10000000;
+        env_user_data(user, 32, -1);
         req.user_data = user;
         req.user_data_count = (rsrc2 >> 1) & 0x1f;
         req.rsrc1 = rsrc1;
         req.rsrc2 = rsrc2;
+        req.region_count = env_memory(&region, memory, 64);
+        req.regions = req.region_count ? &region : NULL;
         req.use_cache = getenv("SA5_USE_CACHE") != NULL;
         req.wave = wave ? wave
                         : !sa5_analyse(req.code, req.code_dwords, req.user_data_count, &layout, slots, 0, ignored,
@@ -1095,6 +1098,15 @@ static int compute_sweep(const char *plan, int first, int count)
             printf("cs %s ok %u words, hash %016llx, %d loops (%d without a conditional branch to their merge), %u bindings, %s%.300s\n",
                    name, words, (unsigned long long)hash, loops, no_exit, sa5_result_binding_count(result),
                    valid ? "valid" : "INVALID: ", valid ? "" : error);
+            for (uint32_t i = 0; i < sa5_result_binding_count(result) && getenv("SA5_MEMORY"); i++)
+            {
+                struct sa5_binding b;
+                sa5_result_binding(result, i, &b);
+                printf("     binding role %u kind %u count %u words", b.role, b.kind, b.count);
+                for (uint32_t w = 0; w < b.word_count && w < 8; w++)
+                    printf(" %08x", b.words[w]);
+                printf("\n");
+            }
             valid_count += valid;
             all_loops += loops;
             all_no_exit += no_exit;

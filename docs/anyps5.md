@@ -296,10 +296,13 @@ validate and finalize, 303 need the draw's descriptors, and 17 fail later (8 bin
 dominance, 1 sampler pairs).
 
 `cs PLAN [FIRST [COUNT]]` compiles the compute shaders of a compute plan (`NAME CODE SKIP RSRC1
-RSRC2 X,Y,Z [WAVE]`) with no guest memory and validates them; each line also gives a hash of the
+RSRC2 X,Y,Z [WAVE]`) with no guest memory (unless `SA5_USER` and `SA5_MEMORY` give some, as for
+`vs`; then each binding's words are listed too) and validates them; each line also gives a hash of the
 SPIR-V and the entry point's loops: how many, and how many have no conditional branch straight to
 their merge block (patch 0012's guard stopped only those exits; with 0026 it also stops exits that
-go through blocks of their own first). `SA5_DUMP_SPIRV=DIR` writes each module there. With the guard at 2^20,
+go through blocks of their own first). `SA5_DUMP_SPIRV=DIR` writes each module there. A compute
+shader's code isn't dumped by `REBOX_DUMP_SHADERS`; one AnyPS5 refused is in its failure memo
+(patch 0009) in AnyPS5's disk cache, whose key holds the code words. With the guard at 2^20,
 329 of 353 of the target title's compute shaders (every seventh of its PS09 cache) compile this way
 and all validate; 212 have loops, 8,751 in all, and every one has a conditional branch to its merge
 block. A world compute shader outside that sample (837k words) has four loops with none, which
