@@ -2503,6 +2503,119 @@ UINT64 console_program_hash(const void *shader, SIZE_T size)
     return hash;
 }
 
+/* GFX10 instruction length in dwords at code[i], 0 for an encoding not decoded here. */
+static UINT gfx10_dwords(const UINT32 *code, UINT i, UINT n)
+{
+    UINT32 w = code[i], w1 = i + 1 < n ? code[i + 1] : 0;
+    UINT32 op9 = w >> 23, src0 = w & 0x1ff;
+#define LIT(x) ((x) == 0xff ? 1u : 0u)
+#define VEXT(s) ((s) == 0xff || (s) == 0xf9 || (s) == 0xfa || (s) == 0xe9 || (s) == 0xea ? 1u : 0u)
+
+    if (op9 == 0x17d) /* SOP1 */
+        return 1 + LIT(w & 0xff);
+    if (op9 == 0x17e) /* SOPC */
+        return 1 + (LIT(w & 0xff) | LIT((w >> 8) & 0xff));
+    if (op9 == 0x17f) /* SOPP */
+        return 1;
+    if (w >> 28 == 0xb) /* SOPK; s_setreg_imm32_b32 has a literal */
+        return 1 + (((w >> 23) & 0x1f) == 0x15);
+    if (w >> 30 == 2) /* SOP2 */
+        return 1 + (LIT(w & 0xff) | LIT((w >> 8) & 0xff));
+    if (w >> 31 == 0) /* VOP2, VOP1 (0x3f), VOPC (0x3e); fmamk/fmaak carry a literal */
+    {
+        UINT32 vop2 = (w >> 25) & 0x3f;
+        if (vop2 == 0x2c || vop2 == 0x2d || vop2 == 0x37 || vop2 == 0x38)
+            return 2;
+        return 1 + VEXT(src0);
+    }
+    switch (w >> 26)
+    {
+    case 0x3d: /* SMEM */
+    case 0x38: /* MUBUF */
+    case 0x3a: /* MTBUF */
+    case 0x36: /* DS */
+    case 0x37: /* FLAT, GLOBAL, SCRATCH */
+    case 0x3e: /* EXP */
+        return 2;
+    case 0x3c: /* MIMG, plus NSA address dwords */
+        return 2 + ((w >> 1) & 3);
+    case 0x35: /* VOP3, VOP3B */
+    case 0x33: /* VOP3P */
+        return 2 + (LIT(w1 & 0x1ff) | LIT((w1 >> 9) & 0x1ff) | LIT((w1 >> 18) & 0x1ff));
+    case 0x32: /* VINTRP */
+        return 1;
+    }
+    return 0;
+#undef LIT
+#undef VEXT
+}
+
+/* A short straight-line compute pass: it reaches s_endpgm within 64 dwords with no branch back, jump
+ * or call on the way, and its only memory accesses are scalar loads (descriptors, constants) and
+ * buffer stores. Such a pass can't loop, so it can't be what hung the GPU, and it reads nothing a
+ * wild index could take it past; what passes of this shape do is reset state for later ones (clear
+ * a counter, write (0, 1, 1) dispatch arguments, zero an offset table). Skipped, the next frame's
+ * appends start from the last frame's counts and run on past their lists. In the target title, once
+ * its instance culling compiled (patch 0027), REBOX_QUARANTINE was skipping
+ * CS_InitTotalCulledMeshlets, CS_InitBatchCullDispatchArgs and CS_ClearCulledMeshletOffsets every
+ * frame and the compile queue CS_BatchCullInitArgs for frames on end, while the culling appended
+ * (an atomic add on the total, then stores at that index), and the render thread crashed minutes in
+ * on its own objects in adopted GPU memory (runs 561, 562). These are kept: never quarantined
+ * (quarantine.c) and compiled in the caller rather than skipped behind other compiles.
+ * REBOX_KEEP_INIT_PASSES=0 treats them as any other program. */
+#define INIT_PASS_DWORDS 64
+BOOL console_init_pass(const void *shader, SIZE_T size)
+{
+    static LONG keep = -1;
+    const struct rebox_deferred_shader *h = shader;
+    const UINT32 *code;
+    UINT n, i = 0;
+
+    if (keep < 0)
+    {
+        char v[8];
+        DWORD len = GetEnvironmentVariableA("REBOX_KEEP_INIT_PASSES", v, sizeof(v));
+        keep = !(len && len < sizeof(v) && v[0] == '0');
+    }
+    if (!keep || !h || size < sizeof(*h) || h->magic != REBOX_DEFERRED_MAGIC || h->version != 1 || h->stage != 0x20
+            || h->code_offset > size || h->code_dwords * 4ull > size - h->code_offset)
+        return FALSE;
+    code = (const UINT32 *)((const BYTE *)h + h->code_offset);
+    n = min(h->code_dwords, INIT_PASS_DWORDS);
+    while (i < n)
+    {
+        UINT32 w = code[i], len;
+        if (w >> 23 == 0x17f) /* SOPP */
+        {
+            UINT32 op = (w >> 16) & 0x7f;
+            if (op == 1) /* s_endpgm */
+                return TRUE;
+            if (((op == 2 || (op >= 4 && op <= 9) || (op >= 0x17 && op <= 0x1a)) && (w & 0x8000))
+                    || op == 0x1b) /* a branch back; s_endpgm_saved */
+                return FALSE;
+        }
+        else if (w >> 23 == 0x17d && ((w >> 8) & 0xff) >= 0x20 && ((w >> 8) & 0xff) <= 0x22)
+            return FALSE; /* s_setpc_b64, s_swappc_b64, s_rfe_b64 */
+        else if (w >> 26 == 0x3d && ((w >> 18) & 0xff) >= 0x10 && ((w >> 18) & 0xff) < 0x1f)
+            return FALSE; /* scalar stores */
+        else if (w >> 26 == 0x38)
+        {
+            /* Buffer stores only (format, byte to dwordx4, d16 format): no loads, no atomics. */
+            UINT32 op = (w >> 18) & 0x7f;
+            if (!((op >= 0x04 && op <= 0x07) || (op >= 0x18 && op <= 0x1f)))
+                return FALSE;
+        }
+        else if (w >> 26 == 0x3a && ((w >> 16) & 7) < 4)
+            return FALSE; /* typed buffer loads */
+        else if (w >> 26 == 0x3c || w >> 26 == 0x36 || w >> 26 == 0x37 || w >> 26 == 0x3e)
+            return FALSE; /* image, LDS/GDS, flat/global/scratch, export */
+        if (!(len = gfx10_dwords(code, i, n)))
+            return FALSE;
+        i += len;
+    }
+    return FALSE;
+}
+
 /* Whether a stage is REBOX_WATCH_STAGE's. */
 BOOL console_stage_watched(UINT64 id)
 {
@@ -3351,6 +3464,23 @@ static HRESULT console_compile(const struct rebox_compile_in *in, struct rebox_c
     }
     key = hash_words(0xcbf29ce484222325ull, in->shader, in->shader_size);
     state = program_claim(key, TRUE, &uses);
+    /* A short straight-line pass (console_init_pass: a counter or argument reset): compiled here, as
+     * long as it takes (a few dozen instructions), and its pipeline built at once, rather than skipped
+     * behind a compile queue that the world's big programs fill for minutes. */
+    if (state != PROGRAM_FAILED && console_init_pass(in->shader, in->shader_size))
+    {
+        static volatile LONG calls;
+        HRESULT hr = compile_now(in, out, FALSE);
+        LONG n = InterlockedIncrement(&calls);
+        if (state == PROGRAM_COLD)
+            program_set(key, SUCCEEDED(hr) ? PROGRAM_WARM : PROGRAM_FAILED);
+        if (SUCCEEDED(hr))
+            must_draw = TRUE;
+        if (!(n & (n - 1)) && n >= 16)
+            rebox_log("d3d12_xs: console shaders: %ld calls of short straight-line passes compiled in the caller", n);
+        call_outcome = SUCCEEDED(hr) ? OUTCOME_OK : OUTCOME_FAILED;
+        return hr;
+    }
     /* An indirect-argument producer's call: ahead of the rest, and waited for (see above). */
     if (call_essential && state != PROGRAM_FAILED && (wait = producer_wait()))
     {

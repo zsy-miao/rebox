@@ -21,7 +21,9 @@
  * (the code's hash), in hex; '#' starts a comment. Delete a line to let a program run again.
  *
  * A skipped dispatch writes nothing: whatever reads its output (indirect arguments included, which
- * vkd3d-proton clamps, patch 0017) reads what was there before. A skipped vertex or mesh stage's
+ * vkd3d-proton clamps, patch 0017) reads what was there before. So a short straight-line compute pass
+ * (console_init_pass: a counter or argument reset, which can't loop) is never skipped or picked: left
+ * out, the passes that append after it count on from the last frame and write past their lists. A skipped vertex or mesh stage's
  * draws get the PSO's fallback pipeline; a skipped pixel stage's can get the stand-in pixel stage
  * (REBOX_STANDIN_PIXEL), else the fallback. */
 
@@ -47,6 +49,7 @@ struct program
     UINT64 hash;                /* 0: an empty slot */
     UINT32 stage;               /* the deferred header's: 0x20 compute, 1 vertex, 0x10 pixel, 0x80 mesh; 0 unseen */
     BOOL quarantined;
+    volatile LONG init_pass;    /* console_init_pass: 0 not asked yet, 1 no, 2 yes (never skipped or picked) */
     volatile LONG skip_logged;
     /* GetTickCount64, 0 never: its first use, the start of its current spell, its last use. */
     volatile LONG64 first_ran, spell, last_ran;
@@ -231,8 +234,20 @@ BOOL quarantine_skips(const struct rebox_compile_in *in, void **out)
             return FALSE;
     }
     *out = program;
+    if (!program->init_pass)
+        InterlockedCompareExchange(&program->init_pass, console_init_pass(in->shader, in->shader_size) ? 2 : 1, 0);
     if (!program->quarantined)
         return FALSE;
+    /* A short straight-line pass resets state for later passes and can't have hung the GPU: kept
+     * (console_init_pass), whatever an earlier run's loss put in the file. */
+    if (program->init_pass == 2)
+    {
+        if (!InterlockedExchange(&program->skip_logged, 1))
+            rebox_log("d3d12_xs: quarantine: console %s shader %016llx is quarantined but is a short straight-line "
+                      "pass (a reset of counters or arguments later passes use): it runs (REBOX_KEEP_INIT_PASSES=0 "
+                      "skips it)", stage_name(program->stage), (unsigned long long)program->hash);
+        return FALSE;
+    }
     if (!InterlockedExchange(&program->skip_logged, 1))
         rebox_log("d3d12_xs: quarantine: console %s shader %016llx is quarantined (REBOX_QUARANTINE): skipped",
                   stage_name(program->stage), (unsigned long long)program->hash);
@@ -280,7 +295,7 @@ void quarantine_device_lost(void)
                                      (unsigned long long)p->hash);
             continue;
         }
-        if (!p->last_ran || now - (ULONGLONG)p->last_ran > window_ms)
+        if (!p->last_ran || now - (ULONGLONG)p->last_ran > window_ms || p->init_pass == 2)
             continue;
         recent++;
         /* Keep the new_count whose spells began latest, latest first: insertion into a short list. */
