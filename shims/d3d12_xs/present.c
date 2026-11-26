@@ -798,6 +798,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
     UINT kind = TRACK_LEGACY, from = D3D12_RESOURCE_STATE_COMMON;
     BOOL show, dump, convert, scale = FALSE;
     struct debug_view_pick view = { 0 };
+    BOOL view_drawn = FALSE;
     UINT out_w, out_h;
     UINT64 frame, total = 0;
     /* REBOX_DUMP_GPU_TEXTURE=<hex title address>: at each dumped frame, also the GPU contents of the
@@ -936,7 +937,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
         }
     }
     show = ensure_swapchain(s, out_w, out_h, scale ? DXGI_FORMAT_R8G8B8A8_UNORM : format) && frame_slot_free(s);
-    dump = dump_wanted(frame);
+    /* REBOX_DEBUG_VIEW_TEST's pattern is dumped whenever it shows (debug_view.c). */
+    dump = dump_wanted(frame) || (view.dump && getenv("REBOX_DUMP_FRAMES"));
     if (!show && !dump)
     {
         if (view.res)
@@ -966,7 +968,7 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
         if (!view.snapshot)
             lookup(view.res, &view_kind, &view_from);
         transition(s->ring[r].list, view.res, view_kind, view_from, TRUE, TRUE);
-        drawn = debug_view_record(s->ring[r].list, &view, s->convert, (UINT)desc.Width, desc.Height);
+        drawn = view_drawn = debug_view_record(s->ring[r].list, &view, s->convert, (UINT)desc.Width, desc.Height);
         transition(s->ring[r].list, view.res, view_kind, view_from, TRUE, FALSE);
         if (!drawn)
         {
@@ -1078,6 +1080,8 @@ HRESULT present_x(ID3D12CommandQueue *queue, struct present_queue **state, UINT 
         if (SUCCEEDED(ID3D12Resource_Map(readback, 0, &range, &data)))
         {
             write_dump(frame, &desc, &fp, data);
+            if (view_drawn)
+                rebox_log("d3d12_xs:   frame %llu shows REBOX_DEBUG_VIEW's %s", (unsigned long long)frame, view.note);
             ID3D12Resource_Unmap(readback, 0, NULL);
         }
         ID3D12Resource_Release(readback);

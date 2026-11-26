@@ -20,9 +20,22 @@
  * the pipeline still being built: vkd3d-proton patch 0032), so a target still at its clear value
  * tells draws that never reached the GPU from draws that drew nothing.
  *
- * The target is copied when the pass that drew it ends (the next OMSetRenderTargets of that list,
- * or its Close), so a later pass reusing its memory doesn't hide it, and the copy is shown.
- * REBOX_DEBUG_VIEW_SNAPSHOT=0 reads the target itself at the present instead.
+ * The target is copied when the pass that drew it ends (the next OMSetRenderTargets of that list
+ * that doesn't bind it again, or its Close), so a later pass reusing its memory doesn't hide it, and
+ * the copy is shown. A pass whose draws into it were all left out (stages still compiling) isn't
+ * copied, nor is one that drew nothing into it (a clear, a rebind) once a copy holds draws: the copy
+ * shown is the last one with draws in it, from however many presents ago (the log line of each
+ * dumped frame says which). REBOX_DEBUG_VIEW_SNAPSHOT=0 reads the target itself at the present.
+ *   REBOX_DEBUG_VIEW_AFTER=<n>      copy it after the n-th draw into it recorded with a pipeline in
+ *                                   each frame instead (pass ends aren't copied): partial results
+ *   REBOX_DEBUG_VIEW_TEST=1|copy    a self-test of the readout: the first time a copy is made, a
+ *                                   pattern (below) is cleared into the title's target just before
+ *                                   it (1; with SNAPSHOT=0 in place of it, read at the present), or
+ *                                   into the copy just after it (copy), and the frame that shows it
+ *                                   is dumped (REBOX_DUMP_FRAMES). An 8x8 grid: colour targets
+ *                                   (0.5, 0, 0.5) with every other cell (x+1)/8, (y+1)/8, 1 (cell x,
+ *                                   y); depth 0 (the far plane, dark blue) with every other cell
+ *                                   10^-((x+y)/4) (grey, lighter at the top left)
  *   REBOX_DEBUG_VIEW_SCALE=<f>      colour multiplier (default 1); float formats also roll off as
  *                                   x / (1 + x)
  *   REBOX_DEBUG_VIEW_CHANNEL=r|g|b|a  one channel as grey (default the colour)
@@ -37,6 +50,7 @@
 #define WIDL_C_INLINE_WRAPPERS
 #include <windows.h>
 #include <d3d12.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +73,14 @@ static float colour_scale = 1.0f, decades = 4.0f;
 static UINT channel;
 static BOOL depth_forward, snapshots = TRUE;
 static char select_text[64];
+static LONG after_draws;  /* REBOX_DEBUG_VIEW_AFTER, 0: at pass ends */
+enum test_mode { TEST_OFF, TEST_TARGET, TEST_COPY };
+static struct
+{
+    enum test_mode mode;
+    volatile LONG state;  /* 0 pending, 1 written, 2 shown */
+    LONG written;         /* the frame it was written in */
+} test;
 
 #define TARGETS 512
 #define EVICT_PRESENTS 8
@@ -86,9 +108,13 @@ static struct
     void *of;
     ID3D12Resource *copy;
     volatile LONG copied;  /* the present during whose frame it was last copied, + 1 */
+    UINT recorded;         /* draws recorded with a pipeline in the pass (or up to the draw) copied */
+    LONG step_frame, step_count;  /* REBOX_DEBUG_VIEW_AFTER: this frame's draws into it so far */
 } snap;
 static struct { ID3D12Resource *res; LONG at; } retired[8];
 static SRWLOCK snap_lock = SRWLOCK_INIT;
+
+static BOOL read_format(DXGI_FORMAT f, DXGI_FORMAT *view, BOOL *hdr);
 
 static float env_float(const char *name, float fallback)
 {
@@ -134,10 +160,18 @@ static BOOL CALLBACK init(INIT_ONCE *once, void *param, void **ctx)
     channel = !c ? 0 : *c == 'r' ? 1 : *c == 'g' ? 2 : *c == 'b' ? 3 : *c == 'a' ? 4 : 0;
     depth_forward = (c = getenv("REBOX_DEBUG_VIEW_DEPTH")) && !strcmp(c, "forward");
     snapshots = !((c = getenv("REBOX_DEBUG_VIEW_SNAPSHOT")) && *c == '0');
+    after_draws = (c = getenv("REBOX_DEBUG_VIEW_AFTER")) ? max(atoi(c), 0) : 0;
+    c = getenv("REBOX_DEBUG_VIEW_TEST");
+    test.mode = !c || !*c || !strcmp(c, "0") ? TEST_OFF : !strcmp(c, "copy") && snapshots ? TEST_COPY : TEST_TARGET;
     rebox_log("d3d12_xs: REBOX_DEBUG_VIEW=%s: a render target or depth buffer is shown in place of the presented "
-              "plane (%s; depth %s, %.1f decades; colour scale %.2f)", v,
-              snapshots ? "copied when its pass ends" : "read at the present", depth_forward ? "forward" : "reversed",
-              decades, colour_scale);
+              "plane (%s; depth %s, %.1f decades; colour scale %.2f)%s", v,
+              !snapshots ? "read at the present" : after_draws ? "copied after a frame's n-th draw into it"
+              : "copied when a pass that drew it ends", depth_forward ? "forward" : "reversed", decades, colour_scale,
+              test.mode == TEST_TARGET ? "; self-test: a pattern cleared into the target"
+              : test.mode == TEST_COPY ? "; self-test: a pattern cleared into its copy" : "");
+    if (snapshots && after_draws)
+        rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_AFTER=%ld: copied after draw number %ld into it (counting those "
+                  "recorded with a pipeline) in each frame", after_draws, after_draws);
     return TRUE;
 }
 
@@ -198,14 +232,22 @@ static int target_index(ID3D12Resource *res, BOOL depth, BOOL display)
 
 /* --------------------------------------------------------------- snapshot */
 
-static void state_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UINT kind, UINT from, BOOL copy,
-                          BOOL forward)
+/* What a target is used as around a copy or the test pattern. */
+enum use { USE_COPY_SOURCE, USE_WRITE };
+
+/* The barrier from the state (kind 1) or layout (kind 2) a resource is tracked in to a use, or back
+ * (forward FALSE). USE_WRITE is render target or depth write. */
+static void use_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UINT kind, UINT from, BOOL depth,
+                        enum use use, BOOL forward)
 {
     if (kind == 2) /* an enhanced-barrier layout */
     {
-        UINT layout = copy ? D3D12_BARRIER_LAYOUT_COPY_SOURCE : D3D12_BARRIER_LAYOUT_SHADER_RESOURCE;
-        UINT sync = copy ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_COMPUTE_SHADING;
-        UINT access = copy ? D3D12_BARRIER_ACCESS_COPY_SOURCE : D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
+        UINT layout = use == USE_COPY_SOURCE ? D3D12_BARRIER_LAYOUT_COPY_SOURCE
+                : depth ? D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE : D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+        UINT sync = use == USE_COPY_SOURCE ? D3D12_BARRIER_SYNC_COPY
+                : depth ? D3D12_BARRIER_SYNC_DEPTH_STENCIL : D3D12_BARRIER_SYNC_RENDER_TARGET;
+        UINT access = use == USE_COPY_SOURCE ? D3D12_BARRIER_ACCESS_COPY_SOURCE
+                : depth ? D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE : D3D12_BARRIER_ACCESS_RENDER_TARGET;
         D3D12_TEXTURE_BARRIER t = {
             .SyncBefore = forward ? D3D12_BARRIER_SYNC_ALL : sync,
             .SyncAfter = forward ? sync : D3D12_BARRIER_SYNC_ALL,
@@ -222,7 +264,8 @@ static void state_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res, 
     }
     else
     {
-        UINT state = copy ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        UINT state = use == USE_COPY_SOURCE ? D3D12_RESOURCE_STATE_COPY_SOURCE
+                : depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
         D3D12_RESOURCE_BARRIER b = { .Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION };
         if (from == state)
             return;
@@ -245,18 +288,138 @@ static void plain_barrier(ID3D12GraphicsCommandList *list, ID3D12Resource *res, 
     ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
 }
 
-/* Records a copy of the chosen target into its snapshot (made on first use), at the end of a pass
- * that drew it. */
-static void snapshot_copy(ID3D12GraphicsCommandList *list, void *target)
+/* The format a render target or depth view writes a target of format f through (0: none this can). */
+static DXGI_FORMAT write_format(DXGI_FORMAT f, BOOL depth)
+{
+    DXGI_FORMAT view;
+    BOOL hdr;
+
+    if (depth)
+        switch (f)
+        {
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: case DXGI_FORMAT_R32G8X24_TYPELESS:
+            return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case DXGI_FORMAT_D32_FLOAT: case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+        case DXGI_FORMAT_D16_UNORM: case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+        default: return DXGI_FORMAT_UNKNOWN;
+        }
+    if (!read_format(f, &view, &hdr) || view == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+        return DXGI_FORMAT_UNKNOWN;
+    return view;
+}
+
+/* REBOX_DEBUG_VIEW_TEST: the pattern (see the top) cleared into res, a render target or depth buffer
+ * in the state or layout (kind) from, left as it was found. Through clears, which go where draws
+ * go (render target or depth writes, compression and all). */
+static BOOL test_pattern(ID3D12GraphicsCommandList *list, ID3D12Resource *res, UINT kind, UINT from)
+{
+    static ID3D12DescriptorHeap *rtv_heap, *dsv_heap;
+    ID3D12Device *device = rebox_shared_device();
+    D3D12_RESOURCE_DESC d = ID3D12Resource_GetDesc(res);
+    BOOL depth = !!(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    DXGI_FORMAT format = write_format(d.Format, depth);
+    UINT cell_w = max((UINT)(d.Width / 8), 1u), cell_h = max(d.Height / 8, 1u);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle;
+    HRESULT hr;
+
+    if (!device || !format || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count != 1
+            || !(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)))
+    {
+        rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_TEST: no pattern for a %llux%u target of format %u, flags %#x",
+                  (unsigned long long)d.Width, d.Height, d.Format, (UINT)d.Flags);
+        return FALSE;
+    }
+    if (!(depth ? dsv_heap : rtv_heap))
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd = { depth ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1,
+                                          D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
+        if (FAILED(hr = ID3D12Device_CreateDescriptorHeap(device, &hd, &IID_ID3D12DescriptorHeap,
+                                                          (void **)(depth ? &dsv_heap : &rtv_heap))))
+        {
+            rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_TEST: no descriptor heap (%#lx)", hr);
+            return FALSE;
+        }
+    }
+    handle = ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart(depth ? dsv_heap : rtv_heap);
+    if (depth)
+    {
+        D3D12_DEPTH_STENCIL_VIEW_DESC v = { .Format = format };
+        if (d.DepthOrArraySize > 1)
+            v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY, v.Texture2DArray.ArraySize = 1;
+        else
+            v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        ID3D12Device_CreateDepthStencilView(device, res, &v, handle);
+    }
+    else
+    {
+        D3D12_RENDER_TARGET_VIEW_DESC v = { .Format = format };
+        if (d.DepthOrArraySize > 1)
+            v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY, v.Texture2DArray.ArraySize = 1;
+        else
+            v.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        ID3D12Device_CreateRenderTargetView(device, res, &v, handle);
+    }
+
+    use_barrier(list, res, kind, from, depth, USE_WRITE, TRUE);
+    {
+        static const FLOAT base[4] = { 0.5f, 0.0f, 0.5f, 1.0f };
+        if (depth)
+            ID3D12GraphicsCommandList_ClearDepthStencilView(list, handle, D3D12_CLEAR_FLAG_DEPTH, 0.0f, 0, 0, NULL);
+        else
+            ID3D12GraphicsCommandList_ClearRenderTargetView(list, handle, base, 0, NULL);
+    }
+    for (UINT y = 0; y < 8; y++)
+        for (UINT x = (y & 1) ^ 1; x < 8; x += 2)
+        {
+            D3D12_RECT r = { (LONG)(x * cell_w), (LONG)(y * cell_h), (LONG)min((x + 1) * cell_w, (UINT)d.Width),
+                             (LONG)min((y + 1) * cell_h, d.Height) };
+            if (r.right <= r.left || r.bottom <= r.top)
+                continue;
+            if (depth)
+                ID3D12GraphicsCommandList_ClearDepthStencilView(list, handle, D3D12_CLEAR_FLAG_DEPTH,
+                        powf(10.0f, -(float)(x + y) / 4.0f), 0, 1, &r);
+            else
+            {
+                FLOAT c[4] = { (x + 1) / 8.0f, (y + 1) / 8.0f, 1.0f, 1.0f };
+                ID3D12GraphicsCommandList_ClearRenderTargetView(list, handle, c, 1, &r);
+            }
+        }
+    use_barrier(list, res, kind, from, depth, USE_WRITE, FALSE);
+    rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_TEST: the pattern is cleared into %s %llux%u format %u (written as %u), "
+              "in frame %ld; the frame that shows it is dumped", res == snap.copy ? "the copy of the" : "the title's",
+              (unsigned long long)d.Width, d.Height, d.Format, format, frame);
+    return TRUE;
+}
+
+/* Whether a draw was recorded with a pipeline (DRAW_FATE_*). */
+static BOOL fate_recorded(UINT fate)
+{
+    return fate == DRAW_FATE_RECORDED || fate == DRAW_FATE_STANDIN || fate == DRAW_FATE_COMPILED
+            || fate == DRAW_FATE_PLAIN;
+}
+
+/* Records a copy of the chosen target into its snapshot (made on first use): at the end of a pass
+ * that drew it, or after a frame's n-th draw into it (REBOX_DEBUG_VIEW_AFTER). recorded: the draws
+ * recorded with a pipeline the copy holds. writing: the target is bound (mid-pass), so it is in a
+ * render target or depth write state whatever the last barrier tracked says. */
+static void snapshot_copy(ID3D12GraphicsCommandList *list, void *target, UINT recorded, BOOL writing)
 {
     ID3D12Resource *copy = NULL, *res = target;
+    D3D12_RESOURCE_DESC d = ID3D12Resource_GetDesc(res);
+    BOOL depth = !!(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL), test_now;
     UINT kind = 1, from = D3D12_RESOURCE_STATE_COMMON;
 
     AcquireSRWLockExclusive(&snap_lock);
+    if (test.state == 1 && test.written == frame && snap.of == target)
+    {
+        /* The pattern's frame: no later copy covers it before it is shown. */
+        ReleaseSRWLockExclusive(&snap_lock);
+        return;
+    }
     if (snap.of != target || !snap.copy)
     {
         D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
-        D3D12_RESOURCE_DESC d = ID3D12Resource_GetDesc(res);
         ID3D12Resource *made = NULL;
         HRESULT hr;
 
@@ -273,8 +436,10 @@ static void snapshot_copy(ID3D12GraphicsCommandList *list, void *target)
             retired[oldest].at = frame;
         }
         /* The same format and layout, so CopyResource always applies (a depth buffer's copy is one
-         * too, stencil plane and all); only the flags that would keep it from being read go. */
-        d.Flags &= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+         * too, stencil plane and all); only the flags that would keep it from being read go (a render
+         * target's stays for REBOX_DEBUG_VIEW_TEST=copy, which clears its pattern into it). */
+        d.Flags &= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+                | (test.mode == TEST_COPY ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : 0);
         d.Alignment = 0;
         d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         hr = ID3D12Device_CreateCommittedResource(rebox_shared_device(), &heap, D3D12_HEAP_FLAG_NONE, &d,
@@ -282,21 +447,84 @@ static void snapshot_copy(ID3D12GraphicsCommandList *list, void *target)
         snap.copy = SUCCEEDED(hr) ? made : NULL;
         snap.of = target;
         snap.copied = 0;
+        snap.recorded = 0;
         if (FAILED(hr))
             rebox_log("d3d12_xs: REBOX_DEBUG_VIEW: no copy of a %llux%u format %u target (%#lx); it is read at the "
                       "present instead", (unsigned long long)d.Width, d.Height, d.Format, hr);
     }
     copy = snap.copy;
+    test_now = test.mode && !test.state;
+    if (test_now)
+        test.state = 1, test.written = frame;
+    if (copy)
+        snap.recorded = recorded;
     ReleaseSRWLockExclusive(&snap_lock);
     if (!copy)
         return;
     present_tracked(res, &kind, &from);
-    state_barrier(list, res, kind, from, TRUE, TRUE);
+    if (writing)
+    {
+        /* Bound and drawn into: what the tracked barrier says unless it isn't a writable state. */
+        BOOL bindable = kind == 2 ? from == D3D12_BARRIER_LAYOUT_RENDER_TARGET
+                || from == D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE || from == D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ
+                : from == D3D12_RESOURCE_STATE_RENDER_TARGET || (from & (D3D12_RESOURCE_STATE_DEPTH_WRITE
+                | D3D12_RESOURCE_STATE_DEPTH_READ));
+        if (!bindable)
+        {
+            if (kind == 2)
+                from = depth ? D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE : D3D12_BARRIER_LAYOUT_RENDER_TARGET;
+            else
+                from = depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+    }
+    if (test_now && test.mode == TEST_TARGET)
+        test_pattern(list, res, kind, from);
+    use_barrier(list, res, kind, from, depth, USE_COPY_SOURCE, TRUE);
     plain_barrier(list, copy, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     ID3D12GraphicsCommandList_CopyResource(list, copy, res);
     plain_barrier(list, copy, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-    state_barrier(list, res, kind, from, TRUE, FALSE);
+    use_barrier(list, res, kind, from, depth, USE_COPY_SOURCE, FALSE);
+    if (test_now && test.mode == TEST_COPY)
+        test_pattern(list, copy, 1, D3D12_RESOURCE_STATE_COMMON);
     InterlockedExchange(&snap.copied, frame + 1);
+}
+
+/* The end of a pass that had the chosen target bound: copied, unless its draws into it were all left
+ * out (stages compiling: the copy would show the clear), or it drew nothing into it and the copy
+ * already holds draws. With REBOX_DEBUG_VIEW_TEST and SNAPSHOT=0, the pattern goes into the target
+ * here, read at the present. */
+static void pass_end(ID3D12GraphicsCommandList *list, struct debug_view_list *l)
+{
+    void *picked = chosen;
+    BOOL take;
+
+    if (!l->snapshot_res || l->snapshot_res != picked)
+        return;
+    if (!snapshots)
+    {
+        if (test.mode && !InterlockedCompareExchange(&test.state, 1, 0))
+        {
+            UINT kind = 1, from = D3D12_RESOURCE_STATE_COMMON;
+            test.written = frame;
+            present_tracked(picked, &kind, &from);
+            test_pattern(list, picked, kind, from);
+        }
+        return;
+    }
+    if (after_draws)
+        return;
+    AcquireSRWLockShared(&snap_lock);
+    take = l->pass_recorded || (!l->pass_draws && (snap.of != picked || !snap.copied || !snap.recorded));
+    ReleaseSRWLockShared(&snap_lock);
+    if (take || (test.mode && !test.state))
+        snapshot_copy(list, picked, l->pass_recorded, FALSE);
+    else
+    {
+        static LONG logged;
+        if (l->pass_draws && InterlockedIncrement(&logged) <= 8)
+            rebox_log("d3d12_xs: REBOX_DEBUG_VIEW: a pass's %u draws into the target shown were all left out (frame "
+                      "%ld); not copied, the last copy with draws stays", l->pass_draws, frame);
+    }
 }
 
 /* ------------------------------------------------------------ recording */
@@ -306,11 +534,20 @@ void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
 {
     int indices[8], d = -1;
     UINT n = min(count, 8u);
-    void *picked = chosen;
+    void *picked = chosen, *bound_picked = NULL;
 
-    /* Only if it is still the one picked: another may be anywhere in another list. */
-    if (l->snapshot_res && snapshots && l->snapshot_res == picked)
-        snapshot_copy(list, picked);
+    for (UINT i = 0; picked && i < n; i++)
+        if (rts[i] == picked)
+            bound_picked = picked;
+    if (picked && depth == picked)
+        bound_picked = picked;
+    /* A rebind that keeps it bound continues the pass (titles rebind the same targets between
+     * draws); else the pass that had it ends. */
+    if (!bound_picked || l->snapshot_res != bound_picked)
+    {
+        pass_end(list, l);
+        l->pass_draws = l->pass_recorded = 0;
+    }
     AcquireSRWLockExclusive(&targets_lock);
     for (UINT i = 0; i < n; i++)
         indices[i] = rts[i] ? target_index(rts[i], FALSE, display) : -1;
@@ -330,12 +567,7 @@ void debug_view_bind(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
     l->depth = d + 1;
     l->depth_res = d >= 0 ? targets[d].res : NULL;
     ReleaseSRWLockExclusive(&targets_lock);
-    l->snapshot_res = NULL;
-    for (UINT i = 0; picked && i < n; i++)
-        if (rts[i] == picked)
-            l->snapshot_res = picked;
-    if (picked && depth == picked)
-        l->snapshot_res = picked;
+    l->snapshot_res = bound_picked;
 }
 
 /* ---------------------------------------------------------------- probe */
@@ -509,8 +741,7 @@ static void probe_report(LONG now)
     {
         const D3D12_QUERY_DATA_PIPELINE_STATISTICS *st;
         D3D12_QUERY_DATA_PIPELINE_STATISTICS stats;
-        BOOL recorded = probe.slots[i].fate == DRAW_FATE_RECORDED || probe.slots[i].fate == DRAW_FATE_STANDIN
-                || probe.slots[i].fate == DRAW_FATE_COMPILED || probe.slots[i].fate == DRAW_FATE_PLAIN;
+        BOOL recorded = fate_recorded(probe.slots[i].fate);
         struct sums *s = &sums[!recorded ? 2 : probe.slots[i].mesh ? 0 : 1];
         UINT64 samples = probe_u64(i, 0), groups = 0;
         UINT args[5] = { 0 }, count = ~0u;
@@ -714,6 +945,24 @@ void debug_view_draw(ID3D12GraphicsCommandList *list, struct debug_view_list *l,
         probe.slots[slot].recorded = 1;
         l->probe = 0;
     }
+    if (l->snapshot_res && l->snapshot_res == chosen)
+    {
+        BOOL recorded = fate_recorded(fate);
+        l->pass_draws++;
+        l->pass_recorded += recorded;
+        if (snapshots && after_draws && recorded)
+        {
+            /* REBOX_DEBUG_VIEW_AFTER: this frame's n-th draw into it, counted across lists. */
+            LONG n;
+            AcquireSRWLockExclusive(&snap_lock);
+            if (snap.step_frame != frame)
+                snap.step_frame = frame, snap.step_count = 0;
+            n = ++snap.step_count;
+            ReleaseSRWLockExclusive(&snap_lock);
+            if (n == after_draws)
+                snapshot_copy(list, l->snapshot_res, (UINT)n, TRUE);
+        }
+    }
     if (l->rt && targets[l->rt - 1].res == l->rt_res)
     {
         InterlockedIncrement(&targets[l->rt - 1].draws);
@@ -755,9 +1004,7 @@ static void log_fates(LONG now, const struct target *t)
 
 void debug_view_close(ID3D12GraphicsCommandList *list, struct debug_view_list *l)
 {
-    void *picked = chosen;
-    if (l->snapshot_res && snapshots && l->snapshot_res == picked)
-        snapshot_copy(list, picked);
+    pass_end(list, l);
     memset(l, 0, sizeof(*l));
 }
 
@@ -771,6 +1018,11 @@ static UINT64 area(const struct target *t)
 /* Under targets_lock: the entry the setting picks from this frame's counts, or -1. */
 static int choose(const char **why)
 {
+    /* The G-buffer target last picked for its mesh draws: kept through frames where no pass drew
+     * meshes (its copy, from the last pass that drew it, is shown), rather than flipping to the
+     * depth buffer or the plane and starting a new copy. */
+    static int sticky = -1;
+    static void *sticky_res;
     int best = -1;
 
     if (select_kind == SEL_AUTO || select_kind == SEL_GBUFFER)
@@ -785,6 +1037,21 @@ static int choose(const char **why)
                     || (t->mesh == targets[best].mesh && t->draws > targets[best].draws))
                 best = (int)i;
         }
+        if (best >= 0 && targets[best].mesh)
+            sticky = best, sticky_res = targets[best].res;
+        else if (sticky >= 0 && targets[sticky].res == sticky_res && sticky_res)
+        {
+            *why = "render target 0 of the pass that last drew meshes (none drew any this frame)";
+            if (select_kind == SEL_GBUFFER && select_slot)
+            {
+                int partner = targets[sticky].partners[select_slot] - 1;
+                *why = "a render target of the pass that last drew meshes (none drew any this frame)";
+                return partner >= 0 && targets[partner].res ? partner : -1;
+            }
+            return sticky;
+        }
+        else
+            sticky = -1, sticky_res = NULL;
         if (best >= 0 && (select_kind == SEL_GBUFFER || targets[best].mesh))
         {
             *why = targets[best].mesh ? "render target 0 of the pass with the most mesh draws"
@@ -947,7 +1214,7 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
     if (!pick->res)
         return FALSE;
 
-    /* The copy made when its pass ended in this frame or the last, if there is one. */
+    /* Its last copy, however old: passes whose draws were all left out aren't copied (pass_end). */
     AcquireSRWLockExclusive(&snap_lock);
     for (UINT k = 0; k < ARRAYSIZE(retired); k++)
         if (retired[k].res && now - retired[k].at > EVICT_PRESENTS)
@@ -955,12 +1222,29 @@ BOOL debug_view_pick(struct debug_view_pick *pick)
             ID3D12Resource_Release(retired[k].res);
             retired[k].res = NULL;
         }
-    if (snapshots && snap.of == pick->res && snap.copy && snap.copied >= now - 1)
+    if (snapshots && snap.of == pick->res && snap.copy && snap.copied)
     {
+        LONG at = snap.copied - 1;
+        snprintf(pick->note, sizeof(pick->note), "the copy of the %s %llux%u format %u made in frame %ld (%ld "
+                 "presents ago), %u draws recorded with a pipeline in its pass%s", pick->depth ? "depth buffer" : "target",
+                 (unsigned long long)pick->desc.Width, pick->desc.Height, pick->desc.Format, at, now - 1 - at,
+                 snap.recorded, after_draws ? " (up to the draw copied after)" : "");
         ID3D12Resource_Release(pick->res);
         pick->res = snap.copy;
         ID3D12Resource_AddRef(pick->res);
         pick->snapshot = TRUE;
+    }
+    else
+        snprintf(pick->note, sizeof(pick->note), "the %s %llux%u format %u itself, read at the present%s",
+                 pick->depth ? "depth buffer" : "target", (unsigned long long)pick->desc.Width, pick->desc.Height,
+                 pick->desc.Format, snapshots ? " (no copy of it made yet)" : "");
+    /* REBOX_DEBUG_VIEW_TEST: the first present after the pattern was written shows it. */
+    if (test.state == 1 && now > test.written && (pick->snapshot || !snapshots))
+    {
+        test.state = 2;
+        pick->dump = TRUE;
+        rebox_log("d3d12_xs: REBOX_DEBUG_VIEW_TEST: present %ld shows the pattern written in frame %ld (%s); its frame "
+                  "is dumped: an 8x8 grid there proves the copy, the view and the dump", now, test.written, pick->note);
     }
     ReleaseSRWLockExclusive(&snap_lock);
     return TRUE;

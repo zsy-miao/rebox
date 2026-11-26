@@ -12,6 +12,9 @@ struct debug_view_list
     int rt, depth;               /* 1 + the bound targets' table indices, or 0 */
     void *rt_res, *depth_res;    /* what those entries held when bound */
     void *snapshot_res;          /* the chosen target, bound: copied when the pass ends */
+    /* Draws into it since it was bound in this list (rebinds that keep it bound continue the
+     * pass), and how many of those were recorded with a pipeline. */
+    UINT pass_draws, pass_recorded;
     int probe;                   /* 1 + the probe slot of the draw being recorded, or 0 */
     /* For the probe: the first viewport and scissor rectangle set (RSSetViewports and
      * RSSetScissorRects; counts 0: none since the list was reset), and the graphics root views
@@ -44,6 +47,8 @@ struct debug_view_pick
     ID3D12Resource *res;
     D3D12_RESOURCE_DESC desc;  /* of the title's target */
     BOOL depth, snapshot;
+    BOOL dump;                 /* REBOX_DEBUG_VIEW_TEST: dump this frame (its pattern is shown) */
+    char note[192];            /* what is shown, for the log line of a dumped frame */
 };
 BOOL debug_view_pick(struct debug_view_pick *pick);
 /* Records the view of pick->res (readable as a shader resource by now) into all of dst (RGBA8, in

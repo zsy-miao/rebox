@@ -186,6 +186,29 @@ out=$(REBOX_DEBUG_VIEW=32x16 REBOX_DUMP_FRAMES_AT=1,2,3,4,5,6 "$WINE" "$here/bui
 grep -q "ok   REBOX_DEBUG_VIEW shows its copy from when its pass ended" <<<"$out" \
     || { echo "FAIL REBOX_DEBUG_VIEW did not show the copy"; grep -E "DEBUG_VIEW" <<<"$out" | head; exit 1; }
 echo "ok   REBOX_DEBUG_VIEW copies the target when its pass ends and shows the copy"
+# REBOX_DEBUG_VIEW_AFTER=1: the copy is made after the first draw into it (blue), not at the pass end.
+echo "== fake.bin, REBOX_DEBUG_VIEW=32x16 REBOX_DEBUG_VIEW_AFTER=1"
+out=$(REBOX_DEBUG_VIEW=32x16 REBOX_DEBUG_VIEW_AFTER=1 REBOX_DUMP_FRAMES_AT=1,2,3,4,5,6 "$WINE" "$here/build/smoke.exe" \
+          "Z:${work//\//\\}\\fake.bin" 2>&1) || { echo "$out" | grep -E "FAIL|DEBUG_VIEW" | head -40; exit 1; }
+grep -q "ok   REBOX_DEBUG_VIEW_AFTER=1 shows its copy from after the first draw" <<<"$out" \
+    || { echo "FAIL REBOX_DEBUG_VIEW_AFTER did not copy after the draw"; grep -E "DEBUG_VIEW" <<<"$out" | head; exit 1; }
+echo "ok   REBOX_DEBUG_VIEW_AFTER copies the target after a frame's n-th draw into it"
+# REBOX_DEBUG_VIEW_TEST: its pattern, cleared into the title's target before the copy (1), or into
+# the copy after it (copy; here with the copy made mid-pass by REBOX_DEBUG_VIEW_AFTER), shows in
+# the dumped frame: the target's clears, the copy, the view and the dump all work.
+for mode in 1 copy; do
+    echo "== fake.bin, REBOX_DEBUG_VIEW=32x16 REBOX_DEBUG_VIEW_TEST=$mode"
+    after=; [ "$mode" = copy ] && after=1
+    rm -f "$work/frames/frame_6.bmp"  # dumped by the test alone (frame 6 isn't in REBOX_DUMP_FRAMES_AT)
+    out=$(REBOX_DEBUG_VIEW=32x16 REBOX_DEBUG_VIEW_TEST=$mode REBOX_DEBUG_VIEW_AFTER=$after \
+              REBOX_DUMP_FRAMES_AT=1,2,3,4,5 "$WINE" "$here/build/smoke.exe" "Z:${work//\//\\}\\fake.bin" 2>&1) \
+        || { echo "$out" | grep -E "FAIL|DEBUG_VIEW" | head -40; exit 1; }
+    grep -q "ok   REBOX_DEBUG_VIEW_TEST=$mode: frame 6 shows the pattern" <<<"$out" \
+        && grep -q "REBOX_DEBUG_VIEW_TEST: present [0-9]* shows the pattern written in frame" <<<"$out" \
+        || { echo "FAIL REBOX_DEBUG_VIEW_TEST=$mode: the pattern was not dumped"; grep -E "DEBUG_VIEW" <<<"$out" | head
+             exit 1; }
+    echo "ok   REBOX_DEBUG_VIEW_TEST=$mode: the pattern shows in the frame it dumps"
+done
 
 # REBOX_QUARANTINE skips the dispatches of compute programs a file names by the id their compile
 # logs (the dispatch test's program here; that test's checks then fail, which is not this one's business).

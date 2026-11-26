@@ -1468,13 +1468,41 @@ done:
     free(ps);
 }
 
+/* A dumped frame's pixel at x, y (BGRA). */
+static BOOL read_dump_pixel_at(const char *dir, int frame, UINT x, UINT y, BYTE bgra[4])
+{
+    char path[MAX_PATH];
+    BYTE header[54];
+    INT32 w;
+    FILE *f;
+    BOOL ok;
+
+    snprintf(path, sizeof(path), "%s\\frame_%d.bmp", dir, frame);
+    if (!(f = fopen(path, "rb")))
+        return FALSE;
+    ok = fread(header, 1, sizeof(header), f) == sizeof(header) && header[0] == 'B' && header[1] == 'M';
+    memcpy(&w, header + 18, 4);
+    ok = ok && x < (UINT)w && !fseek(f, 54 + ((long)y * w + x) * 4, SEEK_SET) && fread(bgra, 1, 4, f) == 4;
+    fclose(f);
+    return ok;
+}
+
+static BOOL near_rgb(const BYTE bgra[4], int r, int g, int b)
+{
+    return abs(bgra[2] - r) <= 2 && abs(bgra[1] - g) <= 2 && abs(bgra[0] - b) <= 2;
+}
+
 /* REBOX_DEBUG_VIEW=32x16 (run-smoke.sh): a 32x16 target cleared green and presented shows green;
- * then, picked, it is cleared blue in a pass of its own, copied when that pass ends, and cleared red
- * after; the next present shows the copy, blue. Presented as frames 5 and 6, after
- * test_present_format's. */
+ * then, picked, it is cleared blue, drawn into once (a draw with no pipeline: recorded, drawing
+ * nothing), cleared green, bound again (the pass goes on), unbound (the pass ends: copied), and
+ * cleared red after; the next present shows the copy, green. Presented as frames 5 and 6, after
+ * test_present_format's. REBOX_DEBUG_VIEW_AFTER=1: copied after the draw instead, blue.
+ * REBOX_DEBUG_VIEW_TEST=1 or copy: frame 6 shows the self-test's pattern, cleared into the target
+ * just before the copy or into the copy just after it. */
 static void test_debug_view_snapshot(void *dev, void *queue)
 {
-    const char *dump_dir = getenv("REBOX_DUMP_FRAMES");
+    const char *dump_dir = getenv("REBOX_DUMP_FRAMES"), *test_mode = getenv("REBOX_DEBUG_VIEW_TEST");
+    BOOL after = getenv("REBOX_DEBUG_VIEW_AFTER") && atoi(getenv("REBOX_DEBUG_VIEW_AFTER")) == 1;
     D3D12_DESCRIPTOR_HEAP_DESC hd = { D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0 };
     D3D12_HEAP_PROPERTIES heap_props = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_RESOURCE_DESC desc = { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 32, 16, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1528,7 +1556,11 @@ static void test_debug_view_snapshot(void *dev, void *queue)
         XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, round ? blue : green, 0, NULL);
         if (round)
         {
-            /* The pass ends (nothing bound): copied, blue. Then cleared red unbound, after the copy. */
+            /* DrawInstanced (slot 12): REBOX_DEBUG_VIEW_AFTER=1 copies here, blue. */
+            XSLOT(list, 12, void, UINT, UINT, UINT, UINT)(list, 3, 1, 0, 0);
+            XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, green, 0, NULL);
+            XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 1, &rtv, FALSE, NULL);
+            /* The pass ends (nothing bound): copied, green. Then cleared red unbound, after the copy. */
             XSLOT(list, 50, void, UINT, const SIZE_T *, BOOL, const SIZE_T *)(list, 0, NULL, FALSE, NULL);
             XSLOT(list, 52, void, SIZE_T, const FLOAT *, UINT, const D3D12_RECT *)(list, rtv, red, 0, NULL);
         }
@@ -1544,9 +1576,27 @@ static void test_debug_view_snapshot(void *dev, void *queue)
         BOOL found = read_dump_pixel(dump_dir, 5, px);
         CHECK(found && px[1] == 255 && !px[2] && !px[0], "REBOX_DEBUG_VIEW shows the 32x16 target as it is at the "
               "present (RGB %u %u %u)", px[2], px[1], px[0]);
-        found = read_dump_pixel(dump_dir, 6, px);
-        CHECK(found && px[0] == 255 && !px[2] && !px[1], "REBOX_DEBUG_VIEW shows its copy from when its pass ended "
-              "(RGB %u %u %u)", px[2], px[1], px[0]);
+        if (test_mode)
+        {
+            /* Cell (0, 0) the pattern's base, cell (1, 0) (x 4) 2/8, 1/8, 1. */
+            BYTE cell[4] = { 0 };
+            found = read_dump_pixel_at(dump_dir, 6, 0, 0, px) && read_dump_pixel_at(dump_dir, 6, 4, 0, cell);
+            CHECK(found && near_rgb(px, 128, 0, 128) && near_rgb(cell, 64, 32, 255), "REBOX_DEBUG_VIEW_TEST=%s: frame "
+                  "6 shows the pattern (RGB %u %u %u and %u %u %u)", test_mode, px[2], px[1], px[0], cell[2], cell[1],
+                  cell[0]);
+        }
+        else if (after)
+        {
+            found = read_dump_pixel(dump_dir, 6, px);
+            CHECK(found && px[0] == 255 && !px[2] && !px[1], "REBOX_DEBUG_VIEW_AFTER=1 shows its copy from after the "
+                  "first draw (RGB %u %u %u)", px[2], px[1], px[0]);
+        }
+        else
+        {
+            found = read_dump_pixel(dump_dir, 6, px);
+            CHECK(found && px[1] == 255 && !px[2] && !px[0], "REBOX_DEBUG_VIEW shows its copy from when its pass ended "
+                  "(RGB %u %u %u)", px[2], px[1], px[0]);
+        }
     }
 
 done:
